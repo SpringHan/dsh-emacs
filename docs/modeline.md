@@ -155,6 +155,12 @@ misc-info, and all other existing content are preserved:
  U:***  %b   L40  DSH [whale tail] Deep diving · 12s (model max 95.0%)
 ```
 
+The line also survives mode-line-hiding packages: when
+[awesome-tray](https://github.com/manateelazycat/awesome-tray) is active,
+`dsh-emacs-mode` opts out of its global mode-line face shrink with a
+buffer-local face remapping. DSH chat buffers keep a full-height mode line,
+while every other buffer keeps the thin tray line.
+
 - **Whale-tail animation**: the web animation replaces the old filled progress
   bar. `motion-line` owns one shared timer and independent playback slots
   for all chat buffers. Repeated running snapshots do not reset the loop.

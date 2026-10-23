@@ -6,6 +6,15 @@ All notable changes to this project are documented here. Format follows
 sections carry the planned next version (pre-1.0: `fix` → patch, features →
 minor) and stay undated until the release is cut.
 
+## 0.7.1 - Unreleased
+
+### Fixed
+
+- **Mode line stays visible under awesome-tray**: `dsh-emacs-mode` buffers now
+  opt out of awesome-tray's global mode-line face shrink with a buffer-local
+  face remapping, so the DSH status line renders at its normal height and
+  colors while every other buffer keeps the thin tray line.
+
 ## 0.7.0 - 2026-10-23
 
 Compatible with **dsh 0.2.1-rc.2**, the latest upstream release as of

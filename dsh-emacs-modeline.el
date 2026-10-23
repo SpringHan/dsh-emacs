@@ -1586,14 +1586,44 @@ dsh-emacs buffer."
             ;; Fallback if the user set their global mode-line-format to nil.
             (fallback '("%e" mode-line-front-space mode-line-mule-info
                         mode-line-modified mode-line-buffer-identification
-                        "   " mode-line-position mode-line-modes
+                        "      " mode-line-position mode-line-modes
                         mode-line-misc-info mode-line-end-spaces)))
+        ;; Drop the position and mode clusters from the native mode line.
+        ;; Strip them after splicing: `mode-line-modes' is the splice
+        ;; anchor, so removing it first would move the DSH segments to the
+        ;; head of the line.  Splicing first leaves every remaining element
+        ;; in place, with the segments taking the vacated slot.
         (setq-local mode-line-format
-                    (dsh-emacs-modeline--splice (or base fallback)))
+                    (delq 'mode-line-position
+                          (delq 'mode-line-modes
+                                (copy-sequence
+                                 (dsh-emacs-modeline--splice
+                                  (or base fallback))))))
         (setq dsh-emacs-modeline--modeline-patched t))))
 
   ;; Initial render (also forces the `:eval' segments to re-evaluate).
   (dsh-emacs-modeline-update))
+
+;;; ---------------------------------------------------------------------------
+
+;;; awesome-tray integration
+
+;; awesome-tray hides the mode line by shrinking the `mode-line' faces for
+;; every buffer.  A DSH chat renders its status there, so each chat buffer
+;; opts out with a buffer-local face remapping while the tray line stays
+;; thin everywhere else.
+(defvar awesome-tray-mode-line-exempt)
+(declare-function awesome-tray-exempt-mode-line "awesome-tray" ())
+
+(defun dsh-emacs-modeline--exempt-awesome-tray ()
+  "Keep this DSH buffer's mode line visible when awesome-tray hides it."
+  (if (fboundp 'awesome-tray-exempt-mode-line)
+      (awesome-tray-exempt-mode-line)
+    ;; awesome-tray loads later: record the intent; its enable step applies
+    ;; the exemption to every buffer that opted out.
+    (setq-local awesome-tray-mode-line-exempt t)))
+
+(add-hook 'dsh-emacs-mode-hook #'dsh-emacs-modeline--exempt-awesome-tray)
 
 ;;; ---------------------------------------------------------------------------
 

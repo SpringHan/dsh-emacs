@@ -1650,5 +1650,17 @@
                      (eq (dsh-emacs-modeline--doom-major-mode padded)
                          padded)))))))
 
+;; A DSH chat renders its status in the mode line, so every chat buffer must
+;; opt out of mode-line-hiding packages such as awesome-tray.
+(ert-deftest dsh-emacs-test-modeline-dsh-mode-exempts-awesome-tray ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'awesome-tray-exempt-mode-line)
+                 (lambda () (setq calls (1+ calls)))))
+        (dsh-emacs-mode))
+      (ert-info ((format "%s" "dsh-mode-exempts-awesome-tray"))
+        (should (= calls 1))))))
+
 (provide 'dsh-test-modeline)
 ;;; dsh-test-modeline.el ends here
