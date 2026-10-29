@@ -1316,5 +1316,199 @@
     (should (equal (dsh-protocol-file-ref-name
                     (dsh-protocol-file-receipt-file receipt)) "remote.pdf"))))
 
+;; --- dsh-plugins-bridge external API ---
+
+(ert-deftest dsh-emacs-test-protocol-bridge-plugin-catalog ()
+  :tags '(dsh-unit)
+  (let* ((response
+          (dsh-protocol-bridge-plugin-list--from-alist
+           '((ok . t)
+             (plugins . [((package . "@scope/pkg")
+                          (title . "Package")
+                          (description . "A plugin")
+                          (version . "1.2.3")
+                          (phase . "active")
+                          (enabled . t)
+                          (endpointCount . 2)
+                          (endpoints . [((endpoint . "ns/list")
+                                         (namespace . "ns")
+                                         (method . "list")
+                                         (kind . "unary")
+                                         (requiresAgent . "agentId")
+                                         (description . "List things"))]))])))))
+    (should (dsh-protocol-bridge-plugin-list-ok response))
+    (should-not (dsh-protocol-bridge-plugin-list-error response))
+    (let* ((plugins (dsh-protocol-bridge-plugin-list-plugins response))
+           (plugin (car plugins))
+           (endpoint (car (dsh-protocol-bridge-plugin-endpoints plugin))))
+      (should (= 1 (length plugins)))
+      (should (equal "@scope/pkg" (dsh-protocol-bridge-plugin-package plugin)))
+      (should (equal "Package" (dsh-protocol-bridge-plugin-title plugin)))
+      (should (= 2 (dsh-protocol-bridge-plugin-endpoint-count plugin)))
+      (should (dsh-protocol-bridge-plugin-enabled plugin))
+      (should (equal "active" (dsh-protocol-bridge-plugin-phase plugin)))
+      (should (equal "ns/list" (dsh-protocol-bridge-endpoint-endpoint endpoint)))
+      (should (equal "agentId"
+                     (dsh-protocol-bridge-endpoint-requires-agent endpoint)))
+      (should-not (dsh-protocol-bridge-endpoint-parameters endpoint)))))
+
+(ert-deftest dsh-emacs-test-protocol-bridge-plugin-detail ()
+  :tags '(dsh-unit)
+  (let* ((response
+          (dsh-protocol-bridge-plugin-response--from-alist
+           '((ok . t)
+             (package . "@scope/pkg")
+             (title . "Package")
+             (endpoints
+              . [((package . "@scope/pkg")
+                  (endpoint . "ns/run")
+                  (namespace . "ns")
+                  (method . "run")
+                  (kind . "unary")
+                  (description . "Run it")
+                  (requiresAgent . "agentId")
+                  (parameters
+                   . [((name . "agent")
+                       (wire . "agentId")
+                       (required . :json-false)
+                       (source . "lookup")
+                       (description . "receiving agent")
+                       (schema . ((type . "string"))))
+                      ((name . "count")
+                       (wire . "count")
+                       (required . t)
+                       (schema . ((type . "integer"))))]))])))))
+    (should (dsh-protocol-bridge-plugin-response-ok response))
+    (should-not (dsh-protocol-bridge-plugin-response-error response))
+    (let* ((plugin (dsh-protocol-bridge-plugin-response-plugin response))
+           (endpoint (car (dsh-protocol-bridge-plugin-endpoints plugin)))
+           (parameters (dsh-protocol-bridge-endpoint-parameters endpoint))
+           (agent (car parameters))
+           (count (cadr parameters)))
+      (should (equal "@scope/pkg" (dsh-protocol-bridge-plugin-package plugin)))
+      (should (equal "agentId"
+                     (dsh-protocol-bridge-endpoint-requires-agent endpoint)))
+      (should (= 2 (length parameters)))
+      (should (equal "agentId" (dsh-protocol-bridge-parameter-wire agent)))
+      (should-not (dsh-protocol-bridge-parameter-required agent))
+      (should (equal "lookup" (dsh-protocol-bridge-parameter-source agent)))
+      (should (equal "string" (alist-get 'type
+                                        (dsh-protocol-bridge-parameter-schema
+                                         agent))))
+      (should (dsh-protocol-bridge-parameter-required count))
+      (should (equal "integer" (alist-get 'type
+                                         (dsh-protocol-bridge-parameter-schema
+                                          count)))))))
+
+(ert-deftest dsh-emacs-test-protocol-bridge-agents-and-result ()
+  :tags '(dsh-unit)
+  (let* ((agents (dsh-protocol-bridge-agent-list--from-alist
+                  '((ok . t)
+                    (agents . [((id . "session-1") (status . "idle")
+                                (cwd . "/tmp/project"))
+                               "junk"]))))
+         (agent (car (dsh-protocol-bridge-agent-list-agents agents)))
+         (ok (dsh-protocol-bridge-result--from-alist
+              '((ok . t) (package . "@scope/pkg") (endpoint . "ns/run")
+                (result . ((value . 42))))))
+         (bad (dsh-protocol-bridge-result--from-alist
+               '((ok . :json-false)
+                 (error . ((code . "package-not-exposed")
+                           (message . "not exposed")
+                           (field . "package")))))))
+    (should (dsh-protocol-bridge-agent-list-ok agents))
+    (should (= 1 (length (dsh-protocol-bridge-agent-list-agents agents))))
+    (should (equal "session-1" (dsh-protocol-bridge-agent-id agent)))
+    (should (equal "idle" (dsh-protocol-bridge-agent-status agent)))
+    (should (equal "/tmp/project" (dsh-protocol-bridge-agent-cwd agent)))
+    (should (dsh-protocol-bridge-result-ok ok))
+    (should (equal "ns/run" (dsh-protocol-bridge-result-endpoint ok)))
+    (should (equal 42 (cdr (assq 'value (dsh-protocol-bridge-result-result ok)))))
+    (should-not (dsh-protocol-bridge-result-ok bad))
+    (should (equal "package-not-exposed"
+                   (dsh-protocol-bridge-error-code
+                    (dsh-protocol-bridge-result-error bad))))
+    (should (equal "package"
+                   (dsh-protocol-bridge-error-field
+                    (dsh-protocol-bridge-result-error bad))))))
+
+(ert-deftest dsh-emacs-test-protocol-bridge-route-groups ()
+  :tags '(dsh-unit)
+  (let* ((response
+          (dsh-protocol-bridge-route-list--from-alist
+           '((ok . t)
+             (routes
+              . [((id . "dsh-session-manager")
+                  (title . "dsh-session-manager")
+                  (package . "dsh-session-manager")
+                  (thirdParty . t)
+                  (selected . t)
+                  (kinds . ["exact"])
+                  (prefixes . :json-false)
+                  (routeCount . 2)
+                  (paths . ["/dsh-session-manager/delete"
+                            "/dsh-session-manager/stats"]))
+                 ((id . "mcp-manager-plus")
+                  (title . "MCP Manager")
+                  (package . "dsh-mcp-manager-plus")
+                  (thirdParty . t)
+                  (selected . :json-false)
+                  (kinds . ["prefix"])
+                  (prefixes . t)
+                  (routeCount . 1)
+                  (paths . ["/mcp-manager-plus"]))]))))
+         (routes (dsh-protocol-bridge-route-list-routes response))
+         (exact (car routes))
+         (prefix (cadr routes)))
+    (should (dsh-protocol-bridge-route-list-ok response))
+    (should-not (dsh-protocol-bridge-route-list-error response))
+    (should (= 2 (length routes)))
+    (should (equal "dsh-session-manager"
+                   (dsh-protocol-bridge-route-group-id exact)))
+    (should (dsh-protocol-bridge-route-group-selected exact))
+    (should-not (dsh-protocol-bridge-route-group-prefixes exact))
+    (should (equal '("exact") (dsh-protocol-bridge-route-group-kinds exact)))
+    (should (equal '("/dsh-session-manager/delete"
+                     "/dsh-session-manager/stats")
+                   (dsh-protocol-bridge-route-group-paths exact)))
+    (should (equal 2 (dsh-protocol-bridge-route-group-route-count exact)))
+    (should-not (dsh-protocol-bridge-route-group-selected prefix))
+    (should (dsh-protocol-bridge-route-group-prefixes prefix))
+    (should (equal '("prefix") (dsh-protocol-bridge-route-group-kinds prefix)))
+    (should (equal '("/mcp-manager-plus")
+                   (dsh-protocol-bridge-route-group-paths prefix)))))
+
+(ert-deftest dsh-emacs-test-protocol-bridge-malformed-responses-decline ()
+  :tags '(dsh-unit)
+  (let ((list (dsh-protocol-bridge-plugin-list--from-alist [])))
+    (should-not (dsh-protocol-bridge-plugin-list-ok list))
+    (should-not (dsh-protocol-bridge-plugin-list-plugins list)))
+  (let ((detail (dsh-protocol-bridge-plugin-response--from-alist "junk")))
+    (should-not (dsh-protocol-bridge-plugin-response-ok detail))
+    (should-not (dsh-protocol-bridge-plugin-response-plugin detail)))
+  (let ((agents (dsh-protocol-bridge-agent-list--from-alist '((ok . t)))))
+    (should (dsh-protocol-bridge-agent-list-ok agents))
+    (should-not (dsh-protocol-bridge-agent-list-agents agents)))
+  (let ((routes (dsh-protocol-bridge-route-list--from-alist [])))
+    (should-not (dsh-protocol-bridge-route-list-ok routes))
+    (should-not (dsh-protocol-bridge-route-list-routes routes))))
+
+(ert-deftest dsh-emacs-test-protocol-bridge-invoke-request ()
+  :tags '(dsh-unit)
+  (should (equal (dsh-protocol-write-json
+                  (dsh-protocol-bridge-invoke-request
+                   "@scope/pkg" "ns/run" '(("x" . 1))))
+                 (concat "{\"package\":\"@scope/pkg\","
+                         "\"endpoint\":\"ns/run\",\"args\":{\"x\":1}}")))
+  (should (string-match-p
+           "\"args\":{}"
+           (dsh-protocol-write-json
+            (dsh-protocol-bridge-invoke-request "@scope/pkg" "ns/run")))))
+
+(ert-deftest dsh-emacs-test-protocol-write-json-pretty-display ()
+  :tags '(dsh-unit)
+  (should (equal (dsh-protocol-write-json '((a . 1)) nil) "{\"a\":1}"))
+  (should (string-match-p "\n" (dsh-protocol-write-json '((a . 1)) t))))
+
 (provide 'dsh-test-protocol)
 ;;; dsh-test-protocol.el ends here

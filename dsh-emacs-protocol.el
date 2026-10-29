@@ -52,6 +52,26 @@
 ;;   skills.list      → dsh-protocol-skill-list (skills)
 ;;                        └─ dsh-protocol-skill (name description when-to-use
 ;;                             model-invocable path)
+;;   plugins-bridge   → dsh-protocol-bridge-plugin-list (ok error plugins)
+;;                        └─ dsh-protocol-bridge-plugin (package title
+;;                             description version phase enabled
+;;                             endpoint-count endpoints)
+;;                             └─ dsh-protocol-bridge-endpoint (package
+;;                                  endpoint namespace method kind
+;;                                  description requires-agent parameters)
+;;                                  └─ dsh-protocol-bridge-parameter (name
+;;                                       wire required source description
+;;                                       schema)
+;;                      dsh-protocol-bridge-plugin-response (ok error plugin)
+;;                      dsh-protocol-bridge-agent-list (ok error agents)
+;;                        └─ dsh-protocol-bridge-agent (id status cwd)
+;;                      dsh-protocol-bridge-route-list (ok error routes)
+;;                        └─ dsh-protocol-bridge-route-group (id title
+;;                             package third-party selected kinds prefixes
+;;                             route-count paths)
+;;                      dsh-protocol-bridge-result (ok error package endpoint
+;;                                                   result)
+;;                      dsh-protocol-bridge-error (code message field)
 ;;   inbox projection → dsh-protocol-queue-item (id placement text kind)
 ;;   permissionPresets/catalog → dsh-protocol-permission-catalog (options)
 ;;                        └─ dsh-protocol-permission-option (value name
@@ -96,15 +116,17 @@ to the transport boundary.  Input must already be decoded from UTF-8."
           (json-false :json-false))
       (if string (json-read-from-string string) (json-read)))))
 
-(defun dsh-protocol-write-json (value)
+(defun dsh-protocol-write-json (value &optional pretty)
   "Encode wire VALUE independently of user json.el settings.
 Use nil for null, `:json-false' for false, t for true, alists or hash
 tables for objects and vectors for arrays.  Retain json.el's list-array
 support for opaque payloads such as question answers; native serialization
-is not a drop-in replacement for those lists.  Errors propagate to callers."
+is not a drop-in replacement for those lists.  PRETTY enables json.el's
+indented display formatting for non-wire callers.  Errors propagate to
+callers."
   (let ((json-null nil)
         (json-false :json-false)
-        (json-encoding-pretty-print nil)
+        (json-encoding-pretty-print pretty)
         (json-encoding-separator ",")
         (json-encoding-object-sort-predicate nil))
     (json-encode value)))
@@ -796,6 +818,266 @@ is nil for providers that manage their own resources."
   "The `skills.list' response value: the session's user-invocable skills, in
 the host's order."
   skills)
+
+;; ---------------------------------------------------------------------------
+;; dsh-plugins-bridge (external HTTP API)
+;; ---------------------------------------------------------------------------
+;; The bridge is a dsh Web plugin, not a dsh RPC namespace: its `/v1' routes
+;; answer their own JSON envelopes.  These views keep the bridge's wire field
+;; names in their constructors, so business code reads decoded fields through
+;; accessors just like the RPC payloads above.
+
+(cl-defstruct (dsh-protocol-bridge-error
+               (:constructor dsh-protocol-bridge-error--from-alist
+                             (alist
+                              &aux
+                              (code (dsh-protocol--field 'code alist))
+                              (message (dsh-protocol--field 'message alist))
+                              (field (dsh-protocol--field 'field alist)))))
+  "One `{ok:false,error:{code,message,field?}}' bridge failure."
+  code
+  message
+  field)
+
+(cl-defstruct (dsh-protocol-bridge-parameter
+               (:constructor dsh-protocol-bridge-parameter--from-alist
+                             (alist
+                              &aux
+                              (name (dsh-protocol--field 'name alist))
+                              (wire (dsh-protocol--field 'wire alist))
+                              (required (dsh-protocol--boolean
+                                         (dsh-protocol--field 'required alist)))
+                              (source (dsh-protocol--field 'source alist))
+                              (description (dsh-protocol--field 'description alist))
+                              (schema (dsh-protocol--field 'schema alist)))))
+  "One named argument of a bridge endpoint descriptor.
+WIRE is the JSON property the gateway expects; SCHEMA is the descriptor's
+JSON Schema (or nil).  SOURCE says how the gateway resolves the value
+\(for example `lookup' for an agent)."
+  name
+  wire
+  required
+  source
+  description
+  schema)
+
+(cl-defstruct (dsh-protocol-bridge-endpoint
+               (:constructor dsh-protocol-bridge-endpoint--from-alist
+                             (alist
+                              &aux
+                              (package (dsh-protocol--field 'package alist))
+                              (endpoint (dsh-protocol--field 'endpoint alist))
+                              (namespace (dsh-protocol--field 'namespace alist))
+                              (method (dsh-protocol--field 'method alist))
+                              (kind (dsh-protocol--field 'kind alist))
+                              (description
+                               (dsh-protocol--field 'description alist))
+                              (requires-agent
+                               (dsh-protocol--field 'requiresAgent alist))
+                              (parameters
+                               (mapcar
+                                #'dsh-protocol-bridge-parameter--from-alist
+                                (dsh-protocol--objects
+                                 (dsh-protocol--field 'parameters alist)))))))
+  "One bridge endpoint descriptor (summary or full detail).
+PACKAGE and ENDPOINT identify the call; REQUIRES-AGENT names the wire
+argument the gateway resolves through the live Agent lookup.  A summary row
+has no PARAMETERS."
+  package
+  endpoint
+  namespace
+  method
+  kind
+  description
+  requires-agent
+  parameters)
+
+(cl-defstruct (dsh-protocol-bridge-plugin
+               (:constructor dsh-protocol-bridge-plugin--from-alist
+                             (alist
+                              &aux
+                              (package (dsh-protocol--field 'package alist))
+                              (title (dsh-protocol--field 'title alist))
+                              (description (dsh-protocol--field 'description alist))
+                              (version (dsh-protocol--field 'version alist))
+                              (phase (dsh-protocol--field 'phase alist))
+                              (enabled (dsh-protocol--boolean
+                                        (dsh-protocol--field 'enabled alist)))
+                              (endpoint-count
+                               (dsh-protocol--field 'endpointCount alist))
+                              (endpoints
+                               (mapcar
+                                #'dsh-protocol-bridge-endpoint--from-alist
+                                (dsh-protocol--objects
+                                 (dsh-protocol--field 'endpoints alist)))))))
+  "One exposed plugin row.
+The catalog `/v1/plugins' and the detail `/v1/plugin' routes share this view;
+detail rows carry full endpoint descriptors (parameters included), while
+catalog rows carry endpoint summaries."
+  package
+  title
+  description
+  version
+  phase
+  enabled
+  endpoint-count
+  endpoints)
+
+(cl-defstruct (dsh-protocol-bridge-plugin-list
+               (:constructor dsh-protocol-bridge-plugin-list--from-alist
+                             (alist
+                              &aux
+                              (ok (dsh-protocol--boolean
+                                   (dsh-protocol--field 'ok alist)))
+                              (error (let ((error (dsh-protocol--field
+                                                   'error alist)))
+                                       (and (consp error)
+                                            (dsh-protocol-bridge-error--from-alist
+                                             error))))
+                              (plugins
+                               (mapcar
+                                #'dsh-protocol-bridge-plugin--from-alist
+                                (dsh-protocol--objects
+                                 (dsh-protocol--field 'plugins alist)))))))
+  "The `/v1/plugins' response: OK plus the exposed plugin rows."
+  ok
+  error
+  plugins)
+
+(cl-defstruct (dsh-protocol-bridge-plugin-response
+               (:constructor dsh-protocol-bridge-plugin-response--from-alist
+                             (alist
+                              &aux
+                              (ok (dsh-protocol--boolean
+                                   (dsh-protocol--field 'ok alist)))
+                              (error (let ((error (dsh-protocol--field
+                                                   'error alist)))
+                                       (and (consp error)
+                                            (dsh-protocol-bridge-error--from-alist
+                                             error))))
+                              (plugin (and (consp alist)
+                                           (dsh-protocol-bridge-plugin--from-alist
+                                            alist))))))
+  "The `/v1/plugin' response: OK, an optional failure, and the detail row."
+  ok
+  error
+  plugin)
+
+(cl-defstruct (dsh-protocol-bridge-agent
+               (:constructor dsh-protocol-bridge-agent--from-alist
+                             (alist
+                              &aux
+                              (id (dsh-protocol--field 'id alist))
+                              (status (dsh-protocol--field 'status alist))
+                              (cwd (dsh-protocol--field 'cwd alist)))))
+  "One live Agent from `/v1/agents'."
+  id
+  status
+  cwd)
+
+(cl-defstruct (dsh-protocol-bridge-agent-list
+               (:constructor dsh-protocol-bridge-agent-list--from-alist
+                             (alist
+                              &aux
+                              (ok (dsh-protocol--boolean
+                                   (dsh-protocol--field 'ok alist)))
+                              (error (let ((error (dsh-protocol--field
+                                                   'error alist)))
+                                       (and (consp error)
+                                            (dsh-protocol-bridge-error--from-alist
+                                             error))))
+                              (agents
+                               (mapcar
+                                #'dsh-protocol-bridge-agent--from-alist
+                                (dsh-protocol--objects
+                                 (dsh-protocol--field 'agents alist)))))))
+  "The `/v1/agents' response: OK plus the live Agent rows."
+  ok
+  error
+  agents)
+
+(cl-defstruct (dsh-protocol-bridge-route-group
+               (:constructor dsh-protocol-bridge-route-group--from-alist
+                             (alist
+                              &aux
+                              (id (dsh-protocol--field 'id alist))
+                              (title (dsh-protocol--field 'title alist))
+                              (package (dsh-protocol--field 'package alist))
+                              (third-party
+                               (dsh-protocol--boolean
+                                (dsh-protocol--field 'thirdParty alist)))
+                              (selected (dsh-protocol--boolean
+                                         (dsh-protocol--field 'selected alist)))
+                              (kinds (dsh-protocol--list
+                                      (dsh-protocol--field 'kinds alist)))
+                              (prefixes (dsh-protocol--boolean
+                                         (dsh-protocol--field 'prefixes alist)))
+                              (route-count
+                               (dsh-protocol--field 'routeCount alist))
+                              (paths (dsh-protocol--list
+                                      (dsh-protocol--field 'paths alist))))))
+  "One discovered HTTP route group from `/v1/routes'.
+PATHS are absolute target paths.  PREFIXES is non-nil when the group
+matches path prefixes, so the caller may enter a path below its own
+prefix instead of choosing a listed path."
+  id
+  title
+  package
+  third-party
+  selected
+  kinds
+  prefixes
+  route-count
+  paths)
+
+(cl-defstruct (dsh-protocol-bridge-route-list
+               (:constructor dsh-protocol-bridge-route-list--from-alist
+                             (alist
+                              &aux
+                              (ok (dsh-protocol--boolean
+                                   (dsh-protocol--field 'ok alist)))
+                              (error (let ((error (dsh-protocol--field
+                                                   'error alist)))
+                                       (and (consp error)
+                                            (dsh-protocol-bridge-error--from-alist
+                                             error))))
+                              (routes
+                               (mapcar
+                                #'dsh-protocol-bridge-route-group--from-alist
+                                (dsh-protocol--objects
+                                 (dsh-protocol--field 'routes alist)))))))
+  "The `/v1/routes' response: OK plus the discovered route groups."
+  ok
+  error
+  routes)
+
+(cl-defstruct (dsh-protocol-bridge-result
+               (:constructor dsh-protocol-bridge-result--from-alist
+                             (alist
+                              &aux
+                              (ok (dsh-protocol--boolean
+                                   (dsh-protocol--field 'ok alist)))
+                              (error (let ((error (dsh-protocol--field
+                                                   'error alist)))
+                                       (and (consp error)
+                                            (dsh-protocol-bridge-error--from-alist
+                                             error))))
+                              (package (dsh-protocol--field 'package alist))
+                              (endpoint (dsh-protocol--field 'endpoint alist))
+                              (result (dsh-protocol--field 'result alist)))))
+  "The `/v1/invoke' response: OK, the call identity and its opaque result."
+  ok
+  error
+  package
+  endpoint
+  result)
+
+(defun dsh-protocol-bridge-invoke-request (package endpoint &optional args)
+  "Return the `/v1/invoke' wire body for PACKAGE's ENDPOINT and ARGS.
+ARGS is a decoded alist of named arguments, or nil for `{}'."
+  (list (cons "package" package)
+        (cons "endpoint" endpoint)
+        (cons "args" (or args (make-hash-table :test #'equal)))))
 
 ;; ---------------------------------------------------------------------------
 ;; permissionPresets/catalog

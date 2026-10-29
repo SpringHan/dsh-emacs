@@ -22,6 +22,7 @@ dsh-emacs/
 ├── dsh-emacs-provider.el     # Minibuffer provider setup through settings and credential RPCs
 ├── dsh-emacs-command.el      # Slash surface: commands/list + commands/execute, "/" completion and menu
 ├── dsh-emacs-skill.el        # Skill catalog (skills/list) and /name gestures
+├── dsh-emacs-plugin.el       # dsh-plugins-bridge API and HTTP route proxy
 ├── dsh-emacs-shell.el        # Client-side `!command` shell commands (local execution)
 ├── dsh-emacs-reference.el    # @ reference completion, chips and navigation
 ├── dsh-emacs-composer.el     # Composer chrome: Next Message and Goal rows above the input
@@ -580,6 +581,68 @@ Output is capped by `dsh-emacs-shell-max-output`;
 `dsh-emacs-shell-require-confirm` optionally
 gates each run behind `y-or-n-p` (see docs/shell-commands.md).
 
+## Plugin bridge (`dsh-emacs-plugin.el`)
+
+`M-x dsh-emacs-plugins` operates a dsh plugin through the
+**dsh-plugins-bridge** dsh Web plugin. The bridge is not a dsh RPC namespace:
+it answers its own `{ok, result, error}` JSON envelopes under
+`/plugins-bridge/v1`. The module therefore uses the generic HTTP/JSON
+transport in `dsh-emacs-server.el` and the bridge views in
+`dsh-emacs-protocol.el`, not `dsh-emacs--rpc-async`.
+
+Flow: read `/v1/plugins` (exposed package rows), pick a package, read
+`/v1/plugin?package=…` (full endpoint descriptors), pick an endpoint, read
+its arguments, then POST `/v1/invoke` and display the result. An
+agent-scoped endpoint (`requiresAgent`, or a required `agentId` parameter)
+reads `/v1/agents` and completes live ids. Required parameters are prompted
+by JSON Schema type; optional parameters are one JSON object. A prefix
+argument replaces all argument prompts with one JSON object, so nested or
+unusual arguments remain expressible.
+
+Catalog and detail reads are bounded synchronous GETs: the command needs
+the data before it can prompt, and the payloads are small. Invocation is
+asynchronous because one Remote call may run for the bridge's two-minute
+limit. The result opens in a read-only `*dsh-plugin: PACKAGE#ENDPOINT*`
+buffer; `q` closes it. HTTP error bodies are decoded on 4xx/5xx so the
+bridge's `error.code`/`message`/`field` reach the user. All requests carry
+the bridge bearer token; `dsh-emacs-plugin-bridge-token` or
+`DSH_BRIDGE_TOKEN` supplies it, and `dsh-emacs-plugin-bridge-base-url`
+defaults to `<dsh-emacs-base-url>/plugins-bridge/v1`.
+
+`M-x dsh-emacs-plugin-routes` covers the bridge's **HTTP route proxy** for
+plugins that register routes directly on `dsh-host-webserver` instead of
+producing a Typert API. `dsh-emacs-plugin--select-route` reads `/v1/routes`,
+chooses a group, normalizes the target path under that group's prefix and
+chooses a method; its optional `GROUP`, `METHOD` and `PATH` arguments replace
+the matching prompts. The command reads a body plus Content-Type for
+body-bearing methods (a supplied `BODY` is sent as `application/json`) and
+forwards through `/v1/http/<target-path>`. Selected
+groups only: `/v1/routes` reports `selected`, and choosing an unselected group
+stops before the request with a Settings hint. Unlike the JSON plugin API,
+route responses are arbitrary, so the interactive path uses
+`dsh-emacs--http-request` and keeps the raw status, headers and body. The
+display buffer pretty-prints JSON, inserts text as-is and summarizes binary
+bodies; `dsh-emacs-plugin-route-max-output` bounds text. When both `GROUP` and
+`METHOD` are supplied, `dsh-emacs-plugin-routes` uses
+`dsh-emacs--http-json-sync` instead, returns the decoded JSON body and opens no
+buffer; transport, non-2xx and unparseable-body failures signal `user-error`,
+while `204`/`205` return nil.
+`M-x dsh-emacs-plugin-insert-route-call` reuses `--select-route`, reads a
+nonempty body for body-bearing methods and inserts the corresponding call at
+point, so generated code makes the same synchronous request. The target
+route's own loopback/session/method
+checks still run. When the bridge base URL and `dsh-emacs-base-url` share an
+origin, route requests also carry the current signed DSH session Cookie
+(`dsh-emacs-plugin-route-forward-dsh-auth`, default t), so target routes that
+call `connection.requestRejection` see the session Emacs already holds. A
+bridge on another origin receives only the bridge token, and a missing Emacs
+session still yields 401. See
+[decision record 155](../postmortem/155-http-route-proxy.md) and
+[156](../postmortem/156-route-programmatic-calls.md).
+
+The bridge's agent-tool surface remains separate and is not exposed by these
+commands. See [decision record 154](../postmortem/154-plugin-bridge-client.md).
+
 ## Protocol layer (`dsh-emacs-protocol.el`)
 
 `dsh-protocol-read-json` owns JSON decoding for HTTP responses and WebSocket
@@ -777,6 +840,21 @@ protocol field changes stay in the decoder. Covered payloads:
   `skills/list` → `dsh-protocol-skill-list` (skills) → `dsh-protocol-skill`
   (name, description, when-to-use, model-invocable, path) — the two catalogs
   the `/` completion merges
+- dsh-plugins-bridge → `dsh-protocol-bridge-plugin-list` (ok, error, plugins)
+  → `dsh-protocol-bridge-plugin` (package, title, description, version,
+  phase, enabled, endpoint-count, endpoints) → `dsh-protocol-bridge-endpoint`
+  (package, endpoint, namespace, method, kind, description, requires-agent,
+  parameters) → `dsh-protocol-bridge-parameter` (name, wire, required,
+  source, description, schema). Detail responses use
+  `dsh-protocol-bridge-plugin-response`; `/agents` uses
+  `dsh-protocol-bridge-agent-list`; `/invoke` uses
+  `dsh-protocol-bridge-result`. A non-object response yields an empty view
+  rather than signalling at the protocol boundary. Outbound invoke bodies use
+  `dsh-protocol-bridge-invoke-request`.
+- `/v1/routes` → `dsh-protocol-bridge-route-list` (ok, error, routes) →
+  `dsh-protocol-bridge-route-group` (id, title, package, third-party,
+  selected, kinds, prefixes, route-count, paths). `kinds` and `paths` are
+  normalized from wire arrays to lists.
 - `command/run` / `command/done` → `dsh-protocol-command-event` (type,
   command-id, name, kind, text). Run creates a row and uses the same optimistic
   cleanup as submit rejection; done keeps that row's label and icon. Only
@@ -940,6 +1018,20 @@ arguments and JSON envelopes described above; feature owners retain command
 policy and callbacks. The server normalizes UTF-8 response bodies and reads JSON
 through protocol; `dsh-protocol-rpc-result--from-alist` still owns RPC versus
 upload envelopes.
+
+`dsh-emacs--http-request` is the generic asynchronous HTTP primitive
+underneath that envelope layer. It accepts a method, URL, headers and an
+already-encoded body, and dispatches a plist with `:status`, `:headers`,
+`:body` and `:error`. `dsh-emacs--http-json` wraps it with UTF-8 JSON
+decoding and adds `:value`/`:parse-error`; `dsh-emacs--http-json-sync` is
+the bounded synchronous equivalent for small catalogs and one-shot route
+calls. HTTP error bodies
+remain available, which the plugin bridge needs for its JSON error objects
+and the HTTP route proxy needs for arbitrary responses.
+`dsh-emacs--http-post` applies the DSH authentication headers, status policy
+and stale-cookie recovery on top of the asynchronous primitive. The plugin
+API client supplies its own bearer token instead of DSH credentials; the
+route proxy adds the same-origin DSH session Cookie when one is available.
 
 The server also supplies authentication headers. HTTP requests leave Basic
 credentials in URL userinfo for the URL library and add the package-owned

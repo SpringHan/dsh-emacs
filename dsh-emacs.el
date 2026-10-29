@@ -19,11 +19,13 @@
 ;; - Chat buffer (with tool-call and reasoning folding)
 ;; - Mode-line stats (cwd, git branch, model, tokens, ctx%, cost)
 ;; - Markdown rendering
+;; - dsh plugin invocation through dsh-plugins-bridge
 ;;
 ;; Quick start:
 ;;   (require 'dsh-emacs)
 ;;   M-x dsh-emacs                    ; Open the session list
 ;;   M-x dsh-emacs-new-session        ; Create a new session
+;;   M-x dsh-emacs-plugins            ; Operate an exposed dsh plugin
 ;;
 ;; Chat buffer keybindings:
 ;;   C-c C-c   Send (while running, queues/steers per
@@ -89,6 +91,7 @@
 (require 'dsh-emacs-provider)
 (require 'dsh-emacs-command)
 (require 'dsh-emacs-skill)
+(require 'dsh-emacs-plugin)
 (require 'dsh-emacs-reference)
 (require 'dsh-emacs-shell)
 (require 'dsh-emacs-session)

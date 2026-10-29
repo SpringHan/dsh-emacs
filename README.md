@@ -5,8 +5,9 @@
 
 Use [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`)
 from Emacs: streaming replies, tool calls, workspace sessions, subagent chats,
-file attachments, and model selection. Requires **Emacs 28.1+**, with no
-mandatory third-party Emacs packages.
+file attachments, model selection, and dsh plugin API/HTTP-route
+invocation. Requires **Emacs 28.1+**, with no mandatory third-party Emacs
+packages.
 
 https://github.com/user-attachments/assets/9ee9fc66-1997-49b7-a921-5753690edafa
 
@@ -136,6 +137,16 @@ and cached Git detection. See [Mode-line](docs/modeline.md).
   neither sent to the model nor saved in server history. Plain path completion
   also uses the machine running Emacs; use `@` for remote server files.
   See [Shell commands](docs/shell-commands.md).
+- **`M-x dsh-emacs-plugins`** operates an exposed dsh plugin through
+  `dsh-plugins-bridge`: it lists the exposed packages, reads one plugin's
+  Remote endpoints, prompts for the declared arguments and invokes the call
+  asynchronously. **`M-x dsh-emacs-plugin-routes`** calls an exposed plugin
+  HTTP route instead, for plugins that do not provide a Typert API; with
+  `group`, `method`, `path` and `body` arguments it returns decoded JSON
+  synchronously, and
+  `M-x dsh-emacs-plugin-insert-route-call` inserts such a call at point.
+  Configure the bridge token and allowlists from dsh
+  **Settings → Plugins Bridge**. See [Plugin bridge](docs/plugins.md).
 
 Unfinished output stays in a compact transcript card, explicitly labelled
 **Retry** (scheduled or started), **Failed reply**, **Cancelled reply**, or
@@ -207,7 +218,7 @@ for local or TRAMP configuration files.
 
 - [Customization](docs/customization.md) — options, history, workspaces, approvals
 - [@ references](docs/reference.md) · [Slash commands](docs/slash-commands.md) · [Skills](docs/skills.md)
-- [Shell commands](docs/shell-commands.md) · [Model picker](docs/model-picker.md) · [Subagents](docs/subagents.md)
+- [Shell commands](docs/shell-commands.md) · [Plugin bridge](docs/plugins.md) · [Model picker](docs/model-picker.md) · [Subagents](docs/subagents.md)
 - [Mode line](docs/modeline.md) · [UI styling](docs/ui-styling.md)
 - [Changelog](CHANGELOG.md) — release notes and breaking changes
 - [Architecture](docs/architecture.md) · [RPC protocol](docs/rpc.md)

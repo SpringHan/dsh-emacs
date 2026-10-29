@@ -750,6 +750,157 @@ authentication that was not satisfied."
             (format " (HTTP %S)" code))))
     ""))
 
+(defun dsh-emacs--http-parse-headers (text)
+  "Parse HTTP response header TEXT into an alist.
+Names are lower-case; values are trimmed.  The status line and empty
+lines are ignored, and a malformed line is skipped."
+  (let (headers)
+    (dolist (line (split-string (replace-regexp-in-string "\r" "" text)
+                                "\n" t))
+      (unless (string-match-p "\\`HTTP/" line)
+        (when (string-match "\\`\\([^:]+\\):[ \t]*\\(.*\\)\\'" line)
+          (push (cons (downcase (match-string 1 line))
+                      (string-trim (match-string 2 line)))
+                headers))))
+    (nreverse headers)))
+
+(defun dsh-emacs--http-request (method url headers body callback)
+  "Send an HTTP request and deliver its raw response asynchronously.
+METHOD is a method string; URL the absolute address; HEADERS the request
+headers (an alist, including authentication chosen by the caller); BODY a
+unibyte string already encoded by the caller, or nil.  CALLBACK runs in
+the buffer that made the request and receives a plist with:
+
+  :status      numeric HTTP status, or nil on transport failure
+  :headers     response headers as an alist of lower-case names to values
+  :body        raw response body string, or nil
+  :error       the URL transport error, or nil
+
+HTTP error responses still carry their body here.  Callers own status
+policy, content interpretation and authentication.  A callback C-g is
+swallowed so it cannot escape a process filter.
+
+This is the package's generic asynchronous HTTP primitive.  JSON callers
+use `dsh-emacs--http-json'; domain wrappers (`dsh-emacs--http-post') add
+credentials and decide what a response means."
+  (let ((callback-buffer (current-buffer)))
+    (cl-labels
+        ((dispatch (result)
+           (when (buffer-live-p callback-buffer)
+             (with-current-buffer callback-buffer
+               (condition-case nil
+                   (funcall callback result)
+                 (quit nil))))))
+      ;; Keep progress messages out of the minibuffer.  In particular,
+      ;; `Contacting host...' otherwise remains visible when a successful
+      ;; callback does not emit a follow-up message.
+      (let ((url-request-noninteractive t)
+            (url-request-method method)
+            (url-request-extra-headers headers)
+            (url-request-data body))
+        (url-retrieve
+         url
+         (lambda (status)
+           ;; JSON decode of big history windows allocates heavily;
+           ;; Profiler-measured on the default window (~30k raw events):
+           ;; Automatic GC took ~46% of the whole open.  Enlarge the GC
+           ;; threshold dynamically to defer the GC storm into one collection
+           ;; after parsing — parsing and the callback run in the same dynamic
+           ;; scope.
+           (let* ((gc-cons-threshold (* 64 1024 1024))
+                  (gc-cons-percentage 0.6)
+                  (http-status (and (boundp 'url-http-response-status)
+                                    url-http-response-status))
+                  (transport-error (plist-get status :error))
+                  (header-end (save-excursion
+                                (goto-char (point-min))
+                                (when (re-search-forward "^$" nil t)
+                                  (point))))
+                  (response-headers
+                   (and header-end
+                        (dsh-emacs--http-parse-headers
+                         (buffer-substring-no-properties
+                          (point-min) header-end))))
+                  body)
+             ;; A transport failure may leave no HTTP headers at all.
+             (when header-end
+               (goto-char (point-min))
+               (re-search-forward "^$")
+               (delete-region (point) (point-min))
+               ;; `^$' matches before the blank line's own newline; that
+               ;; newline terminates the headers, not the body.
+               (when (memq (char-after) '(?\n ?\r))
+                 (delete-char 1))
+               (setq body (buffer-substring-no-properties
+                           (point) (point-max))))
+             (when (buffer-live-p (current-buffer))
+               (kill-buffer (current-buffer)))
+             (dispatch (list :status http-status
+                             :headers response-headers
+                             :body body
+                             :error transport-error))))
+         nil t t)))))
+
+(defun dsh-emacs--http-json (method url headers body callback)
+  "Send an HTTP request and decode its JSON response asynchronously.
+METHOD, URL, HEADERS and BODY are as in `dsh-emacs--http-request'.
+CALLBACK receives that response plist plus :value (the decoded JSON body,
+or nil) and :parse-error (the JSON read error, or nil)."
+  (dsh-emacs--http-request
+   method url headers body
+   (lambda (response)
+     (let* ((body (plist-get response :body))
+            value
+            parse-error)
+       (when body
+         (condition-case err
+             (setq value
+                   (dsh-protocol-read-json
+                    (if (multibyte-string-p body)
+                        body
+                      (decode-coding-string body 'utf-8))))
+           (error (setq parse-error err))))
+       (funcall callback
+                (append response
+                        (list :value value
+                              :parse-error parse-error)))))))
+
+(defun dsh-emacs--http-json-sync (method url headers &optional body timeout)
+  "Send an HTTP request synchronously and return its response plist.
+METHOD, URL, HEADERS and BODY are as in `dsh-emacs--http-json'.  TIMEOUT
+bounds the wait in seconds; nil keeps the URL library's default.  Return
+a plist with :status, :value, :error and :parse-error.  A timeout or
+connection failure returns a nil :status and the transport error rather
+than signalling.  This is the bounded synchronous path for callers that
+need a JSON value before continuing (small catalogs, one-shot route
+calls); it is not for long-running streaming work."
+  (let ((url-request-noninteractive t)
+        (url-request-method method)
+        (url-request-extra-headers headers)
+        (url-request-data body))
+    (condition-case err
+        (let ((buffer (url-retrieve-synchronously url t t timeout)))
+          (if (not (buffer-live-p buffer))
+              (list :status nil :value nil
+                    :error '(error "request timed out") :parse-error nil)
+            (unwind-protect
+                (with-current-buffer buffer
+                  (let ((http-status (and (boundp 'url-http-response-status)
+                                          url-http-response-status))
+                        value
+                        parse-error)
+                    (goto-char (point-min))
+                    (when (re-search-forward "^$" nil t)
+                      (delete-region (point) (point-min))
+                      (condition-case parse-err
+                          (setq value (dsh-emacs--decode-response-body))
+                        (error (setq parse-error parse-err))))
+                    (list :status http-status :value value
+                          :error nil :parse-error parse-error)))
+              (kill-buffer buffer))))
+      (error
+       (list :status nil :value nil :error err :parse-error nil)))))
+
 (defun dsh-emacs--http-post (url content-type body callback)
   "POST BODY to URL as CONTENT-TYPE; CALLBACK receives the decoded JSON.
 BODY is the exact bytes to send (a unibyte string already encoded by
@@ -763,66 +914,39 @@ what its own body means.
 Both the RPC envelope calls and the raw file-upload route post through
 here; `url-request-data' carries BODY verbatim (no coding conversion),
 which is what makes the octet-stream upload byte-exact."
-  (let ((url-request-noninteractive t)
-        (url-request-method "POST")
-        (url-request-extra-headers
-         (append (list (cons "Content-Type" content-type))
-                 (dsh-emacs--server-auth-header)))
-        (url-request-data body)
-        (callback-buffer (current-buffer)))
-    (cl-labels
-        ((dispatch (value)
-           (when (buffer-live-p callback-buffer)
-             (with-current-buffer callback-buffer
-               ;; Callback that interacts inside the filter
-               ;; (completing-read etc.) and hits C-g: swallow the
-               ;; quit instead of a process-filter error.
-               (condition-case nil
-                   (funcall callback value)
-                 (quit nil))))))
-      ;; Keep progress messages out of the minibuffer.  In particular,
-      ;; `Contacting host...' otherwise remains visible when a successful
-      ;; callback does not emit a follow-up message.
-      (url-retrieve
-       url
-       (lambda (status)
-         ;; JSON decode of big history windows allocates heavily;
-         ;; Profiler-measured on the default window (~30k raw events):
-         ;; Automatic GC took ~46% of the whole open.  Enlarge the GC
-         ;; threshold dynamically to defer the GC storm into one collection
-         ;; after parsing — parsing and the callback run in the same dynamic
-         ;; scope.
-         (let ((gc-cons-threshold (* 64 1024 1024))
-               (gc-cons-percentage 0.6))
-           (if (plist-get status :error)
-               (let ((err (plist-get status :error)))
-                 (kill-buffer)
-                 ;; A 401 while we sent a cookie means the cached cookie is
-                 ;; stale (an out-of-band server restarted and minted a new
-                 ;; per-process token): drop it so the next call re-mints /
-                 ;; re-prompts instead of 401-looping until Emacs restarts.
-                 (when (dsh-emacs--server-auth-http-401-p err)
-                   (dsh-emacs--server-auth-maybe-expire))
-                 (message "HTTP POST error: %S%s" status
-                          (dsh-emacs--http-error-hint err))
-                 (dispatch nil))
-             (goto-char (point-min))
-             (re-search-forward "^$")
-             (delete-region (point) (point-min))
-             (let ((value (condition-case err
-                              (dsh-emacs--decode-response-body)
-                            (error
-                             ;; Body cannot be parsed (non-JSON, cut stream,
-                             ;; ...): print the reason but still dispatch the
-                             ;; callback (nil), so callers always reach their
-                             ;; failure branch instead of being silently
-                             ;; dropped.
-                             (message "HTTP POST response error: %s"
-                                      (error-message-string err))
-                             nil))))
-               (kill-buffer)
-               (dispatch value)))))
-       nil t t))))
+  (dsh-emacs--http-json
+   "POST" url
+   (append (list (cons "Content-Type" content-type))
+           (dsh-emacs--server-auth-header))
+   body
+   (lambda (response)
+     (let ((status (plist-get response :status))
+           (value (plist-get response :value))
+           (error (plist-get response :error))
+           (parse-error (plist-get response :parse-error)))
+       (cond
+        ((and (or (null status) (< status 400))
+              (not error)
+              (not parse-error))
+         (funcall callback value))
+        ((and (or (null status) (< status 400))
+              (not error)
+              parse-error)
+         (message "HTTP POST response error: %s"
+                  (error-message-string parse-error))
+         (funcall callback nil))
+        (t
+         ;; A 401 while we sent a cookie means the cached cookie is stale
+         ;; (an out-of-band server restarted and minted a new per-process
+         ;; token): drop it so the next call re-mints / re-prompts instead
+         ;; of 401-looping until Emacs restarts.
+         (when (and error (dsh-emacs--server-auth-http-401-p error))
+           (dsh-emacs--server-auth-maybe-expire))
+         (message "HTTP POST error: %S%s"
+                  (or error (and status (list :status status))
+                      '(:error "no response"))
+                  (dsh-emacs--http-error-hint error))
+         (funcall callback nil)))))))
 
 (defun dsh-emacs--rpc-async (method params callback)
   "Asynchronous RPC request; CALLBACK receives (ok-p value-or-error).

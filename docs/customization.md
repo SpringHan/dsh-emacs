@@ -139,6 +139,11 @@ The most commonly used options, straight in your config:
 (setq dsh-emacs-shell-null-stdin t)                 ; close `!` commands' input pipe immediately (EOF, independent of shell syntax)
 (setq dsh-emacs-shell-timeout nil)                  ; nil = no limit; positive integer seconds only (surviving background children are untracked)
 (setq dsh-emacs-jobs-kill-arm-seconds 3)           ; how long the `k' press in the `C-c C-j' background-job menu stays armed before a second press stops the job (matches dsh web's two-press stop)
+(setq dsh-emacs-plugin-bridge-token "…")           ; dsh-plugins-bridge bearer token (nil = use DSH_BRIDGE_TOKEN); see docs/plugins.md
+(setq dsh-emacs-plugin-bridge-base-url nil)        ; nil = <dsh-emacs-base-url>/plugins-bridge/v1
+(setq dsh-emacs-plugin-bridge-timeout 10)          ; seconds for bridge catalog/detail/route-list GETs and synchronous route calls
+(setq dsh-emacs-plugin-route-max-output 50000)     ; max characters of an HTTP route response shown in its buffer (nil = no limit)
+(setq dsh-emacs-plugin-route-forward-dsh-auth t)   ; forward the same-origin DSH session Cookie on route calls so target routes' requestRejection accepts them
 ```
 
 ## Reading history

@@ -1320,5 +1320,109 @@ received, RESULT is FN's return value."
                        (equal saved after-first))))))
     (setq dsh-emacs-server-auth-token nil)))
 
+;; --- HTTP/JSON transport primitives (bridge and RPC callers) ---
+
+(defun dsh-test-server--http-response-buffer (status body)
+  "Return a response buffer with HTTP STATUS and JSON BODY."
+  (let ((buffer (generate-new-buffer " *dsh-http-test*")))
+    (with-current-buffer buffer
+      (insert (format "HTTP/1.1 %s Test\nContent-Type: application/json\n\n%s"
+                      status body))
+      (setq-local url-http-response-status status))
+    buffer))
+
+(ert-deftest dsh-emacs-test-server-http-json-sync-reads-status-and-body ()
+  :tags '(dsh-unit)
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _)
+               (dsh-test-server--http-response-buffer
+                200 "{\"ok\":true,\"value\":7}"))))
+    (let ((response (dsh-emacs--http-json-sync "GET" "http://example.test" nil)))
+      (ert-info ((format "%s" "http-json-sync-reads-status-and-body"))
+        (should (= 200 (plist-get response :status)))
+        (should (equal 7 (cdr (assq 'value (plist-get response :value)))))
+        (should-not (plist-get response :error))
+        (should-not (plist-get response :parse-error)))))
+  ;; HTTP failures keep their JSON body: the bridge reports its error object
+  ;; there.
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _)
+               (dsh-test-server--http-response-buffer
+                404 "{\"ok\":false,\"error\":{\"code\":\"unknown-endpoint\"}}"))))
+    (let ((response (dsh-emacs--http-json-sync "GET" "http://example.test" nil)))
+      (ert-info ((format "%s" "http-json-sync-keeps-error-body"))
+        (should (= 404 (plist-get response :status)))
+        (should (equal "unknown-endpoint"
+                       (cdr (assq 'code
+                                  (cdr (assq 'error
+                                             (plist-get response :value))))))))))
+  ;; A timed-out request returns a value instead of signalling.
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _) nil)))
+    (let ((response (dsh-emacs--http-json-sync "GET" "http://example.test" nil)))
+      (ert-info ((format "%s" "http-json-sync-timeout"))
+        (should-not (plist-get response :status))
+        (should (equal '(error "request timed out")
+                       (plist-get response :error)))))))
+
+(ert-deftest dsh-emacs-test-server-http-json-async-reads-status-and-body ()
+  :tags '(dsh-unit)
+  (let ((caller (generate-new-buffer " *dsh-http-caller*"))
+        (callback-returned-in nil)
+        (result nil))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'url-retrieve)
+                     (lambda (_url callback &rest _)
+                       (let ((buffer (dsh-test-server--http-response-buffer
+                                      403 "{\"ok\":false,\"error\":{\"code\":\"denied\"}}"))
+                             (status '(:error (error http 403))))
+                         (with-current-buffer buffer
+                           (funcall callback status))
+                         buffer))))
+            (with-current-buffer caller
+              (dsh-emacs--http-json "POST" "http://example.test" nil nil
+                                    (lambda (response)
+                                      (setq callback-returned-in (current-buffer))
+                                      (setq result response)))))
+          (ert-info ((format "%s" "http-json-async-reads-status-and-body"))
+            (should (eq callback-returned-in caller))
+            (should (= 403 (plist-get result :status)))
+            (should (equal "denied"
+                           (cdr (assq 'code
+                                      (cdr (assq 'error (plist-get result :value)))))))
+            (should (equal '(error http 403) (plist-get result :error)))))
+      (kill-buffer caller))))
+
+(ert-deftest dsh-emacs-test-server-http-request-raw-response ()
+  :tags '(dsh-unit)
+  (let ((result nil)
+        (request nil))
+    (cl-letf (((symbol-function 'url-retrieve)
+               (lambda (url callback &rest _)
+                 (setq request (list url url-request-method
+                                     url-request-extra-headers url-request-data))
+                 (let ((buffer (dsh-test-server--http-response-buffer
+                                200 "{\"a\":1}")))
+                   (with-current-buffer buffer
+                     (funcall callback nil))
+                   buffer))))
+      (dsh-emacs--http-request
+       "POST" "http://example.test" '(("X-Test" . "1"))
+       (encode-coding-string "body" 'utf-8)
+       (lambda (response) (setq result response))))
+    (ert-info ((format "%s" "http-request-raw-response"))
+      (should (equal "http://example.test" (nth 0 request)))
+      (should (equal "POST" (nth 1 request)))
+      (should (equal '(("X-Test" . "1")) (nth 2 request)))
+      (should (equal "body" (nth 3 request)))
+      (should (= 200 (plist-get result :status)))
+      (should (equal "{\"a\":1}" (plist-get result :body)))
+      (should (equal "application/json"
+                     (cdr (assoc "content-type"
+                                 (plist-get result :headers)))))
+      (should-not (plist-get result :value))
+      (should-not (plist-get result :error)))))
+
 (provide 'dsh-test-server)
 ;;; dsh-test-server.el ends here

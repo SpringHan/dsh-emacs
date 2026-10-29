@@ -6,7 +6,40 @@ All notable changes to this project are documented here. Format follows
 sections carry the planned next version (pre-1.0: `fix` → patch, features →
 minor) and stay undated until the release is cut.
 
-## 0.7.1 - Unreleased
+## 0.8.0 - Unreleased
+
+### Added
+
+- **Operate dsh plugins through dsh-plugins-bridge**: `M-x dsh-emacs-plugins`
+  lists the bridge's exposed plugin packages, reads a plugin's full endpoint
+  descriptors, prompts for required arguments by JSON Schema type (live
+  `agentId` completion included) and optional arguments as one JSON object,
+  then invokes the endpoint asynchronously and shows the pretty-printed JSON
+  result in a read-only buffer. A prefix argument reads all arguments as one
+  JSON object. New options `dsh-emacs-plugin-bridge-token`,
+  `dsh-emacs-plugin-bridge-base-url` and `dsh-emacs-plugin-bridge-timeout`
+  configure the bridge; the token also falls back to `DSH_BRIDGE_TOKEN`.
+  (rationale: postmortem/154)
+- **Call plugin HTTP routes through dsh-plugins-bridge**:
+  `M-x dsh-emacs-plugin-routes` lists the bridge's discovered route groups,
+  lets you choose a target path, method, optional body and Content-Type, then
+  forwards the request through `/v1/http` and shows the raw response. JSON is
+  pretty-printed, text is shown as-is, binary bodies are summarized, and
+  `dsh-emacs-plugin-route-max-output` caps long text. When the bridge and
+  `dsh-emacs-base-url` share an origin, route calls also forward the current
+  signed DSH session Cookie (`dsh-emacs-plugin-route-forward-dsh-auth`,
+  default t), so target routes that require the browser session work without
+  bypassing their own checks. Route groups must be selected under **Plugin
+  HTTP routes** in dsh Settings → Plugins Bridge. Lisp callers may pass
+  `GROUP`, `METHOD`, `PATH` and `BODY` to skip those prompts; with both
+  `GROUP` and `METHOD` the call runs synchronously and returns the decoded
+  JSON instead of opening a result buffer. A supplied `BODY` is sent as
+  `application/json`; without it, body-bearing methods keep the interactive
+  body and Content-Type prompts.
+  `M-x dsh-emacs-plugin-insert-route-call` walks the same selection, reads a
+  nonempty body for body-bearing methods and inserts the corresponding
+  `dsh-emacs-plugin-routes` call at point.
+  (rationale: postmortem/155, postmortem/156)
 
 ### Fixed
 
