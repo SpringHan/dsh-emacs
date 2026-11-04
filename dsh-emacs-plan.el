@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026
 ;; Author: dsh-emacs contributors
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; License: GPL-3.0-or-later
 
@@ -20,8 +20,9 @@
 (require 'dsh-emacs-faces)
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-markdown)
+(require 'dsh-emacs-ui)
 
-(declare-function dsh-emacs--events-result-async "dsh-emacs"
+(declare-function dsh-emacs--events-result-async "dsh-emacs-interaction"
                   (client-id event-id outcome callback))
 (declare-function dsh-emacs-notify--post "dsh-emacs-render"
                   (session-id body &optional buffer))
@@ -132,7 +133,7 @@
                        (buffer-local-value 'dsh-emacs-plan--pending chat)))
          (review (car pending)))
     (unless review (user-error "No pending plan review in this chat"))
-    (pop-to-buffer
+    (dsh-emacs-ui-navigate (point-marker) #'pop-to-buffer
      (dsh-emacs-plan--show
       chat (plist-get review :identity)
       (dsh-protocol-question-detail (plist-get review :question)) review))))
@@ -142,8 +143,10 @@
   (interactive)
   (unless (buffer-live-p dsh-emacs-plan--chat)
     (user-error "This plan's chat is closed"))
-  (pop-to-buffer dsh-emacs-plan--chat)
-  (goto-char (point-max)))
+  (let ((chat dsh-emacs-plan--chat))
+    (dsh-emacs-ui-navigate
+     (point-marker)
+     (lambda () (pop-to-buffer chat) (goto-char (point-max))))))
 
 (defun dsh-emacs-plan--request (chat event-id session-id questions)
   "Handle a supported plan review from QUESTIONS; return nil for ordinary asks.
@@ -193,6 +196,7 @@ the fallback rather than silently reusing the question reader."
                       (plist-get existing :question) question
                       (plist-get existing :client-id)
                       dsh-emacs-events--client-id
+                      (plist-get existing :busy) nil
                       (plist-get existing :status) "Pending review")
                 (dsh-emacs-plan--show chat identity text existing))
                ;; The same waterfall replayed: keep the request as it is.
@@ -261,8 +265,14 @@ its own outcome answers the waterfall."
 (defun dsh-emacs-plan--answer (approve)
   "Answer this document's live request; APPROVE nil requests changes."
   (let* ((review dsh-emacs-plan--review)
+         (departure (point-marker))
          (chat (plist-get review :chat))
-         (client (plist-get review :client-id)))
+         (client (plist-get review :client-id))
+         ;; A response only settles the waterfall it was sent for.  The host
+         ;; may re-issue the same plan under a new event id while this request
+         ;; is in flight; without binding the callback to this event id, the
+         ;; late response would retire the re-issued request.
+         (event-id (plist-get review :event-id)))
     (unless (and review (not (plist-get review :retired))
                  (buffer-live-p chat)
                  (memq review (buffer-local-value 'dsh-emacs-plan--pending chat))
@@ -288,14 +298,16 @@ its own outcome answers the waterfall."
             (lambda (ok value)
               (when (and (buffer-live-p chat)
                          (not (plist-get review :expired))
-                         (equal client dsh-emacs-events--client-id))
+                         (equal client dsh-emacs-events--client-id)
+                         (equal event-id (plist-get review :event-id)))
                 (if ok
                     (progn
                       (dsh-emacs-plan--retire
                        review (if approve "Approved" "Changes requested"))
                       (unless approve
-                        (pop-to-buffer chat)
-                        (goto-char (point-max))
+                        (dsh-emacs-ui-navigate
+                         departure
+                         (lambda () (pop-to-buffer chat) (goto-char (point-max))))
                         (message "Describe the changes in the chat input")))
                   (unless (plist-get review :retired)
                     (setf (plist-get review :busy) nil
@@ -306,8 +318,11 @@ its own outcome answers the waterfall."
                         (dsh-emacs-plan--paint))))
                   (message "Plan decision failed: %s" value))))))
       (condition-case err
-          (dsh-emacs--events-result-async
-           client (plist-get review :event-id) outcome done)
+          (with-current-buffer chat
+            ;; The decision belongs to the chat, not the document: the
+            ;; document may close while the HTTP response is in flight.
+            (dsh-emacs--events-result-async
+             client event-id outcome done))
         (error (funcall done nil (error-message-string err)))))))
 
 (defun dsh-emacs-plan-approve ()

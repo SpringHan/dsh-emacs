@@ -6,6 +6,84 @@
 
 (defvar vertico-preselect)
 
+(ert-deftest dsh-emacs-test-questions-owner-loads-without-consumers ()
+  :tags '(dsh-unit)
+  (pcase-let ((`(,status . ,output)
+               (dsh-test--fresh-process
+                '(progn
+                   (require 'ert)
+                   (require 'dsh-emacs-interaction)
+                   (should (equal (dsh-emacs--question-session-label "raw-id")
+                                  "raw-id"))
+                   (should-not (featurep 'dsh-emacs))
+                   (should-not (featurep 'dsh-emacs-events))
+                   (should-not (featurep 'dsh-emacs-render))))))
+    (ert-info (output)
+      (should (equal status 0))
+      (should (equal output "")))))
+
+(ert-deftest dsh-emacs-test-questions-autoload-initializes-coordinator ()
+  :tags '(dsh-unit)
+  (let* ((directory (make-temp-file "dsh-interaction-autoload-" t))
+         (source (expand-file-name "dsh-emacs-interaction.el" directory))
+         (loaddefs (expand-file-name "dsh-interaction-autoloads.el" directory)))
+    (unwind-protect
+        (progn
+          (copy-file (expand-file-name "dsh-emacs-interaction.el"
+                                       dsh-emacs-test-root)
+                     source)
+          (dsh-test--generate-autoloads source loaddefs)
+          (dolist (command '(dsh-emacs-question-preview dsh-emacs-answer-question))
+            (pcase-let ((`(,status . ,output)
+                         (dsh-test--fresh-process
+                          `(progn
+                             (require 'ert)
+                             (require 'cl-lib)
+                             (require 'crm)
+                             (load ,loaddefs nil t)
+                             (should (autoloadp (symbol-function ',command)))
+                             (should-not (featurep 'dsh-emacs))
+                             (if (eq ',command 'dsh-emacs-answer-question)
+                                 (should
+                                  (equal
+                                   (should-error (call-interactively ',command)
+                                                 :type 'user-error)
+                                   '(user-error "Not in a dsh chat buffer")))
+                               (let ((choices 0) (texts 0))
+                                 (cl-letf (((symbol-function 'completing-read-multiple)
+                                            (lambda (&rest _)
+                                              (cl-incf choices) nil))
+                                           ((symbol-function 'read-string)
+                                            (lambda (&rest _)
+                                              (cl-incf texts) "")))
+                                   (call-interactively ',command))
+                                 (should (= choices 2))
+                                 (should (= texts 1))))
+                             (should (featurep 'dsh-emacs))))))
+              (ert-info ((format "%s: %s" command output))
+                (should (equal status 0))))))
+      (delete-directory directory t))))
+
+(ert-deftest dsh-emacs-test-questions-events-cancel-without-entry-point ()
+  :tags '(dsh-unit)
+  (pcase-let ((`(,status . ,output)
+               (dsh-test--fresh-process
+                '(progn
+                   (require 'ert)
+                   (require 'dsh-emacs-events)
+                   (setq dsh-emacs--question-queue
+                         '((nil "discard" "s") (nil "keep" "s"))
+                         dsh-emacs--approval-queue '((nil "discard" "s")))
+                   (dsh-emacs-events--host-item
+                    nil '((type . "cancel") (eventId . "discard")))
+                   (should (equal (mapcar #'cadr dsh-emacs--question-queue)
+                                  '("keep")))
+                   (should-not dsh-emacs--approval-queue)
+                   (should-not (featurep 'dsh-emacs))))))
+    (ert-info (output)
+      (should (equal status 0))
+      (should (equal output "")))))
+
 ;; --- Test 31f: an ask row renders dsh web's question card — the questions
 ;; and their numbered options with descriptions replace the argument JSON, and
 ;; the settled answers check the chosen options and carry free-text answers ---
@@ -26,7 +104,18 @@
   :tags '(dsh-unit)
   (ert-info ((format "%s" "ask-tool-uses-question-variant"))
     (should (equal "question" (car (dsh-emacs-render--tool-variant "ask_user_question"))))
-    (should (equal "❓" (cdr (assoc "question" dsh-emacs--variant-icons))))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image) (lambda (svg &rest _) svg)))
+      (should (string-match-p
+               "M12.5757 7.00012"
+               (get-text-property
+                0 'display
+                (cdr (dsh-emacs-render--tool-variant "ask_user_question"))))))
+    (let ((dsh-emacs-render-style 'simple))
+      (should (equal "●" (substring-no-properties
+                          (cdr (dsh-emacs-render--tool-variant
+                                "ask_user_question"))))))
     (should (stringp (cdr (assoc "question" dsh-emacs--tool-icon-svgs))))))
 
 (ert-deftest dsh-emacs-test-questions-ask-pending-card-shows-questionnaire ()
@@ -49,6 +138,29 @@
         (should (string-match-p "^   1\\.   Chip$" block))
         (should (not (string-match-p "^  IN" block)))
         (should (not (string-match-p "^  OUT" block)))))))
+
+;; An empty question text must keep the questionnaire instead of falling back
+;; to the raw argument JSON, which would hide every option.
+(ert-deftest dsh-emacs-test-questions-ask-empty-text-keeps-options ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (dsh-emacs-modeline-setup)
+    (setq-local dsh-emacs-tool-expand-by-default t)
+    (dsh-emacs-render-tool-call
+     (dsh-emacs-test--tool-call-event
+      1 "k-empty" "ask_user_question"
+      (json-encode
+       '((questions . [((id . "q1") (question . "")
+                        (options . [((label . "A")) ((label . "B"))]))])))))
+    (let ((block (dsh-emacs-test--tool-block-text
+                  (dsh-emacs-render--make-namespace) "tool-k-empty")))
+      (ert-info ((format "%s" "ask-empty-text-keeps-options"))
+        (should (string-match-p "Ask question · waiting" block))
+        (should (string-match-p "^  Question$" block))
+        (should (string-match-p "^   1\\.   A$" block))
+        (should (string-match-p "^   2\\.   B$" block))
+        (should-not (string-match-p "\"options\"" block))))))
 
 (ert-deftest dsh-emacs-test-questions-ask-answered-card-marks-choices-and-free-text ()
   :tags '(dsh-unit)
@@ -73,7 +185,7 @@
         (should (string-match-p "^   2\\.   Compact$" block))
         (should (string-match-p "^  → and a summary$" block))))))
 
-(ert-deftest dsh-emacs-test-questions-ask-settled-empty-question-reads-not-answered ()
+(ert-deftest dsh-emacs-test-questions-ask-settled-empty-question-reads-skipped ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
@@ -88,9 +200,9 @@
       (json-encode '((answers . [((id . "q1") (selected . []))])))))
     (let ((block (dsh-emacs-test--tool-block-text
                   (dsh-emacs-render--make-namespace) "tool-k3")))
-      (ert-info ((format "%s" "ask-settled-empty-question-reads-not-answered"))
+      (ert-info ((format "%s" "ask-settled-empty-question-reads-skipped"))
         (should (string-match-p "Ask question · 0/1 answered" block))
-        (should (string-match-p "^  Not answered$" block))))))
+        (should (string-match-p "^  Skipped$" block))))))
 
 ;; An abandoned ask is the user's own decision: the row interrupts instead of
 ;; failing red, like dsh web's ASK_ABORTED state.
@@ -335,9 +447,9 @@
     (should (equal "x" (dsh-emacs--question-label-of "10" (make-list 10 "x"))))
     (should (null (dsh-emacs--question-label-of "0" '("Alpha" "Beta"))))))
 
-;; each candidate's description travels with the candidate
-;; (annotation), no longer a tooltip that follows the highlight.
-(ert-deftest dsh-emacs-test-questions-question-annotation-carries-description ()
+;; The ordinal is display-only: candidates stay plain labels so deleting a
+;; completed option leaves an empty answer instead of a stale "1. " prefix.
+(ert-deftest dsh-emacs-test-questions-question-affixation-numbers-labels ()
   :tags '(dsh-unit)
   (let* ((dsh-emacs--question-current
           (dsh-protocol-question--from-alist
@@ -346,14 +458,39 @@
                          ((label . "Beta"))]))))
          (dsh-emacs--question-options
           (dsh-protocol-question-options dsh-emacs--question-current))
-         (dsh-emacs--question-roster '("Alpha" "Beta")))
-    (ert-info ((format "%s" "question-annotation-carries-description"))
-      (should (equal "  Safe route." (dsh-emacs--question-annotation "1. Alpha")))
-      (should (equal "  Safe route." (dsh-emacs--question-annotation "Alpha")))
-      (should (equal "" (dsh-emacs--question-annotation "2. Beta")))
-      (should (equal "" (dsh-emacs--question-annotation "something else")))
+         (dsh-emacs--question-roster '("Alpha" "Beta"))
+         (rows (dsh-emacs--question-affixation
+                '("Alpha" "Beta" "something else"))))
+    (ert-info ((format "%s" "question-affixation-numbers-labels"))
+      (should (equal '("Alpha" "1. " "  Safe route.")
+                     (list (nth 0 (nth 0 rows))
+                           (nth 1 (nth 0 rows))
+                           (substring-no-properties (nth 2 (nth 0 rows))))))
+      (should (equal '("Beta" "2. " "")
+                     (list (nth 0 (nth 1 rows))
+                           (nth 1 (nth 1 rows))
+                           (substring-no-properties (nth 2 (nth 1 rows))))))
+      (should (equal '("something else" "" "")
+                     (list (nth 0 (nth 2 rows))
+                           (nth 1 (nth 2 rows))
+                           (substring-no-properties (nth 2 (nth 2 rows))))))
       (should (eq 'dsh-emacs-meta-face
-                  (get-text-property 0 'face (dsh-emacs--question-annotation "Alpha")))))))
+                  (get-text-property 0 'face (nth 2 (nth 0 rows))))))))
+
+;; Typing a number still completes to the plain label, so the inserted text
+;; carries no ordinal.
+(ert-deftest dsh-emacs-test-questions-question-completion-table-accepts-numbers ()
+  :tags '(dsh-unit)
+  (let ((table (dsh-emacs--question-completion-table
+                '("Alpha" "Beta" "Gamma"))))
+    (ert-info ((format "%s" "question-completion-table-accepts-numbers"))
+      (should (equal '("Alpha") (all-completions "1" table)))
+      (should (equal '("Alpha") (all-completions "1. " table)))
+      (should (equal '("Alpha") (all-completions "1. Al" table)))
+      (should (equal '("Beta") (all-completions "2" table)))
+      (should (equal '("Alpha" "Beta" "Gamma")
+                     (all-completions "" table)))
+      (should (equal '("Beta") (all-completions "Beta" table))))))
 
 ;; single select: likewise one read (CRM takes only one value),
 ;; numeric candidate -> original label.
@@ -366,6 +503,22 @@
         (should (equal '((id . "q1") (selected "Yes"))
                        (dsh-emacs--question-choice
                         '((id . "q1") (question . "Proceed?")
+                          (options . (((label . "Yes")) ((label . "No"))))))))))))
+
+;; Typing a number and pressing RET without completing also selects that option.
+(ert-deftest dsh-emacs-test-questions-question-choice-bare-number ()
+  :tags '(dsh-unit)
+  (let ((reads '(("1") ("2. "))))
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (&rest _) (or (pop reads) (error "Unexpected read")))))
+      (ert-info ((format "%s" "question-choice-bare-number"))
+        (should (equal '((id . "q-number") (selected "Yes"))
+                       (dsh-emacs--question-choice
+                        '((id . "q-number") (question . "Proceed?")
+                          (options . (((label . "Yes")) ((label . "No"))))))))
+        (should (equal '((id . "q-number") (selected "No"))
+                       (dsh-emacs--question-choice
+                        '((id . "q-number") (question . "Proceed?")
                           (options . (((label . "Yes")) ((label . "No"))))))))))))
 
 ;; multiple select: the whole answer is read in one go; answers come back in
@@ -394,7 +547,31 @@
         (should (equal '((id . "q3") (selected . []))
                        (dsh-emacs--question-choice
                         '((id . "q3") (question . "Pick?") (multiSelect . t)
-                          (options . (((label . "A")) ((label . "B"))))))))))))
+                          (options . (((label . "A")) ((label . "B"))))))))))
+
+;; Empty text still reads the options; the prompt substitutes a placeholder
+;; instead of starting with a bare hint.
+(ert-deftest dsh-emacs-test-questions-question-choice-empty-text-uses-placeholder ()
+  :tags '(dsh-unit)
+  (let (prompt)
+    (cl-letf (((symbol-function 'completing-read-multiple)
+               (lambda (value &rest _) (setq prompt value) nil)))
+      (dsh-emacs--question-choice
+       '((id . "q-empty") (question . "")
+         (options . (((label . "A")) ((label . "B")))))))
+    (ert-info ((format "%s" "question-choice-empty-text-uses-placeholder"))
+      (should (string-match-p "\\`Question " prompt)))))))
+
+;; Whitespace is not a custom answer: deleting an option can leave spaces.
+(ert-deftest dsh-emacs-test-questions-question-choice-whitespace-is-skip ()
+  :tags '(dsh-unit)
+  (cl-letf (((symbol-function 'completing-read-multiple)
+             (lambda (&rest _) '(" "))))
+    (ert-info ((format "%s" "question-choice-whitespace-is-skip"))
+      (should (equal '((id . "q-space") (selected . []))
+                     (dsh-emacs--question-choice
+                      '((id . "q-space") (question . "Pick?")
+                        (options . (((label . "A")) ((label . "B")))))))))))
 
 ;; no "type an answer" candidate: typing text directly is the answer, same
 ;; for multiple and single select, and there is only one read (no more
@@ -455,7 +632,7 @@
 ;; No-option questions are still free text: empty input = skip, non-empty = custom.
 (ert-deftest dsh-emacs-test-questions-question-choice-no-options-custom ()
   :tags '(dsh-unit)
-  (let ((customs '("free text" "")))
+  (let ((customs '("  free text  " "" " ")))
     (cl-letf (((symbol-function 'read-string)
                (lambda (&rest _) (pop customs))))
       (ert-info ((format "%s" "question-choice-no-options-custom"))
@@ -463,6 +640,10 @@
                        (dsh-emacs--question-choice
                         '((id . "q7") (question . "Say?"))))))
       (ert-info ((format "%s" "question-choice-no-options-empty-skips"))
+        (should (equal '((id . "q7") (selected . []))
+                       (dsh-emacs--question-choice
+                        '((id . "q7") (question . "Say?"))))))
+      (ert-info ((format "%s" "question-choice-no-options-whitespace-skips"))
         (should (equal '((id . "q7") (selected . []))
                        (dsh-emacs--question-choice
                         '((id . "q7") (question . "Say?")))))))))
@@ -511,9 +692,9 @@
                                      (kbd "C-c C-s"))
                          'dsh-emacs--question-skip-command)))))))
 
-;; reader setup: candidate annotations + question detail into the echo area (both
+;; reader setup: candidate affixes + question detail into the echo area (both
 ;; scoped to this minibuffer).
-(ert-deftest dsh-emacs-test-questions-question-reader-setup-annotations-and-echo ()
+(ert-deftest dsh-emacs-test-questions-question-reader-setup-affixes-and-echo ()
   :tags '(dsh-unit)
   (let* ((dsh-emacs--question-current
           (dsh-protocol-question--from-alist
@@ -529,12 +710,18 @@
       (with-temp-buffer
         (use-local-map (make-sparse-keymap))
         (dsh-emacs--question-reader-setup)
-        (let ((annotation (plist-get completion-extra-properties
-                                     :annotation-function)))
-          (ert-info ((format "%s" "question-reader-setup-annotations-and-echo"))
-            (should (equal "  Go ahead" (funcall annotation "1. Yes")))
-            (should (equal "  Go ahead" (funcall annotation "Yes")))
-            (should (equal "" (funcall annotation "2. No")))
+        (let* ((affixation (plist-get completion-extra-properties
+                                      :affixation-function))
+               (rows (funcall affixation '("Yes" "No"))))
+          (ert-info ((format "%s" "question-reader-setup-affixes-and-echo"))
+            (should (equal '("Yes" "1. " "  Go ahead")
+                           (list (nth 0 (nth 0 rows))
+                                 (nth 1 (nth 0 rows))
+                                 (substring-no-properties (nth 2 (nth 0 rows))))))
+            (should (equal '("No" "2. " "")
+                           (list (nth 0 (nth 1 rows))
+                                 (nth 1 (nth 1 rows))
+                                 (substring-no-properties (nth 2 (nth 1 rows))))))
             (should (equal "Context here" echoed))))))))
 
 ;; the reader must preselect prompt, not the first item: a frontend preselecting the
@@ -577,21 +764,22 @@
         (should (equal "Proceed? (a name or your own text; empty = skip): "
                        prompt))))))
 
-;; candidate order = the question's original option order: for numbered options
-;; ("1. ...") the number is the order, and the completion frontend must not reorder.
-;; Only an identity `display-sort-function'/`cycle-sort-function' on the collection
-;; makes that possible -- otherwise vertico reorders by history/length/alphabet by
-;; default (and across several questions the list order of the same question batch
-;; even differs). CRM passes this metadata through `crm-completion-table' to the
-;; frontend's collection (`crm--collection-fn'), so assertions must go through it
-;; to cover the table the frontend actually sees.
+;; candidate order = the question's original option order; the reader shows
+;; ordinals as affixes, and the completion frontend must not reorder the plain
+;; labels.  Only an identity `display-sort-function'/`cycle-sort-function' on
+;; the collection makes that possible -- otherwise vertico reorders by
+;; history/length/alphabet by default (and across several questions the list
+;; order of the same question batch even differs). CRM passes this metadata
+;; through `crm-completion-table' to the frontend's collection
+;; (`crm--collection-fn'), so assertions must go through it to cover the table
+;; the frontend actually sees.
 (ert-deftest dsh-emacs-test-questions-question-reader-pins-option-order ()
   :tags '(dsh-unit)
   (let ((seen 'unset))
     (cl-letf (((symbol-function 'completing-read-multiple)
                (lambda (_prompt collection &rest _)
                  (setq seen collection)
-                 '("2. Alpha"))))
+                 '("Alpha"))))
       (dsh-emacs--question-choice
        '((id . "q-order") (question . "Pick?") (multiSelect . t)
          (options . (((label . "Zulu")) ((label . "Alpha"))
@@ -603,7 +791,7 @@
                       (completion-metadata-get metadata 'display-sort-function)))
           (should (eq #'identity
                       (completion-metadata-get metadata 'cycle-sort-function)))
-          (should (equal '("1. Zulu" "2. Alpha" "3. Mike")
+          (should (equal '("Zulu" "Alpha" "Mike")
                          (all-completions "" #'crm--collection-fn nil))))))))
 
 ;; The preview command demos a whole batch of questions (multi-select + single
@@ -698,7 +886,7 @@
             ;; No tab is inserted any more: after the answer the buffer has no question card
             (let ((text (with-current-buffer chat (buffer-string))))
               (ert-info ((format "%s" "question-frame-inserts-no-card"))
-                (should (not (string-match-p "❓ Question" text)))))))
+                (should (not (string-match-p "Question" text)))))))
       (when (buffer-live-p chat) (kill-buffer chat)))))
 
 ;; 4) multi-question frame: sequential per-question minibuffer selection, only one
@@ -748,7 +936,7 @@
             ;; Still no card is inserted (pure minibuffer answering)
             (let ((text (with-current-buffer chat (buffer-string))))
               (ert-info ((format "%s" "question-multi-inserts-no-card"))
-                (should (not (string-match-p "❓ Question" text)))))))
+                (should (not (string-match-p "Question" text)))))))
       (when (buffer-live-p chat) (kill-buffer chat)))))
 
 ;; 5) frame dispatch: C-g/ESC -> abandon the whole question group: answered with
@@ -2335,6 +2523,159 @@
                            '(("c-error" "wf-error"
                               ((kind . "result") (value . "rejected"))))))))
       (when (buffer-live-p chat) (kill-buffer chat)))))
+
+;; A waterfall delivered by the WebSocket dispatcher must not open its prompt
+;; inside that dispatcher: the host's `cancel' frame (another client answered)
+;; could not be dispatched until the prompt returned.  The drain is scheduled
+;; instead; a cancel that arrives before it runs leaves nothing to ask.
+(ert-deftest dsh-emacs-test-questions-waterfall-prompt-defers-out-of-dispatcher ()
+  :tags '(dsh-unit)
+  (let ((chat (get-buffer-create " *dsh-test-question-defer*"))
+        (scheduled nil)
+        (prompted nil)
+        (dsh-emacs--question-queue nil)
+        (dsh-emacs--approval-queue nil)
+        (dsh-emacs--interaction-active nil)
+        (dsh-emacs--waterfall-cancelled-event-id nil)
+        (dsh-emacs-events--dispatching t)
+        (dsh-emacs-enable-notifications nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_time _repeat function &rest args)
+                     (setq scheduled (lambda () (apply function args)))
+                     'scheduled-timer))
+                  ((symbol-function 'dsh-emacs--collect-question-answers)
+                   (lambda (&rest _)
+                     (setq prompted t)
+                     nil)))
+          (dsh-emacs--question-requested
+           chat "wf-defer" "sess-defer"
+           '(((id . "q1") (question . "Proceed?")
+              (options . (((label . "Yes")))))))
+          (ert-info ((format "%s" "waterfall-prompt-defers-out-of-dispatcher"))
+            (should scheduled)
+            (should-not prompted)
+            (should (= 1 (length dsh-emacs--question-queue))))
+          ;; The host cancels while the prompt is still only scheduled.
+          (dsh-emacs--question-cancelled "wf-defer")
+          (funcall scheduled)
+          (ert-info ((format "%s" "scheduled-prompt-skips-cancelled-waterfall"))
+            (should-not prompted)
+            (should (null dsh-emacs--question-queue))
+            (should (null dsh-emacs--interaction-active))))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+(ert-deftest dsh-emacs-test-questions-cancelled-before-read-skips-prompt ()
+  :tags '(dsh-unit)
+  (let ((chat (get-buffer-create " *dsh-test-question-precancel*"))
+        (prompted nil)
+        (responded nil)
+        (dsh-emacs--interaction-active '(question . "wf-pre"))
+        (dsh-emacs--waterfall-cancelled-event-id "wf-pre")
+        (dsh-emacs-enable-notifications nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'dsh-emacs--collect-question-answers)
+                   (lambda (&rest _) (setq prompted t) nil))
+                  ((symbol-function 'dsh-emacs--events-result-async)
+                   (lambda (&rest _) (setq responded t))))
+          (dsh-emacs--question-answer
+           (list chat "wf-pre" "sess-pre"
+                 '(((id . "q1") (question . "Proceed?"))) nil))
+          (ert-info ((format "%s" "cancelled-before-read-skips-prompt"))
+            (should-not prompted)
+            (should-not responded)))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+;; A native dialog cannot be dismissed by the remote `cancel' frame; the
+;; approval reader must stay in the minibuffer it documents.
+(ert-deftest dsh-emacs-test-questions-approval-prompt-forces-minibuffer ()
+  :tags '(dsh-unit)
+  (let ((seen 'unset))
+    (let ((use-dialog-box t))
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (&rest _)
+                   (setq seen use-dialog-box)
+                   t)))
+        (dsh-emacs--approval-prompt "sess-a" "bash" "why" nil)))
+    (ert-info ((format "%s" "approval-prompt-forces-minibuffer"))
+      (should (eq seen nil)))))
+
+;; Approvals are deferred like questions, and a cancel that lands before the
+;; scheduled drain runs must leave nothing to ask.
+(ert-deftest dsh-emacs-test-questions-approval-prompt-defers-out-of-dispatcher ()
+  :tags '(dsh-unit)
+  (let ((chat (get-buffer-create " *dsh-test-approval-defer*"))
+        (scheduled nil)
+        (prompted nil)
+        (responded nil)
+        (dsh-emacs--question-queue nil)
+        (dsh-emacs--approval-queue nil)
+        (dsh-emacs--interaction-active nil)
+        (dsh-emacs--waterfall-cancelled-event-id nil)
+        (dsh-emacs-events--dispatching t)
+        (dsh-emacs-enable-notifications nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_time _repeat function &rest args)
+                     (setq scheduled (lambda () (apply function args)))
+                     'scheduled-timer))
+                  ((symbol-function 'dsh-emacs--approval-prompt)
+                   (lambda (&rest _) (setq prompted t) t))
+                  ((symbol-function 'dsh-emacs--events-result-async)
+                   (lambda (&rest _) (setq responded t))))
+          (dsh-emacs--approval-requested
+           chat "wf-ap-defer" "sess-ap" "bash" "why" nil)
+          (ert-info ((format "%s" "approval-prompt-defers-out-of-dispatcher"))
+            (should scheduled)
+            (should-not prompted)
+            (should (= 1 (length dsh-emacs--approval-queue))))
+          (dsh-emacs--approval-cancelled "wf-ap-defer")
+          (funcall scheduled)
+          (ert-info ((format "%s" "scheduled-approval-skips-cancelled-waterfall"))
+            (should-not prompted)
+            (should-not responded)
+            (should (null dsh-emacs--approval-queue))
+            (should (null dsh-emacs--interaction-active))))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+(ert-deftest dsh-emacs-test-questions-approval-cancelled-before-read-skips-prompt ()
+  :tags '(dsh-unit)
+  (let ((chat (get-buffer-create " *dsh-test-approval-precancel*"))
+        (prompted nil)
+        (responded nil)
+        (dsh-emacs--interaction-active '(approval . "wf-ap-pre"))
+        (dsh-emacs--waterfall-cancelled-event-id "wf-ap-pre"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'dsh-emacs--approval-prompt)
+                   (lambda (&rest _) (setq prompted t) t))
+                  ((symbol-function 'dsh-emacs--events-result-async)
+                   (lambda (&rest _) (setq responded t))))
+          (dsh-emacs--approval-answer
+           (list chat "wf-ap-pre" "sess-ap" "bash" "why" nil))
+          (ert-info ((format "%s" "approval-cancelled-before-read-skips-prompt"))
+            (should-not prompted)
+            (should-not responded)))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+;; The late-answer picker uses the `(late-answer)' slot, which is not a
+;; waterfall: its cdr is nil like an uncancelled flag, so the pre-read guard
+;; must not mistake it for a cancelled question.
+(ert-deftest dsh-emacs-test-questions-late-answer-slot-is-not-cancelled ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs--interaction-active '(late-answer))
+        (dsh-emacs--waterfall-cancelled-event-id nil)
+        (choices 0))
+    (cl-letf (((symbol-function 'dsh-emacs--question-choice)
+               (lambda (&rest _)
+                 (setq choices (1+ choices))
+                 '((id . "q1") (selected . ("A"))))))
+      (ert-info ((format "%s" "late-answer-slot-is-not-cancelled"))
+        (should-not (dsh-emacs--waterfall-cancelled-p))
+        (should (equal
+                 (dsh-emacs--collect-question-answers
+                  '(((id . "q1") (question . "Proceed?"))) "sess-late")
+                 '(((id . "q1") (selected . ("A"))))))
+        (should (= 1 choices))))))
 
 (provide 'dsh-test-questions)
 ;;; dsh-test-questions.el ends here

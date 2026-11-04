@@ -91,7 +91,8 @@
   :tags '(dsh-unit)
   (dolist (scenario '(session-title fragment-title fragment-warm
                                     fragment-after-stream fragment-rewarmed))
-    (let* (report
+    (let* ((dsh-emacs-session-recents-limit 15)
+           report
            (instrumented
             (dsh-render-report-scenario
              scenario (lambda (run)
@@ -103,7 +104,7 @@
         (should (dsh-test-equal-text-p instrumented ordinary)))
       (when (eq scenario 'session-title)
         (ert-info ((format "%s" "render-report-distinguishes-row-visits-from-builds"))
-          (should (= (plist-get report :session-rows) 540))
+          (should (= (plist-get report :session-rows) 555))
           (should (= (plist-get report :session-row-builds) 1))))
       (when (memq scenario '(fragment-warm fragment-after-stream fragment-rewarmed))
         (ert-info ((format "%s" (format "render-report-unchanged-%s" scenario)))

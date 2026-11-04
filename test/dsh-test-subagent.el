@@ -446,9 +446,9 @@
       (ert-info ((format "%s" "session-unknown-catalog-has-no-disclosure"))
         (should (not (string-match-p "[▸▾] .*会话" (buffer-string)))))
       (let ((first (copy-marker (dsh-emacs-session--row-pos
-                                 'dsh-emacs-session-id "row-3")))
+                                 'dsh-emacs-row-id "row-3")))
             (last (copy-marker (+ 8 (dsh-emacs-session--row-pos
-                                     'dsh-emacs-session-id "row-17")))))
+                                     'dsh-emacs-row-id "row-17")))))
         (setq dsh-emacs--workspaces (reverse dsh-emacs--workspaces))
         (setf (dsh-protocol-session-title-value (nth 9 dsh-emacs--sessions))
               "Changed title")
@@ -460,8 +460,8 @@
         (ert-info ((format "%s" "session-regroup-only-diffs-individual-rows"))
           (should (< largest-diff 150)))
         (ert-info ((format "%s" "session-regroup-preserves-xref-row-identities"))
-          (should (equal (get-text-property first 'dsh-emacs-session-id) "row-3"))
-          (should (equal (get-text-property last 'dsh-emacs-session-id) "row-17"))
+          (should (equal (get-text-property first 'dsh-emacs-row-id) "row-3"))
+          (should (equal (get-text-property last 'dsh-emacs-row-id) "row-17"))
           (should (< last first)))
         (ert-info ((format "%s" "session-regroup-updates-title-and-workspace-order"))
           (should (string-match-p "Changed title" (buffer-string)))
@@ -479,7 +479,7 @@
                           (car (last dsh-emacs--workspaces))))
         (dsh-emacs-session--render)
         (ert-info ((format "%s" "session-insert-before-departure-keeps-original-row"))
-          (should (equal (get-text-property first 'dsh-emacs-session-id) "row-3")))
+          (should (equal (get-text-property first 'dsh-emacs-row-id) "row-3")))
         (let ((transpose (symbol-function 'transpose-regions))
               (moves 0))
           (goto-char (dsh-emacs-session--row-pos
@@ -492,14 +492,14 @@
           (ert-info ((format "%s" "session-collapse-deletes-hidden-rows-without-moving-survivors"))
             (should (= moves 0))
             (should (null (dsh-emacs-session--row-pos
-                           'dsh-emacs-session-id "row-17")))
-            (should (equal (get-text-property first 'dsh-emacs-session-id) "row-3"))
+                           'dsh-emacs-row-id "row-17")))
+            (should (equal (get-text-property first 'dsh-emacs-row-id) "row-3"))
             (should (equal (get-text-property (point) 'dsh-emacs-workspace-group-id)
                            "workspace-3")))
           (dsh-emacs-session-toggle-workspace)
           (ert-info ((format "%s" "session-expand-restores-hidden-rows-with-survivor-markers"))
-            (should (dsh-emacs-session--row-pos 'dsh-emacs-session-id "row-17"))
-            (should (equal (get-text-property first 'dsh-emacs-session-id) "row-3"))))
+            (should (dsh-emacs-session--row-pos 'dsh-emacs-row-id "row-17"))
+            (should (equal (get-text-property first 'dsh-emacs-row-id) "row-3"))))
         (set-marker first nil)
         (set-marker last nil))
       (let ((cell (dsh-protocol-subagent-cell--from-alist
@@ -509,7 +509,7 @@
         (puthash "row-0" (list :cells (list (cons 'subagentCatalog cell)))
                  dsh-emacs--subagent-catalogs)
         (dsh-emacs-session--render)
-        (goto-char (dsh-emacs-session--row-pos 'dsh-emacs-session-id "row-0"))
+        (goto-char (dsh-emacs-session--row-pos 'dsh-emacs-row-id "row-0"))
         (ert-info ((format "%s" "session-known-children-show-disclosure"))
           (should (string-match-p "▸" (buffer-substring (point) (line-end-position)))))
         (setq dsh-emacs-session--expanded-subagents '("row-0"))
@@ -520,13 +520,13 @@
                                                (point) (line-end-position)))))
           (should (not (string-match-p "No subagents" (buffer-string))))
           (should (null (dsh-emacs-session--row-pos
-                         'dsh-emacs-session-id "child"))))))))
+                         'dsh-emacs-row-id "child"))))))))
 
 ;; Inline child rows use the same catalog and direct-parent navigation as chats.
 (ert-deftest dsh-emacs-test-subagent-session-children-start-collapsed ()
   :tags '(dsh-unit)
-  (let* ((dsh-emacs-sessions-buffer (generate-new-buffer-name " *dsh-child-list*"))
-         (buffer (get-buffer-create dsh-emacs-sessions-buffer))
+  (let* ((dsh-emacs--sessions-buffer (generate-new-buffer-name " *dsh-child-list*"))
+         (buffer (get-buffer-create dsh-emacs--sessions-buffer))
          (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
          (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
          (dsh-emacs--subagent-host-live nil)
@@ -693,8 +693,8 @@
 
 (ert-deftest dsh-emacs-test-subagent-session-child-open-fetches-missing-ancestor-catalog ()
   :tags '(dsh-unit)
-  (let* ((dsh-emacs-sessions-buffer (generate-new-buffer-name " *dsh-child-reveal*"))
-         (buffer (get-buffer-create dsh-emacs-sessions-buffer))
+  (let* ((dsh-emacs--sessions-buffer (generate-new-buffer-name " *dsh-child-reveal*"))
+         (buffer (get-buffer-create dsh-emacs--sessions-buffer))
          (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
          (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
          (dsh-emacs--current-session "another-chat")
@@ -898,7 +898,7 @@
         (dsh-emacs--buffer-session "anim-parent")
         (dsh-emacs--buffer-subagent nil)
         (dsh-emacs--subagent-host-live t)
-        (dsh-emacs-sessions-buffer " *dsh-test-no-sessions*")
+        (dsh-emacs--sessions-buffer " *dsh-test-no-sessions*")
         (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
         (dsh-emacs--sessions
          (list (dsh-protocol-session--from-alist '((sessionId . "a") (running . t)))
@@ -916,21 +916,25 @@
              dsh-emacs--subagent-catalogs)
     (with-temp-buffer
       (puthash "anim-parent" (current-buffer) dsh-emacs--chat-buffers)
-      (cl-letf (((symbol-function 'dsh-emacs-subagent--animation-available-p)
+      ;; This test owns the subagent slot only; the whale activity
+      ;; integration has its own tests.
+      (cl-letf (((symbol-function 'dsh-emacs-modeline-set-subagent-activity)
+                 #'ignore)
+                ((symbol-function 'dsh-emacs-modeline-animation-available-p)
                  (lambda () t))
-                ((symbol-function 'motion-line-playing-p)
+                ((symbol-function 'dsh-emacs-modeline-animation-playing-p)
                  (lambda (_slot) playing))
-                ((symbol-function 'motion-line-play)
+                ((symbol-function 'dsh-emacs-modeline-animation-play)
                  (lambda (slot clip)
                    (cl-incf plays)
                    (setq played-slot slot playing t)
                    (setq renderer (plist-get clip :render))
                    clip))
-                ((symbol-function 'motion-line-clip)
+                ((symbol-function 'dsh-emacs-modeline-animation-clip)
                  (lambda (duration render)
                    (setq renderer render)
                    (list :duration duration :render render)))
-                ((symbol-function 'motion-line-stop)
+                ((symbol-function 'dsh-emacs-modeline-animation-stop)
                  (lambda (_slot) (cl-incf stops) (setq playing nil)))
                 ((symbol-function 'display-graphic-p) (lambda (&optional _) t))
                 ((symbol-function 'image-type-available-p) (lambda (_type) t))
@@ -1001,6 +1005,97 @@
           (should (string-match-p "stroke=\"#ff0000\""
                                   (dsh-test-subagent-indicator-icon
                                    (dsh-emacs-subagent-indicator)))))))))
+
+;; Every child-state change feeds the whale's activity state, and the last
+;; child settling clears it.
+(ert-deftest dsh-emacs-test-subagent-running-child-drives-modeline-activity ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+        (dsh-emacs--buffer-session "activity-parent")
+        (dsh-emacs--buffer-subagent nil)
+        (dsh-emacs--subagent-host-live t)
+        (dsh-emacs--sessions-buffer " *dsh-test-no-sessions*")
+        (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+        (dsh-emacs--sessions
+         (list (dsh-protocol-session--from-alist
+                '((sessionId . "activity-child") (running . t)))))
+        (activity 'unset))
+    (puthash "activity-parent"
+             (list :cells
+                   (list (cons 'subagentCatalog
+                               (dsh-protocol-subagent-cell--from-alist
+                                '((key . "subagentCatalog") (seq . 1)
+                                  (value . [((id . "activity-child"))]))))))
+             dsh-emacs--subagent-catalogs)
+    (with-temp-buffer
+      (setq-local dsh-emacs--buffer-session "activity-parent"
+                  dsh-emacs--buffer-subagent nil
+                  dsh-emacs--event-ready t)
+      (puthash "activity-parent" (current-buffer) dsh-emacs--chat-buffers)
+      (cl-letf (((symbol-function 'dsh-emacs-modeline-animation-available-p)
+                 #'ignore)
+                ((symbol-function 'dsh-emacs-modeline-set-subagent-activity)
+                 (lambda (active) (setq activity active))))
+        (dsh-emacs-subagent--changed)
+        (ert-info ((format "%s" "running-child-sets-modeline-activity"))
+          (should (eq activity t)))
+        (setf (dsh-protocol-session-running (car dsh-emacs--sessions)) nil)
+        (setq activity 'unset)
+        (dsh-emacs-subagent--changed)
+        (ert-info ((format "%s" "settled-child-clears-modeline-activity"))
+          (should-not activity))))))
+
+(ert-deftest dsh-emacs-test-subagent-whale-activity-follows-chat-lifecycle ()
+  :tags '(dsh-unit)
+  (let* ((dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+         (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+         (dsh-emacs--subagent-host-live t)
+         (dsh-emacs--sessions-buffer " *dsh-test-no-sessions*")
+         (dsh-emacs--sessions
+          (list (dsh-protocol-session--from-alist
+                 '((sessionId . "cached-child") (running . t)))))
+         (cells (list (dsh-protocol-subagent-cell--from-alist
+                       '((key . "subagentCatalog") (seq . 1)
+                         (value . [((id . "cached-child"))])))))
+         (snapshot (dsh-protocol--make-follow-projections :subagents cells)))
+    ;; Host control already cached these cells before the chat was opened.
+    (dsh-emacs-subagent-apply "cached-parent" cells)
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (setq-local dsh-emacs--buffer-session "cached-parent"
+                  dsh-emacs--event-ready t)
+      (puthash "cached-parent" (current-buffer) dsh-emacs--chat-buffers)
+      (dsh-emacs-modeline-setup)
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 100.0)))
+        (dsh-emacs-events--apply-snapshot-projections "cached-parent" snapshot))
+      (should (= (dsh-emacs-subagent--running-count) 1))
+      (should dsh-emacs--modeline-subagent-active)
+      (should (= dsh-emacs--modeline-run-start 100.0))
+      (should-not dsh-emacs--ml-busy)
+      (dsh-emacs-events-disconnect)
+      ;; Host updates cannot restart the whale in a detached chat.
+      (dsh-emacs-subagent--changed)
+      (should-not dsh-emacs--modeline-subagent-active)
+      (should-not dsh-emacs--modeline-run-start)
+      ;; Reconnecting with the same cells starts a fresh observation interval.
+      (setq dsh-emacs--event-ready t)
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 200.0)))
+        (dsh-emacs-events--apply-snapshot-projections "cached-parent" snapshot))
+      (should dsh-emacs--modeline-subagent-active)
+      (should (= dsh-emacs--modeline-run-start 200.0))
+      (let ((process (make-pipe-process :name "dsh-test-child-activity")))
+        (unwind-protect
+            (progn
+              (setq dsh-emacs--event-process process)
+              (process-put process 'dsh-emacs-chat-buffer (current-buffer))
+              (cl-letf (((symbol-function 'dsh-emacs-events--schedule-reconnect)
+                         #'ignore))
+                (dsh-emacs-events--lost process))
+              (should-not dsh-emacs--modeline-subagent-active)
+              (should-not dsh-emacs--modeline-run-start)
+              (dsh-emacs-subagent--changed)
+              (should (equal (dsh-emacs--ml-busy-indicator) "")))
+          (delete-process process))))))
 
 (provide 'dsh-test-subagent)
 ;;; dsh-test-subagent.el ends here

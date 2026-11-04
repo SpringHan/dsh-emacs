@@ -77,6 +77,37 @@
                        (member 'dsh-emacs-markdown-bold
                                (if (listp bold-face) bold-face (list bold-face))))))))))
 
+(ert-deftest dsh-emacs-test-render-streamed-bold-beside-chinese-text ()
+  :tags '(dsh-unit)
+  (dolist (limit '(nil 1))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (let ((dsh-emacs-stream-markdown-limit limit)
+            (event '((data . ((turn . 1) (step . 1)))))
+            (source "这是**重点**内容（**说明**）。`**literal**`"))
+        (dolist (chunk '("这是*" "*重" "点*" "*内容（*"
+                         "*说" "明**）。`**literal**`"))
+          (dsh-emacs-render--start-assistant-stream event chunk))
+        (dsh-emacs-render-event
+         `((type . "assistant/message") (seq . 2)
+           (data . ((turn . 1) (step . 1)
+                    (message . ((content . [((type . "text")
+                                             (text . ,source))])))))))
+        (while dsh-emacs--markdown-pending
+          (dsh-emacs-render--run-markdown (current-buffer)))
+        (goto-char (point-min))
+        (should (search-forward "这是重点内容（说明）。**literal**" nil t))
+        (dolist (word '("重点" "说明"))
+          (goto-char (point-min))
+          (should (search-forward word nil t))
+          (should (memq 'dsh-emacs-markdown-bold
+                        (ensure-list (get-text-property (1- (point)) 'face)))))
+        (goto-char (point-min))
+        (should (search-forward "**literal**" nil t))
+        (should (memq 'dsh-emacs-markdown-inline-code
+                      (ensure-list (get-text-property
+                                    (1- (point)) 'face))))))))
+
 ;; Packed stream records reconstruct in order, tool calls included.
 (ert-deftest dsh-emacs-test-render-attempt-stream-text-reconstructs ()
   :tags '(dsh-unit)
@@ -88,9 +119,9 @@
     (should (equal (dsh-emacs-render--assistant-stream-text records)
                    "think\n→ bash {\"command\":\"ls\"}\nreply"))))
 
-(ert-deftest dsh-emacs-test-render-attempt-stream-text-respects-reasoning-option ()
+(ert-deftest dsh-emacs-test-render-attempt-stream-text-respects-thinking-option ()
   :tags '(dsh-unit)
-  (let ((dsh-emacs-show-reasoning nil)
+  (let ((dsh-emacs-show-thinking nil)
         (records (dsh-protocol--assistant-records
                   '[((type . "reasoning-chunks") (texts . ["hidden think"]))])))
     (should (equal (dsh-emacs-render--assistant-stream-text records) ""))))
@@ -118,8 +149,7 @@
   (dolist (types '(("reasoning") ("reasoning" "text" "reasoning" "text")))
     (with-temp-buffer
       (dsh-emacs-mode)
-      (let ((dsh-emacs-thinking-expand-by-default t)
-            (dsh-emacs-thinking-preview-max 0)
+      (let ((dsh-emacs-thinking-preview-max 0)
             records)
         (cl-loop for type in types for index from 0
                  for body = (format "failed-%s-%d" type index)
@@ -1155,6 +1185,506 @@
           (should-not (invisible-p (overlay-start one)))
           (should (invisible-p (overlay-start two))))))))
 
+(defun dsh-emacs-test--render-trigger-splice
+    (seq target removed &optional outcome entries)
+  "Return an `agent/inbox/spliced' event at SEQ for TARGET.
+REMOVED is the removed count, OUTCOME an optional wire outcome, and ENTRIES
+a list of (ID KIND TEXT) inserted messages."
+  (list (cons 'type "agent/inbox/spliced") (cons 'seq seq)
+        (cons 'data
+              (append
+               (list (cons 'target target) (cons 'start 0))
+               (when removed (list (cons 'removedCount removed)))
+               (when outcome (list (cons 'outcome outcome)))
+               (list
+                (cons 'inserted
+                      (vconcat
+                       (mapcar
+                        (lambda (entry)
+                          (list (cons 'id (nth 0 entry))
+                                (cons 'source
+                                      (list (cons 'kind (nth 1 entry))))
+                                (cons 'content
+                                      (vector
+                                       (list (cons 'type "text")
+                                             (cons 'text (nth 2 entry)))))))
+                        entries))))))))
+
+(defun dsh-emacs-test--render-trigger-message
+    (seq id kind text &optional provider)
+  "Return a `user/message' for ID at SEQ with source KIND and body TEXT.
+PROVIDER is recorded on the source for webhook titles."
+  (let ((source (append (list (cons 'kind kind))
+                        (when provider (list (cons 'provider provider))))))
+    (list (cons 'type "user/message") (cons 'seq seq)
+          (cons 'data
+                (list (cons 'id id) (cons 'source source)
+                      (cons 'content
+                            (vector (list (cons 'type "text")
+                                          (cons 'text text)))))))))
+
+(defun dsh-emacs-test--turn-trigger-events
+    (seq turn time kind &optional provider process)
+  "Return events from SEQ for TURN woken by a claimed KIND notice.
+PROVIDER distinguishes a GitHub webhook; PROCESS adds a settled Think block
+so the turn owns a foldable activity."
+  (let* ((text (format "%s notice body" (or provider kind)))
+         (id (format "notice-%s-%s" turn (or provider kind))))
+    (list
+     (dsh-emacs-test--render-trigger-splice
+      seq "next-turn" nil nil (list (list id kind text)))
+     (list (cons 'type "turn/start") (cons 'seq (1+ seq)) (cons 'time time)
+           (cons 'data (list (cons 'turn turn))))
+     (dsh-emacs-test--render-trigger-splice (+ seq 2) "next-turn" 1)
+     (list (cons 'type "step/start") (cons 'seq (+ seq 3)) (cons 'time time)
+           (cons 'data (list (cons 'turn turn) (cons 'step 1))))
+     (dsh-emacs-test--render-trigger-message (+ seq 4) id kind text provider)
+     (list (cons 'type "assistant/message") (cons 'seq (+ seq 5))
+           (cons 'time (+ time 1000))
+           (cons 'data
+                 (list (cons 'turn turn) (cons 'step 1)
+                       (cons 'message
+                             (list
+                              (cons 'content
+                                    (vconcat
+                                     (when process
+                                       (vector (list (cons 'type "reasoning")
+                                                     (cons 'text "checked"))))
+                                     (vector
+                                      (list (cons 'type "text")
+                                            (cons 'text
+                                                  (format "Answer for %s."
+                                                          (or provider
+                                                              kind))))))))))))
+     (list (cons 'type "turn/end") (cons 'seq (+ seq 6))
+           (cons 'time (+ time 2000))
+           (cons 'data (list (cons 'turn turn)
+                             (cons 'reason
+                                   (list (cons 'kind "completed")))))))))
+
+(defun dsh-emacs-test--human-turn-events (seq turn time)
+  "Return events from SEQ for a plain human TURN with one answer."
+  (list
+   (list (cons 'type "turn/start") (cons 'seq seq) (cons 'time time)
+         (cons 'data (list (cons 'turn turn))))
+   (list (cons 'type "step/start") (cons 'seq (1+ seq)) (cons 'time time)
+         (cons 'data (list (cons 'turn turn) (cons 'step 1))))
+   (list (cons 'type "user/message") (cons 'seq (+ seq 2)) (cons 'time time)
+         (cons 'data
+               (list (cons 'id (format "human-%s" turn))
+                     (cons 'source (list (cons 'kind "user")))
+                     (cons 'content
+                           (vector (list (cons 'type "text")
+                                         (cons 'text "Question")))))))
+   (list (cons 'type "assistant/message") (cons 'seq (+ seq 3))
+         (cons 'time (+ time 500))
+         (cons 'data
+               (list (cons 'turn turn) (cons 'step 1)
+                     (cons 'message
+                           (list (cons 'content
+                                       (vector
+                                        (list (cons 'type "text")
+                                              (cons 'text
+                                                    "Earlier answer.")))))))))
+   (list (cons 'type "turn/end") (cons 'seq (+ seq 4))
+         (cons 'time (+ time 1000))
+         (cons 'data (list (cons 'turn turn)
+                           (cons 'reason (list (cons 'kind "completed"))))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-notice ()
+  :tags '(dsh-unit)
+  (dolist (delivery '(live history prepend reconnect))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (setq-local dsh-emacs--buffer-session "turn-trigger")
+      (let* ((dsh-emacs-reply-footer-items nil)
+             (base 1793007494000)
+             (early (dsh-emacs-test--human-turn-events 1 1 base))
+             (wake (dsh-emacs-test--turn-trigger-events
+                    10 2 (+ base 2000) "agent-message" nil t))
+             (events (append early wake))
+             (entries (mapcar (lambda (event) (list (cons 'event event)))
+                              events)))
+        (pcase delivery
+          ('live (dolist (event events) (dsh-emacs-render-event event)))
+          ('history (dsh-emacs-render-history-events entries))
+          ('prepend
+           ;; Render the woken turn first, then page the earlier turn above it.
+           (dsh-emacs-render-history-events (nthcdr (length early) entries))
+           (let* ((dsh-emacs--history-insert-marker
+                   (dsh-emacs-render--history-prepend-marker))
+                  (position (marker-position dsh-emacs--history-insert-marker)))
+             (dsh-emacs-render-history-events
+              (cl-subseq entries 0 (length early)) nil 10
+              :insert-before position :follow-p nil)
+             (set-marker dsh-emacs--history-insert-marker nil)))
+          ('reconnect
+           (dsh-emacs-render-history-events entries)
+           (dsh-emacs-render-history-events entries)))
+        (ert-info ((format "turn-trigger-%s" delivery))
+          (should (string-match-p "Earlier answer\\." (buffer-string)))
+          (should (string-match-p "Answer for agent-message\\."
+                                  (buffer-string)))
+          (should (= (how-many "Task message received"
+                               (point-min) (point-max))
+                     1))
+          ;; Folded by default: the model-facing notice body is not shown.
+          (should-not (string-match-p "agent-message notice body"
+                                      (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "Task message received")
+          (let ((trigger (match-beginning 0)))
+            (should-not (invisible-p trigger))
+            ;; The trigger stays above the settled turn's own disclosure.
+            (goto-char trigger)
+            (search-forward "Completed in")
+            (should (< trigger (match-beginning 0)))
+            (let* ((state (gethash 2 dsh-emacs-render--reply-turns))
+                   (overlay (plist-get state :work-overlay)))
+              (should overlay)
+              (should (< trigger (overlay-start overlay)))
+              ;; The settled work is hidden; the attribution row is not.
+              (should (invisible-p (overlay-start overlay))))
+            ;; Expanding restores the recorded notice; the answer stays.
+            (goto-char trigger)
+            (dsh-emacs-ui-toggle-fragment)
+            (should (string-match-p "agent-message notice body"
+                                    (buffer-string)))
+            (should (string-match-p "Answer for agent-message\\."
+                                    (buffer-string)))
+            (should (= (how-many "Task message received"
+                                 (point-min) (point-max))
+                       1))))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-opening-batch ()
+  :tags '(dsh-unit)
+  ;; The opening batch is the non-canceled claims between turn/start and the
+  ;; first step/start.  A hidden injection spends a slot, not the attribution.
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (let ((base 1793007494000))
+      (dolist (event
+               (list
+                (list (cons 'type "turn/start") (cons 'seq 1)
+                      (cons 'time base) (cons 'data (list (cons 'turn 1))))
+                (dsh-emacs-test--render-trigger-splice 2 "next-step" 1)
+                (dsh-emacs-test--render-trigger-splice 3 "next-turn" 1)
+                (list (cons 'type "step/start") (cons 'seq 4)
+                      (cons 'time base)
+                      (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                (dsh-emacs-test--render-trigger-message
+                 5 "ctx-1" "agent-instructions" "hidden context body")
+                (dsh-emacs-test--render-trigger-message
+                 6 "wake-1" "agent-message" "wake body")))
+        (dsh-emacs-render-event event))
+      (should (= (how-many "Task message received" (point-min) (point-max))
+                 1))
+      (should-not (string-match-p "hidden context body" (buffer-string)))
+      (should-not (string-match-p "wake body" (buffer-string))))
+    ;; A later step's claim is not part of the opening batch.
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (let ((base 1793007494000))
+        (dolist (event
+                 (list
+                  (list (cons 'type "turn/start") (cons 'seq 1)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1))))
+                  (dsh-emacs-test--render-trigger-splice 2 "next-step" 1)
+                  (list (cons 'type "step/start") (cons 'seq 3)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                  (dsh-emacs-test--render-trigger-message
+                   4 "ctx-1" "agent-instructions" "hidden context body")
+                  (list (cons 'type "step/end") (cons 'seq 5)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                  (dsh-emacs-test--render-trigger-splice 6 "next-step" 1)
+                  (list (cons 'type "step/start") (cons 'seq 7)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1) (cons 'step 2))))
+                  (dsh-emacs-test--render-trigger-message
+                   8 "steer-1" "agent-message" "steer body")))
+          (dsh-emacs-render-event event))
+        (should-not (string-match-p "Task message received"
+                                    (buffer-string)))
+        (should-not (string-match-p "steer body" (buffer-string)))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-prepend-keeps-tail-state ()
+  :tags '(dsh-unit)
+  ;; A prepended page must not clear the live tail's attribution state.
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (setq-local dsh-emacs--buffer-session "turn-trigger-prepend")
+    (let ((base 1793007494000))
+      ;; A settled page gives the buffer a prepend anchor.
+      (dsh-emacs-render-history-events
+       (mapcar (lambda (event) (list (cons 'event event)))
+               (dsh-emacs-test--human-turn-events 1 1 base)))
+      ;; The tail starts a turn and lost only the queue insertion.
+      (dolist (event
+               (list
+                (list (cons 'type "turn/start") (cons 'seq 10)
+                      (cons 'time base) (cons 'data (list (cons 'turn 2))))
+                (dsh-emacs-test--render-trigger-splice 11 "next-turn" 1)
+                (list (cons 'type "step/start") (cons 'seq 12)
+                      (cons 'time base)
+                      (cons 'data (list (cons 'turn 2) (cons 'step 1))))))
+        (dsh-emacs-render-event event))
+      (let* ((entries
+              (mapcar (lambda (event) (list (cons 'event event)))
+                      (dsh-emacs-test--human-turn-events 30 3 base)))
+             (dsh-emacs--history-insert-marker
+              (dsh-emacs-render--history-prepend-marker))
+             (position (marker-position dsh-emacs--history-insert-marker)))
+        (dsh-emacs-render-history-events entries nil 100
+                                         :insert-before position
+                                         :follow-p nil)
+        (set-marker dsh-emacs--history-insert-marker nil))
+      ;; The tail's turn bound and its claim slot survive the older page.
+      (should (= dsh-emacs-render--turn-start-seq 10))
+      (should (= dsh-emacs-render--turn-claim-slots 1))
+      (dsh-emacs-render-event
+       (dsh-emacs-test--render-trigger-message
+        13 "tail-wake" "agent-message" "tail body"))
+      (should (= (how-many "Task message received" (point-min) (point-max))
+                 1))
+      (should-not (string-match-p "tail body" (buffer-string))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-idle-steer ()
+  :tags '(dsh-unit)
+  (dolist (case '(step-1 step-2 human-batch next-turn-claim
+                  claim-before-turn missing-step))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (let* ((base 1793007494000)
+             (id "idle-notice")
+             (message (dsh-emacs-test--render-trigger-message
+                       6 id "agent-message" "idle notice body"))
+             (events
+              (pcase case
+                ('claim-before-turn
+                 (list
+                  (dsh-emacs-test--render-trigger-splice
+                   1 "next-step" nil nil (list (list id "agent-message"
+                                                      "idle notice body")))
+                  (dsh-emacs-test--render-trigger-splice 2 "next-step" 1)
+                  (list (cons 'type "turn/start") (cons 'seq 3)
+                        (cons 'time base) (cons 'data (list (cons 'turn 1))))
+                  (list (cons 'type "step/start") (cons 'seq 4)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                  message))
+                ('next-turn-claim
+                 (list
+                  (dsh-emacs-test--render-trigger-splice
+                   1 "next-turn" nil nil '(("other" "agent-message" "other")))
+                  (list (cons 'type "turn/start") (cons 'seq 2)
+                        (cons 'time base) (cons 'data (list (cons 'turn 1))))
+                  (dsh-emacs-test--render-trigger-splice 3 "next-turn" 1)
+                  (dsh-emacs-test--render-trigger-splice
+                   4 "next-step" nil nil (list (list id "agent-message"
+                                                      "idle notice body")))
+                  (dsh-emacs-test--render-trigger-splice 5 "next-step" 1)
+                  (list (cons 'type "step/start") (cons 'seq 6)
+                        (cons 'time base)
+                        (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                  (dsh-emacs-test--render-trigger-message
+                   7 id "agent-message" "idle notice body")))
+                (_
+                 (append
+                  (list
+                   (list (cons 'type "turn/start") (cons 'seq 1)
+                         (cons 'time base) (cons 'data (list (cons 'turn 1))))
+                   (when (not (eq case 'missing-step))
+                     (list (cons 'type "step/start") (cons 'seq 2)
+                           (cons 'time base)
+                           (cons 'data (list (cons 'turn 1)
+                                             (cons 'step
+                                                   (if (eq case 'step-2) 2 1))))))
+                   (dsh-emacs-test--render-trigger-splice
+                    3 "next-step" nil nil
+                    (if (eq case 'human-batch)
+                        (list (list id "agent-message" "idle notice body")
+                              (list "human-1" "user" "human steer body"))
+                      (list (list id "agent-message" "idle notice body"))))
+                   (dsh-emacs-test--render-trigger-splice
+                    4 "next-step" (if (eq case 'human-batch) 2 1)))
+                  (list message))))))
+        (dolist (event events)
+          (dsh-emacs-render-event event))
+        (ert-info ((format "turn-trigger-idle-steer-%s" case))
+          (should-not (string-match-p "idle notice body" (buffer-string)))
+          (if (eq case 'step-1)
+              (should (string-match-p "Task message received"
+                                      (buffer-string)))
+            (should-not (string-match-p "Task message received"
+                                        (buffer-string)))))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-truncated-claim ()
+  :tags '(dsh-unit)
+  ;; A page can begin at turn/start, keeping the claim but losing the inbox
+  ;; insertion; the turn's first known waking input still gets its row.
+  (dolist (case '(("agent-message" . t) ("user" . nil)
+                  ("runtime-context" . nil)))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (let* ((base 1793007494000)
+             (events
+              (list
+               (list (cons 'type "turn/start") (cons 'seq 1)
+                     (cons 'time base) (cons 'data (list (cons 'turn 1))))
+               (dsh-emacs-test--render-trigger-splice 2 "next-turn" 1)
+               (list (cons 'type "step/start") (cons 'seq 3)
+                     (cons 'time base)
+                     (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+               (dsh-emacs-test--render-trigger-message
+                4 "notice-1" (car case) "truncated body")
+               ;; A later notice is not the opener, so it stays hidden.
+               (dsh-emacs-test--render-trigger-message
+                5 "notice-2" "agent-message" "later body")
+               (list (cons 'type "assistant/message") (cons 'seq 6)
+                     (cons 'time (+ base 1000))
+                     (cons 'data
+                           (list (cons 'turn 1) (cons 'step 1)
+                                 (cons 'message
+                                       (list (cons 'content
+                                                   (vector
+                                                    (list (cons 'type "text")
+                                                          (cons 'text
+                                                                "Answer.")))))))))
+               (list (cons 'type "turn/end") (cons 'seq 7)
+                     (cons 'time (+ base 2000))
+                     (cons 'data (list (cons 'turn 1)
+                                       (cons 'reason
+                                             (list (cons 'kind
+                                                         "completed")))))))))
+        (dolist (event events)
+          (dsh-emacs-render-event event))
+        (ert-info ((format "turn-trigger-truncated-%s" (car case)))
+          (should (eq (and (string-match-p "Task message received"
+                                           (buffer-string))
+                           t)
+                      (cdr case)))
+          (unless (equal (car case) "user")
+            (should-not (string-match-p "truncated body" (buffer-string))))
+          (should-not (string-match-p "later body" (buffer-string)))))))
+  ;; A complete claim that names another id cannot use the opener fallback.
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (let ((base 1793007494000))
+      (dolist (event
+               (list
+                (dsh-emacs-test--render-trigger-splice
+                 1 "next-turn" nil nil
+                 '(("other" "agent-message" "other body")))
+                (list (cons 'type "turn/start") (cons 'seq 2)
+                      (cons 'time base) (cons 'data (list (cons 'turn 1))))
+                (dsh-emacs-test--render-trigger-splice 3 "next-turn" 1)
+                (list (cons 'type "step/start") (cons 'seq 4)
+                      (cons 'time base)
+                      (cons 'data (list (cons 'turn 1) (cons 'step 1))))
+                (dsh-emacs-test--render-trigger-message
+                 5 "unclaimed" "agent-message" "unclaimed body")))
+        (dsh-emacs-render-event event))
+      (should-not (string-match-p "Task message received" (buffer-string)))
+      (should-not (string-match-p "unclaimed body" (buffer-string))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-source-titles ()
+  :tags '(dsh-unit)
+  (dolist (case '(("agent-message" nil "Task message received")
+                  ("team-message" nil "Team message received")
+                  ("subagent-settled" nil "Subtask status updated")
+                  ("webhook" "github" "GitHub event received")
+                  ("webhook" "custom" "External event received")
+                  ("webhook" nil "External event received")
+                  ("schedule" nil "Automation task")
+                  ("tool-jobs" nil "Background task updated")
+                  ("cordis-host-runner" nil "Plugin status updated")
+                  ("custom-extension" nil "Execution requested")))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (dolist (event (dsh-emacs-test--turn-trigger-events
+                      1 1 1793007494000 (nth 0 case) (nth 1 case)))
+        (dsh-emacs-render-event event))
+      (ert-info ((format "turn-trigger-title-%s" case))
+        (let ((title (nth 2 case)))
+          (should (string-match-p (regexp-quote title) (buffer-string)))
+          (should (= (how-many (regexp-quote title) (point-min) (point-max))
+                     1))
+          (goto-char (point-min))
+          (search-forward title)
+          (let ((trigger (match-beginning 0)))
+            (should-not (invisible-p trigger))
+            (goto-char trigger)
+            (search-forward "Completed in")
+            ;; A turn whose only process is the waking notice has nothing to
+            ;; disclose; dsh web renders the disabled Completed row after the
+            ;; trigger, not an orphan row before it.
+            (should (< trigger (match-beginning 0)))
+            (should-not (get-text-property (match-beginning 0)
+                                           'dsh-emacs-work-details))
+            (should-not (plist-get
+                         (gethash 1 dsh-emacs-render--reply-turns)
+                         :work-overlay))))))))
+
+(ert-deftest dsh-emacs-test-render-turn-trigger-requires-claim ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (dolist (event
+             (list
+              ;; Queued for the next turn but never claimed: not a trigger.
+              (dsh-emacs-test--render-trigger-splice
+               1 "next-turn" nil nil '(("n1" "agent-message" "unclaimed body")))
+              (dsh-emacs-test--render-trigger-message
+               2 "n1" "agent-message" "unclaimed body")
+              ;; A canceled claim admits nothing.
+              (dsh-emacs-test--render-trigger-splice
+               3 "next-turn" nil nil '(("n2" "agent-message" "canceled body")))
+              (dsh-emacs-test--render-trigger-splice 4 "next-turn" 1 "canceled")
+              (dsh-emacs-test--render-trigger-message
+               5 "n2" "agent-message" "canceled body")
+              ;; Requeued work is not the claim that opened the turn.
+              (dsh-emacs-test--render-trigger-splice
+               6 "next-turn" nil nil '(("n3" "agent-message" "requeued body")))
+              (dsh-emacs-test--render-trigger-splice 7 "next-turn" 1)
+              (dsh-emacs-test--render-trigger-splice
+               8 "next-turn" nil nil '(("n3" "agent-message" "requeued body")))
+              (dsh-emacs-test--render-trigger-message
+               9 "n3" "agent-message" "requeued body")
+              ;; A next-step admission without a step location is not a
+              ;; turn trigger (the idle-steer rule needs step 1).
+              (dsh-emacs-test--render-trigger-splice
+               10 "next-step" nil nil '(("n4" "agent-message" "steered body")))
+              (dsh-emacs-test--render-trigger-splice 11 "next-step" 1)
+              (dsh-emacs-test--render-trigger-message
+               12 "n4" "agent-message" "steered body")
+              ;; A human message keeps its conversation bubble.
+              (dsh-emacs-test--render-trigger-splice
+               13 "next-turn" nil nil '(("h1" "user" "human body")))
+              (dsh-emacs-test--render-trigger-splice 14 "next-turn" 1)
+              (dsh-emacs-test--render-trigger-message 15 "h1" "user" "human body")
+              ;; The goal round keeps its own notice.
+              (dsh-emacs-test--render-trigger-splice
+               16 "next-turn" nil nil '(("g1" "goal" "goal body")))
+              (dsh-emacs-test--render-trigger-splice 17 "next-turn" 1)
+              (dsh-emacs-test--render-trigger-message 18 "g1" "goal" "goal body")
+              ;; The claimed agent message is the only trigger.
+              (dsh-emacs-test--render-trigger-splice
+               19 "next-turn" nil nil '(("n5" "agent-message" "waking body")))
+              (dsh-emacs-test--render-trigger-splice 20 "next-turn" 1)
+              (dsh-emacs-test--render-trigger-message
+               21 "n5" "agent-message" "waking body")))
+      (dsh-emacs-render-event event))
+    (ert-info ((format "%s" "turn-trigger-only-next-turn-claims"))
+      (should (string-match-p "human body" (buffer-string)))
+      (should (string-match-p "Continuing goal" (buffer-string)))
+      (should (= (how-many "Task message received" (point-min) (point-max)) 1))
+      (dolist (hidden '("unclaimed body" "canceled body" "requeued body"
+                        "steered body" "waking body"))
+        (should-not (string-match-p hidden (buffer-string)))))))
+
 (ert-deftest dsh-emacs-test-render-work-details-prepend-during-active-task ()
   :tags '(dsh-unit)
   (dolist (human-input '(t nil))
@@ -1195,6 +1725,81 @@
                    (overlay-start (plist-get
                                   (gethash 7 dsh-emacs-render--reply-turns)
                                   :work-overlay))))))))
+
+(ert-deftest dsh-emacs-test-render-footer-label-usage-completeness ()
+  :tags '(dsh-unit)
+  (let ((usage '(:input 10 :output 20 :cache-read 30 :cache-write 40)))
+    (dolist (case '((1 (reported reported) "Tokens 200")
+                    (nil (reported) "Tokens ≥100")
+                    (1 (reported missing) "Tokens ≥100")
+                    (1 (missing) "Tokens —")
+                    (1 (zero) "Tokens 0")))
+      (pcase-let* ((`(,start ,reports ,expected) case)
+                   (state
+                    (list :start-seq start :messages
+                          (cl-loop for report in reports for seq from 1
+                                   collect (cons seq
+                                                 (pcase report
+                                                   ('reported usage)
+                                                   ('zero '(:input 0 :output 0
+                                                                   :cache-read 0
+                                                                   :cache-write 0)))))))
+                   (original (copy-tree state t))
+                   (label (dsh-emacs-render--reply-footer-label
+                           7 state '(usage) nil)))
+        (ert-info ((format "Usage %S" case))
+          (should (equal (substring-no-properties label) expected))
+          (should (string-match-p
+                   (if (string-match-p "≥\\|—" expected)
+                       "incomplete history or missing reported usage"
+                     "input [0-9]+, output [0-9]+, cache read [0-9]+, cache write [0-9]+$")
+                   (get-text-property 0 'help-echo label)))
+          (should (equal state original)))))))
+
+(ert-deftest dsh-emacs-test-render-footer-label-duration ()
+  :tags '(dsh-unit)
+  (dolist (case '((1000 3500 "Time 2.5s")
+                  (0 61000 "Time 1m01s")
+                  (1000 1000 "Time 0.0s")
+                  (1000 999 "Time —")
+                  (nil 3500 "Time —")
+                  (1000 nil "Time —")))
+    (pcase-let ((`(,start ,end ,expected) case))
+      (should (equal (substring-no-properties
+                      (dsh-emacs-render--reply-footer-label
+                       7 (list :start-time start :end-time end)
+                       '(duration) nil))
+                     expected)))))
+
+(ert-deftest dsh-emacs-test-render-footer-label-actions-and-order ()
+  :tags '(dsh-unit)
+  (let ((state '(:reply-seq 102 :text "**final reply**"))
+        (items '(duration fork copy fork copy)))
+    (with-temp-buffer
+      (insert "existing transcript")
+      (let ((label (dsh-emacs-render--reply-footer-label 7 state items nil)))
+        (should (equal (substring-no-properties label)
+                       "Time —  ·  Fork  ·  Copy"))
+        (dolist (action '(copy fork))
+          (let ((pos (string-match (if (eq action 'copy) "Copy" "Fork") label)))
+            (should (eq (get-text-property pos 'action label)
+                        #'dsh-emacs-render--reply-action))
+            (should (eq (get-text-property pos 'dsh-emacs-reply-action label)
+                        action))
+            (should (equal (get-text-property pos 'dsh-emacs-reply-seq label)
+                           102))
+            (should (equal (get-text-property pos 'dsh-emacs-reply-text label)
+                           "**final reply**"))
+            (should (eq (get-text-property pos 'mouse-face label) 'highlight))))
+        (should (equal (buffer-string) "existing transcript"))
+        (should (= (point) (point-max)))))
+    (should (equal items '(duration fork copy fork copy)))
+    (should (equal (substring-no-properties
+                    (dsh-emacs-render--reply-footer-label
+                     7 state '(fork copy) t))
+                   "Copy"))
+    (should-not (dsh-emacs-render--reply-footer-label 7 state '(fork) t))
+    (should-not (dsh-emacs-render--reply-footer-label 7 state nil nil))))
 
 ;; Reply footers summarize a turn, not the session or just its last step.
 (ert-deftest dsh-emacs-test-render-footer-option-can-disable-row ()
@@ -1985,6 +2590,166 @@
         (should (= calls 0))
         (should (equal notice
                        "dsh:  *dsh-notify-no-dbus* — Run finished"))))))
+
+(ert-deftest dsh-emacs-test-render-notification-dbus-action-opens-session ()
+  :tags '(dsh-unit)
+  (require 'notifications)
+  (let ((system-type 'gnu/linux)
+        (dsh-emacs-enable-notifications t)
+        (original-featurep (symbol-function 'featurep))
+        (notifications-on-action-map nil)
+        (notifications-on-action-object t)
+        actions opened)
+    (cl-letf (((symbol-function 'w32-notification-notify) nil)
+              ((symbol-function 'ns-do-applescript) nil)
+              ((symbol-function 'featurep)
+               (lambda (feature &optional subfeature)
+                 (or (eq feature 'dbusbind)
+                     (funcall original-featurep feature subfeature))))
+              ((symbol-function 'dsh-emacs-notify--visible-p) #'ignore)
+              ((symbol-function 'dbus-call-method)
+               (lambda (&rest args)
+                 (setq actions
+                       (cl-find-if (lambda (arg) (eq (car-safe arg) :array))
+                                   args))
+                 7))
+              ((symbol-function 'dbus-get-name-owner)
+               (lambda (&rest _) ":1.7"))
+              ((symbol-function 'dsh-emacs-notify--open)
+               (lambda (session-id) (setq opened session-id))))
+      (with-temp-buffer
+        (rename-buffer " *dsh-notify-action*" t)
+        (dsh-emacs-notify--post "sess-click" "Run finished")
+        (should (equal actions '(:array "default" "Open session")))
+        (funcall (cadar notifications-on-action-map) 7 "default")
+        (should (equal opened "sess-click"))
+        (setq opened nil)
+        (funcall (cadar notifications-on-action-map) 7 "dismiss")
+        (should-not opened)))))
+
+(ert-deftest dsh-emacs-test-render-notification-macos-terminal-notifier ()
+  :tags '(dsh-unit)
+  (let ((system-type 'darwin)
+        (dsh-emacs-enable-notifications t)
+        program arguments)
+    (cl-letf (((symbol-function 'dsh-emacs-notify--visible-p) #'ignore)
+              ((symbol-function 'dsh-emacs-notify--server-p) (lambda () t))
+              ((symbol-function 'executable-find)
+               (lambda (name)
+                 (pcase name
+                   ("terminal-notifier" "/opt/homebrew/bin/terminal-notifier")
+                   ("emacsclient" "/opt/homebrew/bin/emacsclient"))))
+              ((symbol-function 'start-process)
+               (lambda (_name _buffer program-and-args &rest args)
+                 (setq program program-and-args
+                       arguments args))))
+      (with-temp-buffer
+        (rename-buffer " *dsh-notify-macos*" t)
+        (dsh-emacs-notify--post "sess-mac" "Run finished")
+        (should (equal program "/opt/homebrew/bin/terminal-notifier"))
+        (should (equal (nth 1 arguments) " *dsh-notify-macos*"))
+        (should (equal (nth 2 arguments) "-message"))
+        (should (equal (nth 3 arguments) "Run finished"))
+        (let ((execute (nth (1+ (cl-position "-execute" arguments :test #'equal))
+                            arguments)))
+          (should (equal (nth 1 (member "-activate" arguments))
+                         "org.gnu.Emacs"))
+          (should (string-search "emacsclient" execute))
+          (should (string-search "--eval" execute))
+          (should (string-search "sess-mac" execute)))))))
+
+(ert-deftest dsh-emacs-test-render-notification-macos-without-server-falls-back ()
+  :tags '(dsh-unit)
+  (let ((system-type 'darwin)
+        (dsh-emacs-enable-notifications t)
+        fell-back)
+    (cl-letf (((symbol-function 'dsh-emacs-notify--visible-p) #'ignore)
+              ((symbol-function 'dsh-emacs-notify--server-p) #'ignore)
+              ((symbol-function 'executable-find)
+               (lambda (name)
+                 (pcase name
+                   ("terminal-notifier" "/usr/local/bin/terminal-notifier")
+                   ("emacsclient" "/usr/local/bin/emacsclient"))))
+              ((symbol-function 'ns-do-applescript)
+               (lambda (&rest _) (setq fell-back t))))
+      (with-temp-buffer
+        (rename-buffer " *dsh-notify-macos-fallback*" t)
+        (dsh-emacs-notify--post "sess-mac" "Run finished")
+        (should fell-back)))))
+
+(ert-deftest dsh-emacs-test-render-notification-reopens-catalog-child ()
+  :tags '(dsh-unit)
+  (dolist (with-summary '(t nil))
+    (let* ((dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+           (dsh-emacs--sessions
+            (and with-summary
+                 (dsh-emacs-test--session-items
+                  '(((sessionId . "child") (origin . "subagent")
+                     (parentSessionId . "parent"))))))
+           (entry (dsh-protocol-subagent-entry--from-alist
+                   '((id . "child") (mode . "continuable"))))
+           (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+           opened regular)
+      (cl-letf (((symbol-function 'dsh-emacs-subagent--changed) #'ignore)
+                ((symbol-function 'dsh-emacs-subagent--refresh-summaries)
+                 #'ignore)
+                ((symbol-function 'dsh-emacs-open-session)
+                 (lambda (&rest args) (setq regular args)))
+                ((symbol-function 'dsh-emacs-open-subagent)
+                 (lambda (parent child &optional _other-window)
+                   (setq opened (dsh-emacs-subagent-address parent child))))
+                ((symbol-function 'display-graphic-p) #'ignore))
+        (dsh-emacs-subagent-apply
+         "parent" (dsh-protocol-subagent-baseline--from-alist
+                   '((asOfSeq . 1)
+                     (values (subagentCatalog . [((id . "child")
+                                                  (mode . "continuable"))])))))
+        (dsh-emacs-notify--open "child")
+        (should-not regular)
+        (should (equal opened (dsh-emacs-subagent-address "parent" entry)))))))
+
+(ert-deftest dsh-emacs-test-render-notification-reuses-live-child ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (let ((dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+          (dsh-emacs--sessions nil)
+          (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+          opened)
+      (puthash "child" (current-buffer) dsh-emacs--chat-buffers)
+      (cl-letf (((symbol-function 'dsh-emacs-open-session)
+                 (lambda (id &rest _) (setq opened id)))
+                ((symbol-function 'display-graphic-p) #'ignore))
+        (dsh-emacs-notify--open "child")
+        (should (equal opened "child"))))))
+
+(ert-deftest dsh-emacs-test-render-notification-child-summary-is-not-root ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+        (dsh-emacs--sessions
+         (dsh-emacs-test--session-items
+          '(((sessionId . "child") (origin . "subagent")
+             (parentSessionId . "parent")))))
+        (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+        opened)
+    (cl-letf (((symbol-function 'dsh-emacs-open-session)
+               (lambda (&rest args) (setq opened args))))
+      (dsh-emacs-notify--open "child")
+      (should-not opened))))
+
+(ert-deftest dsh-emacs-test-render-notification-open-unknown-session-messages ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+        (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+        opened notice)
+    (cl-letf (((symbol-function 'dsh-emacs--chat-session-item) #'ignore)
+              ((symbol-function 'dsh-emacs-open-session)
+               (lambda (&rest _) (setq opened t)))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq notice (apply #'format format-string args)))))
+      (dsh-emacs-notify--open "sess-gone")
+      (should-not opened)
+      (should (equal notice "dsh: the notified session is no longer available")))))
 
 (provide 'dsh-test-render)
 ;;; dsh-test-render.el ends here

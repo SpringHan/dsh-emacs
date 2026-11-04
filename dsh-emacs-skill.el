@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -52,6 +52,7 @@
 (require 'cl-lib)
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-server)
+(require 'dsh-emacs-ui)
 
 (declare-function dsh-emacs--active-session-id "dsh-emacs.el" ())
 
@@ -195,7 +196,8 @@ requests, and may itself be superseded while the RPC processes events."
                   (let ((items (dsh-emacs-skill--parse (cdr res))))
                     (dsh-emacs-skill--cache-catalog session-id items)
                     items)
-                (message "Failed to list skills: %S" (cdr res))
+                (message "Failed to list skills: %s"
+                         (dsh-emacs-rpc-error-text (cdr res)))
                 nil)))
         ;; Never clear a newer request's guard after a refresh during the wait.
         (when (equal stamp
@@ -264,7 +266,7 @@ SKILL is a `dsh-protocol-skill'; its PATH comes from the host (dsh
 0.1.6+) and is absent for providers that manage their own resources."
   (let ((path (dsh-protocol-skill-path skill)))
     (if path
-        (find-file path)
+        (dsh-emacs-ui-navigate (point-marker) #'find-file path)
       (user-error "Skill /%s has no SKILL.md path"
                   (dsh-protocol-skill-name skill)))))
 

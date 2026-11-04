@@ -2,7 +2,7 @@
 
 ;; Copyright (C) 2026
 ;; Author: dsh-emacs contributors
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; License: GPL-3.0-or-later
 
@@ -13,25 +13,27 @@
 ;;; Code:
 (require 'cl-lib)
 (require 'color)
-(require 'xref)
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-server)
 (require 'dsh-emacs-tokens)
-;; Animation is optional, like the mode line's running whale: without
-;; motion-line the icon keeps its static tint.
-(require 'motion-line nil t)
-(declare-function motion-line-playing-p "motion-line" (slot))
-(declare-function motion-line-play "motion-line" (slot clip &rest options))
-(declare-function motion-line-clip "motion-line" (duration renderer))
-(declare-function motion-line-stop "motion-line" (slot))
+(require 'dsh-emacs-ui)
+;; Icon playback uses the mode-line animation facade, which is optional:
+;; without a backend the icon keeps its static tint.
 
 (defvar dsh-emacs--sessions)
 (defvar dsh-emacs--chat-buffers)
 (defvar dsh-emacs--buffer-session)
 (defvar dsh-emacs--buffer-subagent)
-(defvar dsh-emacs-sessions-buffer)
+(defvar dsh-emacs--event-ready)
+(defvar dsh-emacs--sessions-buffer)
 (declare-function dsh-emacs-events--host-repaint "dsh-emacs-events" ())
-(declare-function dsh-emacs--completing-read-ordered "dsh-emacs" (prompt collection &rest args))
+(declare-function dsh-emacs-modeline-animation-available-p "dsh-emacs-modeline" ())
+(declare-function dsh-emacs-modeline-animation-clip "dsh-emacs-modeline" (duration renderer))
+(declare-function dsh-emacs-modeline-animation-playing-p "dsh-emacs-modeline" (slot))
+(declare-function dsh-emacs-modeline-animation-play "dsh-emacs-modeline" (slot clip))
+(declare-function dsh-emacs-modeline-animation-stop "dsh-emacs-modeline" (slot))
+(declare-function dsh-emacs-modeline-animation-text "dsh-emacs-modeline" (slot))
+(declare-function dsh-emacs-modeline-set-subagent-activity "dsh-emacs-modeline" (active))
 (declare-function dsh-emacs--chat-session-item "dsh-emacs" (session-id))
 (declare-function dsh-emacs--chat-title "dsh-emacs" (session-id))
 (declare-function dsh-emacs--active-session-id "dsh-emacs" ())
@@ -54,9 +56,9 @@
   "Seconds of one running-subagent icon pulse cycle.")
 
 (defconst dsh-emacs-subagent--animation-slot 'dsh-subagents
-  "motion-line slot that drives the subagent icon pulse.
-The mode line renders `motion-line-string' for this slot while it plays and
-the plain indicator otherwise, so playback state never leaks into the text.")
+  "Animation slot that drives the subagent icon pulse.
+`dsh-emacs-subagent-animation-text' returns the playing frame and the plain
+indicator is rendered otherwise, so playback state never leaks into the text.")
 
 (defvar dsh-emacs-subagent--icon-frames nil
   "Last (BASE . ACCENT) color pair and the icon pulse frames built for it.
@@ -165,7 +167,8 @@ STATUS-ONLY means only the running flag changed, not Agent availability."
            (when (eq token dsh-emacs--subagent-summary-request)
              (setq dsh-emacs--subagent-summary-request nil)
              (if (not ok)
-                 (message "Subagent parent availability refresh failed: %S" value)
+                 (message "Subagent parent availability refresh failed: %s"
+                          (dsh-emacs-rpc-error-text value))
                (dolist (incoming (dsh-protocol-session-list--from-alist value))
                  (let* ((id (dsh-protocol-session-session-id incoming))
                         (existing (dsh-emacs--chat-session-item id))
@@ -266,8 +269,8 @@ STATUS-ONLY means only the running flag changed, not Agent availability."
                        (dsh-protocol-subagent-identity-mode identity))))
              (dsh-emacs--subagent-input-update)))))
      dsh-emacs--chat-buffers))
-  (when-let* ((buffer (and (boundp 'dsh-emacs-sessions-buffer)
-                          (get-buffer dsh-emacs-sessions-buffer))))
+  (when-let* ((buffer (and (boundp 'dsh-emacs--sessions-buffer)
+                          (get-buffer dsh-emacs--sessions-buffer))))
     (with-current-buffer buffer
       (when (derived-mode-p 'dsh-emacs-session-mode)
         (dsh-emacs-events--host-repaint))))
@@ -371,31 +374,40 @@ same phase, so icon and number always agree."
   "Whether this display can animate the SVG subagent icon."
   (and (display-graphic-p) (image-type-available-p 'svg)))
 
-(defun dsh-emacs-subagent--animation-available-p ()
-  "Whether motion-line is installed in this Emacs."
-  (featurep 'motion-line))
-
 (defun dsh-emacs-subagent--stop-animation ()
-  "Stop this buffer's motion-line icon pulse."
-  (when (and (dsh-emacs-subagent--animation-available-p)
-             (motion-line-playing-p dsh-emacs-subagent--animation-slot))
-    (motion-line-stop dsh-emacs-subagent--animation-slot)))
+  "Stop this buffer's mode-line icon pulse."
+  (when (dsh-emacs-modeline-animation-playing-p
+         dsh-emacs-subagent--animation-slot)
+    (dsh-emacs-modeline-animation-stop dsh-emacs-subagent--animation-slot)))
+
+(defun dsh-emacs-subagent-animation-text ()
+  "Return the animated subagent segment, or nil when the pulse is not playing.
+The mode-line renderer falls back to the static, percent-escaped indicator."
+  (dsh-emacs-modeline-animation-text dsh-emacs-subagent--animation-slot))
 
 (defun dsh-emacs-subagent--sync-animation ()
-  "Start or stop this buffer's motion-line icon pulse.
-Playback runs only when motion-line is installed, the host is live, the
-display can repaint SVG and at least one direct child is running, so a stale
-running flag on a disconnected connection stays still.  While it plays the
-clip re-renders the indicator, so count and title changes need no restart."
-  (if (not (and (dsh-emacs-subagent--animation-available-p)
+  "Synchronize this buffer's child activity and animated icon pulse.
+The whale also requires the chat's own connection, so host updates cannot
+restart activity in a detached chat.  Snapshot application calls this even
+when the child projection watermarks have not changed.
+Playback runs only when the mode-line animation backend is installed, the
+host is live, the display can repaint SVG and at least one direct child is
+running, so a stale running flag on a disconnected connection stays still.
+While it plays the clip re-renders the indicator, so count and title changes
+need no restart."
+  (dsh-emacs-modeline-set-subagent-activity
+   (and dsh-emacs--event-ready dsh-emacs--subagent-host-live
+        (> (dsh-emacs-subagent--running-count) 0)))
+  (if (not (and (dsh-emacs-modeline-animation-available-p)
                 dsh-emacs--subagent-host-live
                 (dsh-emacs-subagent--icon-animation-p)
                 (> (dsh-emacs-subagent--running-count) 0)))
       (dsh-emacs-subagent--stop-animation)
-    (unless (motion-line-playing-p dsh-emacs-subagent--animation-slot)
-      (motion-line-play
+    (unless (dsh-emacs-modeline-animation-playing-p
+             dsh-emacs-subagent--animation-slot)
+      (dsh-emacs-modeline-animation-play
        dsh-emacs-subagent--animation-slot
-       (motion-line-clip
+       (dsh-emacs-modeline-animation-clip
         dsh-emacs-subagent--pulse-duration
         (lambda (elapsed)
           (dsh-emacs-subagent-indicator
@@ -437,7 +449,8 @@ Use the current completion frontend with no additional minibuffer keys."
         (unless (= generation dsh-emacs--subagent-generation)
           (user-error "Connection changed while reading subagents; try again"))
         (unless (and (car response) (cdr response))
-          (user-error "Cannot read subagents: %S" (cdr response)))
+          (user-error "Cannot read subagents: %s"
+                      (dsh-emacs-rpc-error-text (cdr response))))
         (dsh-emacs-subagent-apply
          parent (dsh-protocol-subagent-baseline--from-alist (cdr response)))))
     (let* ((entries (dsh-emacs-subagent--value parent 'subagentCatalog))
@@ -457,7 +470,7 @@ Use the current completion frontend with no additional minibuffer keys."
                     (lambda (candidate)
                       (when-let* ((entry (cdr (assoc candidate table))))
                         (dsh-emacs-subagent--annotation parent entry)))))
-             (choice (dsh-emacs--completing-read-ordered
+             (choice (dsh-emacs-ui--completing-read-ordered
                       "Subagent: " table nil t)))
         (unless (assoc choice table) (user-error "No subagent selected"))
         (cons parent (cdr (assoc choice table)))))))
@@ -477,9 +490,7 @@ Use the current completion frontend with no additional minibuffer keys."
      dsh-emacs--subagent-catalogs)
     (if owner
         (dsh-emacs-open-subagent (car owner) (cdr owner))
-      (let ((marker (point-marker)))
-        (dsh-emacs-open-session id)
-        (xref-push-marker-stack marker)))))
+      (dsh-emacs-open-session id))))
 
 (defun dsh-emacs-subagent-stop ()
   "Choose and request interruption of a continuable child."
@@ -496,7 +507,8 @@ Use the current completion frontend with no additional minibuffer keys."
        "subagents/interruptByParent" (dsh-protocol-subagent-stop-request address)
        (lambda (ok value)
          (if ok (message "Subagent stop requested")
-           (message "Subagent stop failed: %S" value)))))))
+           (message "Subagent stop failed: %s"
+                    (dsh-emacs-rpc-error-text value))))))))
 
 (defun dsh-emacs-subagent-describe ()
   "Choose a child and describe its cumulative token components."
@@ -533,8 +545,8 @@ Run this command in a child conversation to choose from its own children."
 (defun dsh-emacs-subagent-indicator (&optional phase)
   "Mode-line child count and lineage for the current chat.
 PHASE (0..1) selects the running pulse frame when the host is live and at
-least one direct child is running; nil renders the idle tint.  motion-line
-supplies PHASE from the elapsed clip time."
+least one direct child is running; nil renders the idle tint.  The mode-line
+animation backend supplies PHASE from the elapsed clip time."
   (let* ((id (bound-and-true-p dsh-emacs--buffer-session))
          (catalog (and id (dsh-emacs-subagent--value id 'subagentCatalog)))
          (address (bound-and-true-p dsh-emacs--buffer-subagent))

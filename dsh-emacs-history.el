@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025-2026
 ;; Author: dsh-emacs contributors
 ;; URL: https://github.com/vritser/dsh-emacs
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -21,8 +21,7 @@
 (defvar dsh-emacs--buffer-session)
 (defvar dsh-emacs--buffer-subagent)
 (defvar dsh-emacs--input-marker)
-(defvar dsh-emacs-history-window)
-(declare-function dsh-emacs--seed-input-history "dsh-emacs"
+(declare-function dsh-emacs--seed-input-history "dsh-emacs-input"
                   (events session-id &optional older))
 (declare-function dsh-emacs--active-session-id "dsh-emacs" ())
 
@@ -58,9 +57,21 @@ Other windows keep their reading positions; the draft is left untouched."
   (goto-char (point-max))
   (recenter -1))
 
+(defcustom dsh-emacs-history-window 30
+  "Maximum messages per history request, including the opening snapshot.
+Opening a fresh chat completes only the latest round;
+`dsh-emacs-history-rounds' controls manual older-history loads.  Long rounds
+are completed with additional bounded requests.  A smaller batch reduces
+per-response parsing work but requires more network round trips."
+  :type 'integer
+  :group 'dsh-emacs)
+
 (defcustom dsh-emacs-history-rounds 3
-  "Number of complete earlier rounds fetched by `dsh-emacs-load-older-history'.
-A partially visible oldest round counts as the first round to complete.
+  "Number of complete earlier human rounds fetched by
+`dsh-emacs-load-older-history'.  A human round is a turn containing a
+user-authored message; child- and goal-woken turns belong to the human round
+that preceded them.  A partially visible oldest round counts as the first
+round to complete.
 A prefix argument overrides this value for one load.  Opening a fresh chat
 always completes only the latest round, independently of this option."
   :type 'natnum
@@ -147,27 +158,34 @@ pagination frontier, and seeds `M-p' recall from the page's user messages."
                            (dsh-emacs--active-session-id)) t)
               (let ((rounds (dsh-protocol-history-page-rounds page)))
                 (message "%s%s"
-                         (if rounds
-                             (format "Loaded rounds %d–%d (%d round%s)"
-                                     (caar rounds) (car (car (last rounds)))
-                                     (length rounds) (if (= (length rounds) 1) "" "s"))
-                           (format "Loaded %d history events (no round boundaries)"
-                                   rendered))
-                         (if dsh-emacs--history-has-more
-                             "; C-c C-o loads earlier rounds"
-                           "; beginning of history"))))
+                         (cond
+                          (rounds
+                           (format "Loaded rounds %d–%d (%d round%s)"
+                                   (caar rounds) (car (car (last rounds)))
+                                   (length rounds)
+                                   (if (= (length rounds) 1) "" "s")))
+                          (dsh-emacs--history-has-more
+                           (format "Loaded %d history event%s (no round boundaries)"
+                                   rendered (if (= rendered 1) "" "s")))
+                          (t "Beginning of history"))
+                         (cond
+                          (dsh-emacs--history-has-more
+                           "; C-c C-o loads earlier rounds")
+                          (rounds "; beginning of history")
+                          (t "")))))
           (setq dsh-emacs--history-has-more nil)
           (message "No older messages remain"))))))
 
 (defun dsh-emacs-history--fetch-rounds (buffer request)
-  "Continue REQUEST until its complete rounds are available in BUFFER.
+  "Continue REQUEST until its complete human rounds are in BUFFER.
 Stage records without changing the transcript or its pagination cursor;
 failed, canceled and superseded requests can therefore be retried safely."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (dsh-emacs--history-load-active-p request)
         (message "Loading older rounds… %d/%d rounds ready; C-c C-o cancels"
-                 (length (plist-get request :rounds)) (plist-get request :target))
+                 (length (plist-get request :rounds))
+                 (plist-get request :target))
         (condition-case err
             (dsh-emacs--rpc-async
              "session/page"
@@ -175,80 +193,104 @@ failed, canceled and superseded requests can therefore be retried safely."
               (plist-get request :session) (plist-get request :address)
               (plist-get request :through) (plist-get request :before)
               (plist-get request :limit)
-              (- (plist-get request :target) (length (plist-get request :rounds))))
+              (- (plist-get request :target)
+                 (length (plist-get request :rounds))))
              (lambda (ok value)
                (when (buffer-live-p buffer)
                  (with-current-buffer buffer
                    (when (dsh-emacs--history-load-active-p request)
                      (condition-case err
-                         (progn
-                           (unless (and ok (listp value))
-                             (error "History request failed: %S" value))
-                           (unless (and (equal dsh-emacs--buffer-session
-                                               (plist-get request :session))
-                                        (equal dsh-emacs--buffer-subagent
-                                               (plist-get request :address))
-                                        (equal dsh-emacs--history-earliest-seq
-                                               (plist-get request :frontier)))
-                             (error "History changed while loading; retry from the current view"))
-                           (let* ((page (dsh-protocol-history-page--from-alist value))
-                                  (records (dsh-protocol-history-page-records page))
-                                  (oldest (dsh-protocol-history-page-oldest page))
-                                  (more (dsh-protocol-history-page-has-more page))
-                                  (rounds (append (dsh-protocol-history-page-rounds page)
-                                                  (plist-get request :rounds)))
-                                  (all (append records (plist-get request :records)))
-                                  (target (plist-get request :target)))
-                             (when (or (and more (null records))
-                                       (and oldest
-                                            (>= (dsh-protocol-history-page-newest page)
-                                                (plist-get request :before))))
-                               (error "History page did not move backwards"))
-                             (setf (plist-get request :records) all
-                                   (plist-get request :rounds) rounds)
-                             (if (and more (< (length rounds) target))
-                                 (progn
-                                   (setf (plist-get request :before) oldest)
-                                   (dsh-emacs-history--fetch-rounds buffer request))
-                               ;; The server's message budget can return an
-                               ;; extra partial round.  Keep only the requested
-                               ;; complete suffix, retaining its next-page cursor.
-                               (when (>= (length rounds) target)
-                                 (setq more (or more (> (length rounds) target))
-                                       rounds (last rounds target)
-                                       oldest (nth 1 (car rounds))
-                                       all (memq (nth 2 (car rounds)) all)))
-                               (let* ((window (plist-get request :window))
-                                      (point (plist-get request :point))
-                                      (visit (and (window-live-p window)
-                                                  (eq window (selected-window))
-                                                  (eq (window-buffer window) buffer)
-                                                  (= (window-point window) point))))
-                                 (dsh-emacs--load-older-history-page
-                                  buffer (dsh-protocol--make-history-page
-                                          :records all :oldest (or oldest
-                                                                   (plist-get request :before))
-                                          :has-more more :rounds rounds))
-                                 (when (and visit all)
-                                   (push-mark (marker-position point) t)
-                                   (when-let* ((start (dsh-emacs-render--history-prepend-marker)))
-                                     (goto-char start)
-                                     (recenter 0)
-                                     (set-marker start nil)))
-                                 (set-marker point nil)))))
+                         (dsh-emacs-history--consume-rounds-page
+                          buffer request ok value)
                        (error
                         (setq dsh-emacs--history-loading nil)
                         (set-marker (plist-get request :point) nil)
-                        (message "Could not load rounds: %s" (error-message-string err)))))))))
+                        (message "Could not load rounds: %s"
+                                 (error-message-string err)))))))))
           (error
            (setq dsh-emacs--history-loading nil)
            (set-marker (plist-get request :point) nil)
-           (message "Could not load rounds: %s" (error-message-string err))))))))
+           (message "Could not load rounds: %s"
+                    (error-message-string err))))))))
+
+(defun dsh-emacs-history--consume-rounds-page (buffer request ok value)
+  "Consume one `session/page' VALUE for REQUEST in BUFFER.
+Stage it and either fetch more until the human-round target is met or publish
+the kept range.  Signals on transport, identity, ordering or budget errors."
+  (unless (and ok (listp value))
+    (error "History request failed: %s" (dsh-emacs-rpc-error-text value)))
+  (unless (and (equal dsh-emacs--buffer-session (plist-get request :session))
+               (equal dsh-emacs--buffer-subagent (plist-get request :address))
+               (equal dsh-emacs--history-earliest-seq
+                      (plist-get request :frontier)))
+    (error "History changed while loading; retry from the current view"))
+  (let* ((page (dsh-protocol-history-page--from-alist value))
+         (records (dsh-protocol-history-page-records page))
+         (oldest (dsh-protocol-history-page-oldest page))
+         (newest (dsh-protocol-history-page-newest page))
+         (more (dsh-protocol-history-page-has-more page))
+         (all (append records (plist-get request :records)))
+         (rounds (dsh-protocol-history-human-rounds all))
+         (target (plist-get request :target)))
+    (when (or (and more (null records))
+              (and oldest (>= newest (plist-get request :before))))
+      (error "History page did not move backwards"))
+    (setf (plist-get request :records) all
+          (plist-get request :rounds) rounds)
+    (if (and more (< (length rounds) target))
+        (progn
+          (setf (plist-get request :before) oldest)
+          (dsh-emacs-history--fetch-rounds buffer request))
+      (dsh-emacs-history--publish-rounds-page
+       buffer request page all rounds))))
+
+(defun dsh-emacs-history--publish-rounds-page (buffer request page all rounds)
+  "Publish the kept human ROUNDS from ALL records for REQUEST in BUFFER.
+At most the requested number of human rounds is kept, and the page starts at
+the oldest kept human round's `turn/start'; leading child or goal turns are
+deferred to the next page."
+  (let* ((target (plist-get request :target))
+         (kept (if (>= (length rounds) target)
+                   (last rounds target)
+                 rounds))
+         (start (car kept))
+         (start-seq (and start (nth 1 start)))
+         (start-record (and start (nth 2 start)))
+         (trimmed (and start-record (memq start-record all)))
+         (oldest (dsh-protocol-history-page-oldest page))
+         (more (dsh-protocol-history-page-has-more page)))
+    (when trimmed
+      (setq more (or more (not (eq trimmed all)))
+            all trimmed
+            oldest start-seq))
+    (let* ((window (plist-get request :window))
+           (point (plist-get request :point))
+           (visit (and (window-live-p window)
+                       (eq window (selected-window))
+                       (eq (window-buffer window) buffer)
+                       (= (window-point window) point))))
+      (dsh-emacs--load-older-history-page
+       buffer
+       (dsh-protocol--make-history-page
+        :records all
+        :oldest (or oldest (plist-get request :before))
+        :has-more more
+        :rounds kept))
+      (when (and visit all)
+        (push-mark (marker-position point) t)
+        (when-let* ((start (dsh-emacs-render--history-prepend-marker)))
+          (goto-char start)
+          (recenter 0)
+          (set-marker start nil)))
+      (set-marker point nil))))
 
 (defun dsh-emacs-load-older-history (&optional rounds)
-  "Load ROUNDS complete earlier rounds, default `dsh-emacs-history-rounds'.
-With a prefix argument, use that many rounds.  A partial oldest round counts
-as the first round to complete.  Long rounds are fetched in bounded batches;
+  "Load ROUNDS complete earlier human rounds, default
+`dsh-emacs-history-rounds'.  A human round is a turn containing a user-authored
+message, so child- and goal-woken turns are loaded with the round that
+preceded them.  With a prefix argument, use that many rounds.  A partial
+oldest round counts as the first round to complete.  Long rounds are fetched
+in bounded batches;
 the transcript changes only when the requested range or session start is
 reached.  Invoke again while loading to cancel without moving the cursor.
 The initiating window visits the newly loaded range if its point has not

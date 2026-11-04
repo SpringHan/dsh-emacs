@@ -5,8 +5,103 @@
 (require 'dsh-test-support)
 
 (defvar vertico-mode)
-(defvar vertico--groups)
 (defvar vertico-group-format)
+
+(ert-deftest dsh-emacs-test-model-selection-autoload-initializes-coordinator ()
+  :tags '(dsh-unit)
+  (let* ((directory (make-temp-file "dsh-model-autoload-" t))
+         (source (expand-file-name "dsh-emacs-model.el" directory))
+         (loaddefs (expand-file-name "dsh-model-autoloads.el" directory)))
+    (unwind-protect
+        (progn
+          (copy-file (expand-file-name "dsh-emacs-model.el" dsh-emacs-test-root)
+                     source)
+          (dsh-test--generate-autoloads source loaddefs)
+          (dolist (command '(dsh-emacs-select-model dsh-emacs-select-effort))
+            (let ((form
+                   `(progn
+                      (require 'ert)
+                      (should-not (featurep 'dsh-emacs))
+                      (load ,loaddefs nil t)
+                      (should (autoloadp (symbol-function ',command)))
+                      (should-not (featurep 'dsh-emacs))
+                      (should
+                       (equal
+                        (should-error (call-interactively ',command)
+                                      :type 'user-error)
+                        '(user-error "Open or select a session first")))
+                      (should (featurep 'dsh-emacs)))))
+              (pcase-let ((`(,status . ,output)
+                           (dsh-test--fresh-process form)))
+                (ert-info ((format "Cold autoload %s: %s" command output))
+                  (should (equal status 0)))))))
+      (delete-directory directory t))))
+
+(ert-deftest dsh-emacs-test-model-selection-reader-returns-choice-without-rpc ()
+  :tags '(dsh-unit)
+  (let* ((directory
+          (dsh-protocol-model-directory--from-alist
+           '((groups . [((id . "g2") (name . "Provider Two")
+                         (models . [((id . "m2") (name . "Model Two"))]))]))))
+         (vertico-mode nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "m2 [g2|Provider Two]"))
+              ((symbol-function 'dsh-emacs--rpc-async)
+               (lambda (&rest _) (ert-fail "Reader submitted an RPC"))))
+      (should (equal (dsh-emacs--read-model-selection directory nil)
+                     '(("m2" "g2" "Provider Two" "Model Two" nil) nil))))))
+
+(ert-deftest dsh-emacs-test-model-selection-reader-rejects-without-rpc ()
+  :tags '(dsh-unit)
+  (let* ((directory
+          (dsh-protocol-model-directory--from-alist
+           '((groups . [((id . "g1") (name . "Provider One")
+                         (models . [((id . "m1") (name . "Model One"))]))]))))
+         (vertico-mode nil)
+         (picked "")
+         (messages nil)
+         (calls nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) picked))
+              ((symbol-function 'dsh-emacs--rpc-async)
+               (lambda (&rest args) (push args calls)))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (push (apply #'format fmt args) messages))))
+      (dolist (case '(("" "Kept the current model")
+                      ("no-such-model" "Unknown model")
+                      ("Provider One" "provider header")))
+        (setq picked (car case)
+              messages nil)
+        (ert-info ((format "Reader rejects %S" picked))
+          (should-not (dsh-emacs--read-model-selection directory nil))
+          (should-not calls)
+          (should (cl-some (lambda (text)
+                             (string-match-p (nth 1 case) text))
+                           messages)))))))
+
+(ert-deftest dsh-emacs-test-model-selection-effort-reader-without-rpc ()
+  :tags '(dsh-unit)
+  (let* ((directory
+          (dsh-protocol-model-directory--from-alist
+           '((current . ((provider . "g1") (model . "m1")))
+             (groups . [((id . "g1") (name . "Provider One")
+                         (models . [((id . "m1")
+                                     (reasoning
+                                      . ((defaultEffort . "high")
+                                         (efforts
+                                          . [((id . "high") (name . "High"))
+                                             ((id . "max") (name . "Max"))]))))]))]))))
+         (current (dsh-protocol-model-directory-current directory)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt _collection _predicate _require-match
+                                _initial _history default &rest _)
+                 (should (equal default "High"))
+                 "Max"))
+              ((symbol-function 'dsh-emacs--rpc-async)
+               (lambda (&rest _) (ert-fail "Reader submitted an RPC"))))
+      (should (equal (dsh-emacs--read-effort-selection directory current)
+                     '("g1" "m1" "max"))))))
 
 ;; --- Test 47: model catalog expansion + sorting + selectModel call ---
 (ert-deftest dsh-emacs-test-model-selection-model-candidates-flattened ()
@@ -459,7 +554,7 @@
     (unwind-protect
         (progn
           (when saved (fmakunbound 'completion-table-with-metadata))
-          (let ((table (dsh-emacs--completion-table-with-metadata
+          (let ((table (dsh-emacs-ui--completion-table-with-metadata
                         '("alpha" "beta" "gamma")
                         '((display-sort-function . identity)
                           (cycle-sort-function . identity)
@@ -514,7 +609,7 @@
                     ((symbol-function 'message)
                      (lambda (fmt &rest args)
                        (push (apply #'format fmt args) msgs))))
-            (let ((vertico-mode t) (vertico--groups nil))
+            (let ((vertico-mode t) (vertico-group-format "%s"))
               (dsh-emacs-select-model))
             (let* ((call (car calls))
                    (params (cadr call)))
@@ -1004,52 +1099,34 @@
     (ert-info ((format "%s" "command-input-wire-false-attachments-normalizes-to-nil"))
       (should (null (dsh-protocol-command-input-attachments input))))))
 
-;; --- Test 75: new-session preset candidate table (web display name +
-;; cached roster + built-in fallback) ---
-;; Display names match web: a system built-in preset is named via web's
-;; built-in key map ("Standard mode" and so on, the web name wins even if it
-;; publishes its own name); a user preset uses its published name (id when
-;; there is none); broken entries are dropped. No cache -> the web names of
-;; the four built-ins.
-(ert-deftest dsh-emacs-test-model-selection-preset-choices-fallback-builtins ()
+;; --- Test 75: new-session preset candidate table (published name or id) ---
+;; A preset uses its published `name'; one without a name shows its id. Rows
+;; that would render identically append their id. Broken entries are dropped.
+;; No cache -> no choices; `dsh-emacs--read-preset' ensures the server, fetches
+;; a cold roster synchronously, and only then prompts with those choices.
+(ert-deftest dsh-emacs-test-model-selection-preset-choices-name-or-id ()
   :tags '(dsh-unit)
   (let ((old-cache dsh-emacs--agent-presets))
     (unwind-protect
         (progn
           (setq dsh-emacs--agent-presets nil)
-          (ert-info ((format "%s" "preset-choices-fallback-builtins"))
-            (should (equal '(("Standard mode" . "standard")
-                             ("Minimal mode" . "minimal")
-                             ("PTC mode" . "ptc")
-                             ("Creator mode" . "cordis"))
-                           (dsh-emacs--preset-choices))))
+          (ert-info ((format "%s" "preset-choices-empty-before-roster"))
+            (should-not (dsh-emacs--preset-choices)))
           (setq dsh-emacs--agent-presets
                 (dsh-protocol-agent-preset-list--from-alist
-                 '((presets . [((id . "standard") (trust . "system"))
-                               ((id . "minimal") (trust . "system")
-                                (name . "Legacy name"))
+                 '((presets . [((id . "standard") (isDefault . t))
+                               ((id . "minimal") (name . "Legacy name"))
                                ((id . "ptc"))
-                               ((id . "my-agent") (trust . "user")
-                                (name . "My Agent"))
+                               ((id . "my-agent") (name . "My Agent"))
+                               ((id . "my-standard") (name . "standard"))
                                ((id . "broken-agent") (broken . "x"))]))))
-          (ert-info ((format "%s" "preset-choices-web-names-and-roster"))
-            (should (equal '(("Standard mode" . "standard")
-                             ("Minimal mode" . "minimal")
-                             ("PTC mode" . "ptc")
-                             ("My Agent" . "my-agent"))
-                           (dsh-emacs--preset-choices))))
-          ;; display-name boundaries: system unknown id -> name ?? id;
-          ;; user without name -> id
-          (ert-info ((format "%s" "preset-display-name-falls-back-name-or-id"))
-            (should (and (equal "Future Mode"
-                                (dsh-emacs--preset-display-name
-                                 (dsh-protocol-agent-preset--from-alist
-                                  '((id . "future") (trust . "system")
-                                    (name . "Future Mode")))))
-                         (equal "my-raw"
-                                (dsh-emacs--preset-display-name
-                                 (dsh-protocol-agent-preset--from-alist
-                                  '((id . "my-raw") (trust . "user")))))))))
+          (ert-info ((format "%s" "preset-choices-name-or-id"))
+            (should (equal '(("standard (standard)" . "standard")
+                             ("Legacy name" . "minimal")
+                             ("ptc" . "ptc")
+                             ("My Agent" . "my-agent")
+                             ("standard (my-standard)" . "my-standard"))
+                           (dsh-emacs--preset-choices)))))
       (setq dsh-emacs--agent-presets old-cache))))
 
 ;; --- Test 76: preset preselected id (config > roster isDefault > none) ---
@@ -1075,8 +1152,9 @@
 ;; Pick by display name -> its id; empty RET accepts the preselect (models
 ;; completing-read returning DEF); with no preselect an empty RET -> nil
 ;; (host default, no agentPreset sent); C-g bubbles up to cancel the whole
-;; creation (quit is not swallowed by read-preset). Every read triggers one
-;; agentPresets/list refresh (rpc-async is captured by the mock).
+;; creation (quit is not swallowed by read-preset). A warm read triggers one
+;; background refresh; a cold read fetches the roster synchronously and a
+;; failed fetch signals instead of prompting.
 (ert-deftest dsh-emacs-test-model-selection-read-preset-pick-by-display-name ()
   :tags '(dsh-unit)
   (let ((old-cache dsh-emacs--agent-presets)
@@ -1129,7 +1207,43 @@
             (should (eq 'quit
                         (condition-case nil
                             (progn (dsh-emacs--read-preset nil) nil)
-                          (quit 'quit))))))
+                          (quit 'quit)))))
+          ;; cold read: ensure the server, fetch the roster synchronously,
+          ;; then prompt with the fetched choices
+          (setq dsh-emacs--agent-presets nil)
+          (let ((ensured nil)
+                (prompted nil)
+                (fetched nil)
+                (offered nil))
+            (cl-letf (((symbol-function 'dsh-emacs-server-ensure)
+                       (lambda () (setq ensured t)))
+                      ((symbol-function 'completing-read)
+                       (lambda (_prompt collection &rest _)
+                         (setq prompted t offered collection)
+                         "standard"))
+                      ((symbol-function 'dsh-emacs--rpc-request)
+                       (lambda (method _params)
+                         (setq fetched method)
+                         (cons t '((presets . [((id . "standard"))])))))
+                      ((symbol-function 'dsh-emacs--rpc-async)
+                       (lambda (&rest _)
+                         (ert-fail "cold read must not wait for the async refresh"))))
+              (ert-info ((format "%s" "read-preset-fetches-roster-before-prompt"))
+                (should (equal "standard" (dsh-emacs--read-preset nil)))
+                (should ensured)
+                (should prompted)
+                (should (equal "agentPresets/list" fetched))
+                (should (equal '(("standard" . "standard")) offered)))))
+          ;; failed cold fetch: signal, never prompt or create with a default
+          (setq dsh-emacs--agent-presets nil)
+          (let ((prompted nil))
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (&rest _) (setq prompted t) ""))
+                      ((symbol-function 'dsh-emacs--rpc-request)
+                       (lambda (&rest _) (cons nil nil))))
+              (ert-info ((format "%s" "read-preset-fails-without-roster"))
+                (should-error (dsh-emacs--read-preset nil) :type 'user-error)
+                (should-not prompted)))))
       (setq dsh-emacs--agent-presets old-cache))))
 
 ;; --- Test 95b: permissionPresets/catalog parses and the switch runs the
@@ -1199,6 +1313,64 @@
     (ert-info ((format "%s" "permission-set-fetches-catalog-and-switches"))
       (should (equal '("permissionPresets/catalog") methods))
       (should (equal "/permission workspace-write" executed)))))
+
+;; The picker groups only when Vertico will actually apply `group-function',
+;; which is gated on the option's VALUE (nil = no group titles).  The fallback
+;; keeps provider headers and suffixes duplicate ids so they stay distinct.
+(defun dsh-test--model-picker-rows (group-format)
+  "Return the model picker's candidate keys when GROUP-FORMAT is in effect."
+  (let ((buf (generate-new-buffer " *dsh-model-rows*"))
+        (rows nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq dsh-emacs--current-session "sess-g")
+          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                     (lambda (method params cb)
+                       (unless (string= method "session/list")
+                         (funcall
+                          cb t
+                          (cond
+                           ((string= method "session/modelCatalog")
+                            '((current . ((provider . "g1") (model . "m1")))
+                              (groups
+                               . [((id . "g1") (name . "DeepSeek")
+                                   (models . [((id . "m2") (name . "Dup-1"))]))
+                                  ((id . "g2") (name . "Qwen")
+                                   (models . [((id . "m2") (name . "Dup-2"))]))])))
+                           (t nil))))))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt collection &rest _)
+                       (setq rows (all-completions "" collection nil))
+                       (signal 'quit nil)))
+                    ((symbol-function 'message) (lambda (&rest _) nil)))
+            (let ((vertico-mode t)
+                  (vertico-group-format group-format))
+              (condition-case nil (dsh-emacs-select-model) (quit nil)))))
+      (kill-buffer buf))
+    rows))
+
+(ert-deftest dsh-emacs-test-model-selection-grouped-rows-with-group-format ()
+  :tags '(dsh-unit)
+  (let ((rows (dsh-test--model-picker-rows "%s")))
+    (ert-info ("model-grouped-rows-have-no-header-candidates")
+      (should-not (member "Qwen" rows))
+      (should-not (member "DeepSeek" rows)))
+    (ert-info ("model-grouped-rows-show-bare-ids")
+      (should (cl-some (lambda (row)
+                         (equal "  m2" (get-text-property 0 'display row)))
+                       rows)))))
+
+(ert-deftest dsh-emacs-test-model-selection-fallback-rows-without-group-format ()
+  :tags '(dsh-unit)
+  (let ((rows (dsh-test--model-picker-rows nil)))
+    (ert-info ("model-fallback-rows-carry-provider-headers")
+      (should (member "Qwen" rows))
+      (should (member "DeepSeek" rows)))
+    (ert-info ("model-fallback-rows-suffix-duplicate-ids")
+      (should (cl-some (lambda (row)
+                         (equal "  m2 (Qwen)"
+                                (get-text-property 0 'display row)))
+                       rows)))))
 
 (provide 'dsh-test-model-selection)
 ;;; dsh-test-model-selection.el ends here

@@ -468,8 +468,7 @@ messages (e.g. `command/done')."
         (should dsh-emacs--markdown-timer))
       (dsh-emacs-render--cancel-markdown))))
 
-;; A page stops no spinner and leaves the optimistic pending-command alone.
-(ert-deftest dsh-emacs-test-history-history-page-command-not-animated ()
+(ert-deftest dsh-emacs-test-history-history-page-command-keeps-pending ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
@@ -477,26 +476,22 @@ messages (e.g. `command/done')."
     (setq-local dsh-emacs--history-earliest-seq 5)
     (let* ((block-id "cmd-old-cmd")
            (ns (dsh-emacs-render--make-namespace))
-           (stopped nil)
            (pending '(("cmd-temp-local" "compile"))))
       (puthash "old-cmd" (list ns block-id "compile" nil)
                dsh-emacs--command-blocks)
       (setq dsh-emacs--pending-command pending)
-      (cl-letf (((symbol-function 'dsh-emacs--command-spinner-stop)
-                 (lambda (&rest _) (setq stopped t))))
-        (dsh-emacs--load-older-history-page
-         (current-buffer)
-         (list (cons "hasMore" :json-false)
-               (cons "records"
-                     (vector
-                      (dsh-test--history-event-record
-                       "command/done" 4
-                       '((commandId . "old-cmd")
-                         (name . "compile")
-                         (kind . "success")
-                         (text . "COMPILE-DONE"))))))))
-      (ert-info ((format "%s" "history-page-command-not-animated"))
-        (should (not stopped))
+      (dsh-emacs--load-older-history-page
+       (current-buffer)
+       (list (cons "hasMore" :json-false)
+             (cons "records"
+                   (vector
+                    (dsh-test--history-event-record
+                     "command/done" 4
+                     '((commandId . "old-cmd")
+                       (name . "compile")
+                       (kind . "success")
+                       (text . "COMPILE-DONE")))))))
+      (ert-info ((format "%s" "history-page-command-keeps-pending"))
         (should (equal dsh-emacs--pending-command pending))
         (should (string-match-p "compile" (buffer-string)))
         (should (string-match-p "✓ done" (buffer-string)))))))
@@ -847,8 +842,11 @@ messages (e.g. `command/done')."
              (hasMore . ,(if (memq case '(exhausted empty)) :json-false t))
              (records . ,(pcase case
                            ('empty [])
-                           ('complete (vector (dsh-test--history-event-record
-                                               "turn/start" 9 '((turn . 4)))))
+                           ('complete (vector
+                                      (dsh-test--history-event-record
+                                       "turn/start" 9 '((turn . 4)))
+                                      (dsh-test--history-fixture
+                                       "user/message" 10 "VISIBLE QUESTION")))
                            (_ (vector (dsh-test--history-fixture
                                        "user/message" 9 "VISIBLE QUESTION"))))))))
         (should-not requests)
@@ -949,6 +947,115 @@ messages (e.g. `command/done')."
             (should (eq (not (null (dsh-test--history-text-pos "FIRST ROUND"))) (= target 3)))
             (should (string-match-p (if (= target 1) "Loaded rounds 2–2 (1 round)"
                                       "Loaded rounds 1–2 (2 rounds).*beginning") feedback))))))))
+
+;; A human round is user+assistant: a leading child/goal turn belongs to the
+;; previous round and must not become the top of a loaded page.
+(ert-deftest dsh-emacs-test-history-rounds-start-at-user-turn ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (setq-local dsh-emacs--buffer-session "human-round-boundary")
+    (setq dsh-emacs--history-earliest-seq 90
+          dsh-emacs--history-cursor 100
+          dsh-emacs--history-has-more t)
+    (let (feedback)
+      (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                 (lambda (_method _params callback)
+                   (funcall callback
+                            t
+                            `((records . ,(vector
+                                           (dsh-test--history-event-record
+                                            "turn/start" 10 '((turn . 1)))
+                                           (dsh-test--history-event-record
+                                            "user/message" 11
+                                            '((content . [((type . "text")
+                                                           (text . "CHILD-1"))])
+                                              (source . ((kind . "agent-message")))))
+                                           (dsh-test--history-fixture
+                                            "assistant/message" 12 "ASSIST-1")
+                                           (dsh-test--history-event-record
+                                            "turn/start" 20 '((turn . 2)))
+                                           (dsh-test--history-event-record
+                                            "user/message" 21
+                                            '((content . [((type . "text")
+                                                           (text . "HUMAN-2"))])
+                                              (source . ((kind . "user")))))
+                                           (dsh-test--history-fixture
+                                            "assistant/message" 22 "ASSIST-2")
+                                           (dsh-test--history-event-record
+                                            "turn/start" 30 '((turn . 3)))
+                                           (dsh-test--history-event-record
+                                            "user/message" 31
+                                            '((content . [((type . "text")
+                                                           (text . "CHILD-3"))])
+                                              (source . ((kind . "agent-message")))))
+                                           (dsh-test--history-fixture
+                                            "assistant/message" 32 "ASSIST-3")
+                                           (dsh-test--history-event-record
+                                            "turn/start" 40 '((turn . 4)))
+                                           (dsh-test--history-event-record
+                                            "user/message" 41
+                                            '((content . [((type . "text")
+                                                           (text . "HUMAN-4"))])
+                                              (source . ((kind . "user")))))
+                                           (dsh-test--history-fixture
+                                            "assistant/message" 42 "ASSIST-4")))
+                              (hasMore . :json-false)))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq feedback (apply #'format format-string args)))))
+        (dsh-emacs-load-older-history 2)
+        (should (= dsh-emacs--history-earliest-seq 20))
+        (should dsh-emacs--history-has-more)
+        (should (string-match-p "Loaded rounds 2–4 (2 rounds)" feedback))
+        (should-not (dsh-test--history-text-pos "ASSIST-1"))
+        (should (< (dsh-test--history-text-pos "HUMAN-2")
+                   (dsh-test--history-text-pos "ASSIST-2")
+                   (dsh-test--history-text-pos "ASSIST-3")
+                   (dsh-test--history-text-pos "HUMAN-4")
+                   (dsh-test--history-text-pos "ASSIST-4")))))))
+
+;; A page with no round boundaries at the transcript start reports exhaustion,
+;; even when a display-only inbox splice is its only rendered record.
+(ert-deftest dsh-emacs-test-history-roundless-beginning-reports-exhaustion ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (setq-local dsh-emacs--buffer-session "roundless-beginning")
+    (setq dsh-emacs--history-earliest-seq 5
+          dsh-emacs--history-cursor 10
+          dsh-emacs--history-has-more t)
+    (let (feedback)
+      (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                 (lambda (_method _params callback)
+                   (funcall callback
+                            t
+                            `((records . ,(vector
+                                           (dsh-test--history-event-record
+                                            "permission/preset" 0
+                                            '((preset . "workspace-write")))
+                                           (dsh-test--history-event-record
+                                            "sandbox/mode" 1
+                                            '((mode . "workspace-write")))
+                                           (dsh-test--history-event-record
+                                            "approval/policy" 2
+                                            '((policy . "ask")))
+                                           (dsh-test--history-event-record
+                                            "model/selection" 3
+                                            '((provider . "p")))
+                                           (dsh-test--history-event-record
+                                            "agent/inbox/spliced" 4
+                                            '((target . "next-turn")
+                                              (start . 0)
+                                              (inserted . [])))))
+                              (hasMore . :json-false)))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq feedback (apply #'format format-string args)))))
+        (dsh-emacs-load-older-history)
+        (should (equal feedback "Beginning of history"))
+        (should (= dsh-emacs--history-earliest-seq 0))
+        (should-not dsh-emacs--history-has-more)))))
 
 ;; Cancellation and errors never advance the cursor or publish staged pages.
 (ert-deftest dsh-emacs-test-history-history-round-case-keeps-frontier ()

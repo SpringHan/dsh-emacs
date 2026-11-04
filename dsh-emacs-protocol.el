@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -73,6 +73,8 @@
 ;;                                                   result)
 ;;                      dsh-protocol-bridge-error (code message field)
 ;;   inbox projection → dsh-protocol-queue-item (id placement text kind)
+;;   agent/inbox/spliced → dsh-protocol-inbox-splice (target start
+;;                            removed-count outcome inserted)
 ;;   permissionPresets/catalog → dsh-protocol-permission-catalog (options)
 ;;                        └─ dsh-protocol-permission-option (value name
 ;;                             description)
@@ -344,8 +346,9 @@ to the renderer.  SEQ advances replay even when no file is usable."
                (:constructor dsh-protocol-rpc-error--from-alist
                              (alist &aux
                                     (code (dsh-protocol--field 'code alist))
-                                    (message (dsh-protocol--field 'message alist)))))
-  code message)
+                                    (message (dsh-protocol--field 'message alist))
+                                    (details (dsh-protocol--field 'details alist)))))
+  code message details)
 
 ;; ---------------------------------------------------------------------------
 ;; session/list / workspace/follow baseline
@@ -639,8 +642,9 @@ selection, GROUPS by provider and unknown FAILURES.  The wire's
                               (description (cdr (assq 'description alist)))
                               (broken (cdr (assq 'broken alist))))))
   "One `agentPresets/list' entry.
-There is no `trust' field: dsh 0.1.7 dropped it, so a client keys any
-built-in label on ID alone (`dsh-emacs--preset-display-name')."
+`name' is present only when the preset declaration publishes one; the
+shipped presets do not, so callers fall back to `id' for display.  There is
+no `trust' field (dsh 0.1.7 dropped it)."
   id
   is-default
   name
@@ -1862,6 +1866,51 @@ private.  Missing or invalid counts remain nil; an empty wire array is zero."
                       (dsh-protocol--field 'error data))
          :command-id (dsh-protocol--field 'sourceCommandId data))))))
 
+;;; ---------------------------------------------------------------------------
+;;; History round classification
+;;; ---------------------------------------------------------------------------
+
+(defun dsh-protocol--event-user-authored-p (event)
+  "Whether the `user/message' EVENT is author text.
+A source-less message is author text for legacy fixtures and optimistic
+echoes; every recorded non-`user' source (child, goal, context, plugin) is
+not."
+  (let* ((data (dsh-protocol--field 'data event))
+         (source (dsh-protocol--field 'source data))
+         (kind (dsh-protocol--field 'kind source)))
+    (or (null kind) (equal kind "user"))))
+
+(defun dsh-protocol-history-human-rounds (records)
+  "Return (TURN SEQ RECORD) for human rounds in RECORDS, oldest first.
+RECORDS is an accumulated `session/page' history list, oldest first.  A human
+round is a turn containing a user-authored `user/message'; child, goal and
+other host wakes are not rounds by this definition.  The turn's own
+`turn/start' record supplies SEQ and RECORD.  Scanning the accumulated list
+(not one page) keeps a message-aligned page boundary from splitting a turn's
+start from its user message."
+  (let (rounds current)
+    (dolist (record records)
+      (let* ((event (dsh-protocol--field 'event record))
+             (type (dsh-protocol--field 'type event))
+             (data (dsh-protocol--field 'data event)))
+        (when (equal type "turn/start")
+          (when (and current (nth 3 current))
+            (push current rounds))
+          (let ((turn (dsh-protocol--field 'turn data)))
+            (setq current
+                  (and (natnump turn)
+                       (list turn (dsh-protocol--field 'seq event)
+                             record nil)))))
+        (when (and current
+                   (equal type "user/message")
+                   (dsh-protocol--event-user-authored-p event))
+          (setf (nth 3 current) t))))
+    (when (and current (nth 3 current))
+      (push current rounds))
+    (mapcar (lambda (round)
+              (list (nth 0 round) (nth 1 round) (nth 2 round)))
+            (nreverse rounds))))
+
 (cl-defstruct (dsh-protocol-follow-snapshot
                (:constructor dsh-protocol-follow-snapshot--from-alist
                              (value &aux
@@ -1875,16 +1924,9 @@ private.  Missing or invalid counts remain nil; an empty wire array is zero."
                                 raw-records))
                               (has-more (dsh-protocol--boolean
                                          (dsh-protocol--field 'hasMore value)))
-                              (round-count
-                               (cl-count-if
-                                (lambda (record)
-                                  (let ((event (dsh-protocol--field 'event record)))
-                                    (and (equal (dsh-protocol--field 'type event)
-                                                "turn/start")
-                                         (natnump (dsh-protocol--field
-                                                   'turn (dsh-protocol--field
-                                                          'data event))))))
-                                records))
+                              (human-round-count
+                               (length (dsh-protocol-history-human-rounds
+                                        records)))
                               (execution
                                (delq nil
                                      (mapcar
@@ -1901,11 +1943,12 @@ private.  Missing or invalid counts remain nil; an empty wire array is zero."
   "A follow stream's opening transcript and presentation baseline.
 RECORDS retain raw durable event records in wire order for the renderer;
 unlike a backward history page, this view imposes no sequence validation.
-ROUND-COUNT counts valid turn starts in RECORDS, including an active round.
+HUMAN-ROUND-COUNT counts turns in RECORDS with a user-authored message,
+including an active human round.
 EXECUTION covers the whole window, including events below the render anchor.
 PLAN is applied before history can yield; PROJECTIONS stay raw until their
 late decoding boundary.  An absent ASSISTANT is an empty baseline."
-  cursor records has-more round-count execution plan assistant projections)
+  cursor records has-more human-round-count execution plan assistant projections)
 
 (cl-defstruct (dsh-protocol-follow-item
                (:constructor dsh-protocol-follow-item--from-alist
@@ -2188,9 +2231,11 @@ the next; a later migration-required record must not discard earlier updates."
                                        ("api-session/added" (car args))
                                        ("api-session/status"
                                         (dsh-protocol--boolean (cadr args)))
+                                       ("api-session/activity" (cadr args))
                                        (_ nil))))))
   "A session emit with named arguments instead of positional wire fields.
-VALUE is the raw added summary or decoded running flag; otherwise nil.
+VALUE is the raw added summary, decoded running flag or activity timestamp;
+otherwise nil.
 Added summaries stay raw until cache application so a mutable cached session
 cannot contaminate the payload retained for refresh replay."
   name session-id value)
@@ -2481,28 +2526,29 @@ Both decisions are result values, not rejected waterfall errors."
 ;; pagination and round metadata are decoded here for the history controller.
 (cl-defstruct (dsh-protocol-history-page
                (:constructor dsh-protocol--make-history-page))
+  "One decoded `session/page' history window.
+RECORDS retain raw events and OLDEST/NEWEST are its sequence cursors.  ROUNDS
+is supplied by the history loader from
+`dsh-protocol-history-human-rounds' over the accumulated records; the wire
+page has no round classification."
   records oldest newest has-more rounds)
 
 (defun dsh-protocol-history-page--from-alist (value)
-  "Decode VALUE into records, an oldest cursor and (ROUND SEQ RECORD) starts."
-  (let (records rounds oldest previous)
+  "Decode VALUE into records, an oldest/newest cursor and has-more.
+The history loader supplies the page's human ROUNDS from the accumulated
+records."
+  (let (records oldest previous)
     (dolist (record (dsh-protocol--objects (dsh-protocol--field 'records value)))
       (when (equal (dsh-protocol--field 'type record) "event")
         (let* ((event (dsh-protocol--field 'event record))
-               (seq (dsh-protocol--field 'seq event))
-               (turn (dsh-protocol--field
-                      'turn (dsh-protocol--field 'data event))))
+               (seq (dsh-protocol--field 'seq event)))
           (unless (and (natnump seq) (or (null previous) (> seq previous)))
             (error "History page has invalid or unordered event sequence: %S" seq))
           (unless oldest (setq oldest seq))
           (setq previous seq)
-          (push record records)
-          (when (and (equal (dsh-protocol--field 'type event) "turn/start")
-                     (natnump turn))
-            (push (list turn seq record) rounds)))))
+          (push record records))))
     (dsh-protocol--make-history-page
      :records (nreverse records) :oldest oldest :newest previous
-     :rounds (nreverse rounds)
      :has-more (dsh-protocol--boolean (dsh-protocol--field 'hasMore value)))))
 
 (defun dsh-protocol-history-page-request (session address through before limit rounds)
@@ -2657,8 +2703,11 @@ DATA.REASON.ERROR ({code, message, ...})."
                              (event &key assistant &aux
                                     (data (dsh-protocol--field 'data event))
                                     (source (dsh-protocol--field 'source data))
+                                    (id (dsh-protocol--field 'id data))
                                     (source-kind (dsh-protocol--field 'kind source))
                                     (source-name (dsh-protocol--field 'name source))
+                                    (source-provider
+                                     (dsh-protocol--field 'provider source))
                                     (content
                                      (mapcar #'dsh-protocol-content-block--from-alist
                                              (dsh-protocol--list
@@ -2678,12 +2727,43 @@ DATA.REASON.ERROR ({code, message, ...})."
                                                   (stringp label))
                                         collect (cons label id)))))))
   "Content and source evidence of a user or assistant message.
-Source-less optimistic user echoes use the same content boundary."
-  content source-kind source-name references)
+ID is the durable message identity an inbox claim names; SOURCE-PROVIDER is
+the recorded provider for webhook triggers.  Source-less optimistic user
+echoes use the same content boundary and leave both nil."
+  id content source-kind source-name source-provider references)
 
 (defun dsh-protocol-attachment-data--from-alist (value)
   "Return the encoded bytes in a session/attachment response VALUE."
   (dsh-protocol--field 'data value))
+
+(cl-defstruct (dsh-protocol-inbox-splice
+               (:constructor dsh-protocol-inbox-splice--from-alist
+                             (event &aux
+                                    (data (dsh-protocol--field 'data event))
+                                    (target (dsh-protocol--field 'target data))
+                                    (start (dsh-protocol--field 'start data))
+                                    (removed-count
+                                     (dsh-protocol--field 'removedCount data))
+                                    (outcome
+                                     (dsh-protocol--field 'outcome data))
+                                    (inserted
+                                     (cl-loop
+                                      for item
+                                      in (dsh-protocol--objects
+                                          (dsh-protocol--field 'inserted data))
+                                      for id = (dsh-protocol--field 'id item)
+                                      for source = (dsh-protocol--field
+                                                    'source item)
+                                      when (stringp id)
+                                      collect (cons id (dsh-protocol--field
+                                                        'kind source)))))))
+  "One `agent/inbox/spliced' queue change.
+TARGET is `next-turn' or `next-step'; INSERTED holds (ID . SOURCE-KIND) for
+the messages the splice adds and REMOVED-COUNT the number it drops from the
+same queue.  OUTCOME is `canceled' when a dropped batch was never admitted.
+The renderer replays these records only to classify a turn-opening notice;
+it paints no row and keeps no Agent state."
+  target start removed-count outcome inserted)
 
 (defun dsh-protocol-record-event--from-alist (record)
   "Return the durable event carried by history RECORD."
@@ -2843,10 +2923,12 @@ argument-derived diff for a `write' and the generic ioCard for an `edit')."
 (defun dsh-protocol-ask-questions--from-alist (args-raw)
   "Decode an `ask_user_question' call's ARGS-RAW into question structs.
 Returns the questions in their offered order, or nil when the arguments name
-no usable question — a missing `questions' array, a question without text, or
-malformed JSON — so the caller keeps the generic ioCard.  The protocol module
-owns both argument spellings of the multi-select flag and drops a malformed
-element instead of signalling."
+no usable question — a missing `questions' array, a question without an id or
+text, or malformed JSON — so the caller keeps the generic ioCard.  Empty text
+is allowed: it is a presentation concern, and the caller substitutes a
+placeholder while still showing the options.  The protocol module owns both
+argument spellings of the multi-select flag and drops a malformed element
+instead of signalling."
   (let ((parsed (dsh-protocol--tool-json args-raw)))
     (when parsed
       (delq nil
@@ -2854,9 +2936,12 @@ element instead of signalling."
              (lambda (item)
                (let ((question (dsh-protocol-question--from-alist item)))
                  (when (and (dsh-protocol-question-p question)
-                            (let ((text (dsh-protocol-question-text question)))
-                              (and (stringp text)
-                                   (not (string-empty-p text)))))
+                            (let ((id (dsh-protocol-question-id question))
+                                  (text (dsh-protocol-question-text question)))
+                              (or (and (stringp id)
+                                       (not (string-empty-p id)))
+                                  (and (stringp text)
+                                       (not (string-empty-p text))))))
                    question)))
              (dsh-protocol--objects
               (dsh-protocol--field "questions" parsed)))))))
@@ -2978,9 +3063,16 @@ prefer their result error, then a provider message or error at the root."
                       (or (dsh-protocol--field 'message response)
                           (dsh-protocol--field 'error response))))))))
 
-(defun dsh-protocol-error-message--from-alist (value)
-  "Return the message in an error object VALUE, if present."
-  (dsh-protocol--field 'message value))
+(defun dsh-protocol-agent-preset-error--from-alist (value)
+  "Return (PRESET . AVAILABLE) from an `agent-preset/*' error VALUE.
+PRESET is the rejected preset id; AVAILABLE lists the ids the server
+does provide, or nil when the error names none."
+  (let* ((details (dsh-protocol-rpc-error-details
+                   (dsh-protocol-rpc-error--from-alist value)))
+         (preset (dsh-protocol--field 'agentPreset details)))
+    (when preset
+      (cons preset
+            (dsh-protocol--list (dsh-protocol--field 'available details))))))
 
 (defun dsh-protocol-workspace-order--from-alist (value)
   "Return the authoritative workspace order in RPC VALUE as a list."

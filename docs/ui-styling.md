@@ -7,20 +7,23 @@ faces; some surfaces have explicit backgrounds.
 
 ## Design language
 
-The visual language mirrors the dsh web UI — tool rows reuse its exact SVG
-icons and `ToolRow` / `ioCard` semantics, and the session list and context
-meter follow dsh-web conventions (the underlying rendering/folding machinery
-builds on agent-shell, the mode-line stats on pi-mono):
+The visual language mirrors the dsh web UI — tool rows reuse its
+`ToolRow` / `ioCard` semantics; in `full` they also reuse its exact SVG icons.
+The session list and context meter follow dsh-web conventions (the underlying
+rendering/folding machinery builds on agent-shell, the mode-line stats on
+pi-mono):
 
 - **User messages**: left-aligned text with a thin left rail and no background;
   one blank line before and after the message. The rail continues across
   explicit newlines and wrapped lines; the editable input keeps its `❯` prompt
 - **Assistant messages**: frameless Markdown bodies with transcript spacing
 - **Thinking blocks**: collapsible `<details>`-style items, folded by default,
-  shown with dsh web's Think icon (IconThink) + "Think" + a first-sentence
-  preview (truncated with `...` when too long)
+  shown with dsh web's Think sparkle SVG (IconThink) in `full` or one dot in
+  `simple`, plus "Think" and a first-sentence preview (truncated with `...`
+  when too long)
 - **Tool calls**: collapsible tool rows modeled on dsh web, with a variant icon
-  + status color (pending=orange, success=green, error=red); bash/pwsh rows
+  in `full` (one state-colored dot in `simple`) and, in `full`, the status tint
+  (pending=orange, success=green, error=red); bash/pwsh rows
   expand into a terminal card (`$` prompt + output, error/interrupt footer),
   read rows into a line-numbered file card, write/edit rows into a diff card,
   `ask_user_question` rows into their question/answer record, and every other
@@ -29,14 +32,31 @@ builds on agent-shell, the mode-line stats on pi-mono):
   automatic compaction failures share a small status dot, inspired by dsh
   web's `StateDot`. Retry uses the running face (orange), failure the error
   face (red), and cancellation/unknown the timestamp face (grey). Explicit titles
-  distinguish outcomes even without color. Headers keep the tool title face
-  and compact spacing; metadata uses the muted timestamp face. `Model error`
+  distinguish outcomes even without color. Headers keep the bold title face
+  (the muted event-row face in `simple`) and compact spacing; metadata uses the
+  muted timestamp face. `Model error`
   places its error code on the right and keeps the reason expanded initially.
-  Normal automatic compaction summaries retain their terminal-style icon.
+  Normal automatic compaction summaries retain their terminal-style icon in
+  `full` style.
 - **Mode-line stats**: a compact status section spliced into the mode line (model, effort, preset,
   permission, context%; cwd, branch, tokens, provider and cost are opt-in)
 - **Session list**: card view showing session title, working directory, branch,
   and last activity time
+
+`dsh-emacs-render-style` chooses between these icons and a single-dot
+`simple` style for every transcript event row. In `simple`, color is reserved
+for the leading dot: titles and summaries use the muted
+`dsh-emacs-event-row-face` (labels add bold) and status text stays muted while
+tool dots follow state — purple (`dsh-emacs-tool-icon-face`) pending, green
+(`dsh-emacs-tool-success-face`) success, red (`dsh-emacs-tool-error-face`)
+error, and `dsh-emacs-tool-stopped-face` stopped. The live Think dot uses
+`dsh-emacs-thinking-face` and settles to the same muted grey when complete;
+todo, goal and turn-trigger dots use `dsh-emacs-tool-icon-face`,
+`dsh-emacs-composer-goal-face` and `dsh-emacs-meta-face`. On non-graphical
+frames and in Emacs builds without SVG support there is no emoji fallback:
+`full` draws ordinary tool rows as one dot in the tool accent, while goal
+tools (the `◎` glyph) and the `✶` Think, `▤` todo and `➤` turn-trigger rows
+keep their text glyphs. The option restyles newly rendered rows only.
 
 ## User/Assistant messages
 
@@ -94,6 +114,7 @@ Colors come from `dsh-emacs-color-slash-command` / `-slash-command-dark` and
 | `dsh-emacs-tool-icon-face` | Tool variant icon (purple, mimicking dsh web's tool purple #a78bfa) |
 | `dsh-emacs-tool-bash-prompt-face` | Bash terminal card `$` prompt glyph (same tool-purple accent) |
 | `dsh-emacs-tool-title-face` | Tool card title |
+| `dsh-emacs-event-row-face` | `simple` event-row title/summary text and completed Think dot (muted grey, normal; labels add bold) |
 | `dsh-emacs-tool-io-face` | ioCard `IN` / `OUT` section labels |
 | `dsh-emacs-tool-meta-face` | Muted card body text: read line numbers, the read window footer, diff gap and totals lines |
 | `dsh-emacs-tool-diff-path-face` | Diff card hunk path |
@@ -109,20 +130,21 @@ and its args/output lines unstyled (`dsh-emacs-tool-output-face` is unused).
 
 Tool rows mimic dsh web's `ToolRow`: each tool call renders as one row of
 **collapsible** cards, with a header of `variant icon + title + summary`;
-expanding reveals the call body. Each card folds independently. Icons
-correspond one-to-one with dsh web's
+expanding reveals the call body. Each card folds independently. In `full`,
+icons correspond one-to-one with dsh web's
 `VARIANT_ICONS`:
 
-| Variant | Icon | Corresponding dsh web icon |
+| Variant | Full-style icon | Corresponding dsh web icon |
 |---|---|---|
-| bash (bash/pwsh) | 💻 | IconApiOutline14 (terminal) |
-| read (read/web_fetch/cordis_*_inspect) | 📖 | IconBrowseOutline16 (browse) |
-| search (web_search/grep/glob) | 🔍 | IconSearchOutline16 (magnifier) |
-| write | ✏️ | IconEditOutline16 (pencil) |
-| edit | ✏️ | IconEditOutline16 (pencil) |
-| code (run_code) | `</>` | IconCodeOutline16 (code brackets) |
-| question (ask_user_question) | ❓ | IconQuestionOutline14 (question mark) |
-| others (cordis_run, etc.) | ✨ | IconSparkle16 (sparkle) |
+| bash (bash/pwsh) | terminal SVG | IconApiOutline14 (terminal) |
+| read (read/web_fetch/cordis_*_inspect) | browse SVG | IconBrowseOutline16 (browse) |
+| search (grep/glob) | magnifier SVG | IconSearchOutline16 (magnifier) |
+| web (web_search) | globe SVG | IconGlobeOutline14 (globe) |
+| write | pencil SVG | IconEditOutline16 (pencil) |
+| edit | pencil SVG | IconEditOutline16 (pencil) |
+| code (run_code) | code-brackets SVG | IconCodeOutline16 (code brackets) |
+| question (ask_user_question) | question-mark SVG | IconQuestionOutline14 (question mark) |
+| others (cordis_run, etc.) | sparkle SVG | IconSparkle16 (sparkle) |
 
 A row with a known variant shows a humanized tool name (`grep` → `Grep`), or
 the `dsh-emacs-tool-titles` override when one is configured.  A variant-less
@@ -130,7 +152,7 @@ tool with no curated title instead takes dsh web's generic header
 (`Tool Call` + wire tool name, see the summary rules below), and its
 arguments appear only in the expanded card.
 
-Status semantics align with dsh web's `leadingFor`/`stateStatus`:
+Status semantics align with dsh web's `leadingFor`/`stateStatus` in `full`:
 
 - **Running**: keeps the variant icon with purple highlighting (no spinner animation)
 - **Success** (exit 0): keeps the variant icon and prints no status line on
@@ -140,6 +162,10 @@ Status semantics align with dsh web's `leadingFor`/`stateStatus`:
   `✗ exit N`, `✗ signal …`, or `✗ failed` according to the result
 - **Interrupted**: leading switches to `◐` in the stopped face; the body
   shows `⏸ interrupted`
+
+In `simple`, every state uses the leading dot and the row chrome is muted.
+Failure uses a red `●`; the interrupted state uses a stopped-face `●` instead
+of `full`'s `◐`. Execution-status dots are unchanged.
 
 Expanded bodies mirror dsh web's keyed toolviews.  Every one of them is drawn
 on the transcript background — no card surface band: a card's own faces (the
@@ -226,7 +252,7 @@ for no added meaning (see
   options under the minibuffer reader's own numbering, the chosen ones checked
   (`✓ `) with the label in the accent face, each description hanging at the
   label column in `dsh-emacs-meta-face`, and a closing `→ <free text>` answer or
-  `Not answered` once that question settled.  The collapsed row states the
+  `Skipped` once that question settled.  The collapsed row states the
   outcome instead (`waiting`, `2/3 answered`, `cancelled`, `interrupted`).  A
   question set the user dismissed (`ASK_CANCELLED`) settles and an abandoned
   one (`ASK_ABORTED`) reads as interrupted rather than a failed call, and the
@@ -253,9 +279,10 @@ tool row expands/collapses the body (the body is stored inside the block, so
 expanding always restores it).
 
 Automatic compaction summaries use a folded **Automatic compaction** row
-with the existing bash/terminal icon and `dsh-emacs-tool-title-face`. Like tool
-rows, the header has no extra blank padding; covered-item counts and the
-approximate old-context token estimate remain muted. `RET` or a click expands
+with the existing bash/terminal icon in `full` (one dot in `simple` or on a
+non-graphical display) and the tool title, muted in `simple`. Like tool rows,
+the header has no extra blank padding; covered-item counts and the approximate
+old-context token estimate remain muted. `RET` or a click expands
 the Markdown summary, and the original conversation stays visible. The header
 has no success tint or success mark: the summary arrives before checkpoint
 application, which can still fail afterward. Raw model output and the
@@ -296,14 +323,16 @@ more lines), rather than showing a bare title.
 
 | Face | Description |
 |---|---|
-| `dsh-emacs-thinking-face` | Think row label only (icon + "Think"; bold accent) |
+| `dsh-emacs-thinking-face` | Live Think icon/dot; in `full`, also the "Think" label (bold accent) |
 | `dsh-emacs-thinking-body-face` | Reasoning preview and expanded body (muted) |
 
-The collapsed row shows a preview of the first reasoning sentence on the right
+The collapsed row shows a preview of the first thinking sentence on the right
 (`dsh-emacs-thinking-preview-max` controls the maximum length; longer content is
-truncated with `...`; set to 0 to disable). The accent stays on the label row:
-the preview and the expanded reasoning body use the muted body face at normal
-weight.
+truncated with `...`; set to 0 to disable). In `full`, the amber accent covers
+the icon and the "Think" label. In `simple`, the live dot is amber while
+thinking streams, then settles to the muted `dsh-emacs-event-row-face` when
+the fragment is complete; the label is muted throughout. The preview and the
+expanded thinking body use the muted body face at normal weight in both styles.
 
 ## Fragment styling for extensions
 
@@ -421,12 +450,13 @@ the muted upright tier the goal objective uses. The row carries **no**
 background band, like the Goal Row and editable `❯` line; its identity is
 the tinted glyph and muted text.
 One space after the preview text sits a compact action cluster, one
-space apart, all tinted with `dsh-emacs-composer-next-action-face` (unicode
+space apart, all tinted with `dsh-emacs-composer-next-action-face` (text
 fallbacks when Emacs lacks SVG): the up arrow `IconSendOutlineRegular` (RET or
 a click sends the previewed message now — steering the running turn, or
-re-submitting text-only items while idle, the verb RET runs in `C-c C-q`), then `✎` edit
-(`IconEditOutline16`, offered only for a message whose content is all text,
-because the edit RPC answers with text blocks) and `🗑` delete
+submitting text-only items literally while idle, the verb RET runs in
+`C-c C-q`), then `✎` edit (`IconEditOutline16`, offered only for a message
+whose content is all text, because the edit RPC answers with text blocks) and
+`✕` delete
 \(`IconTrashOutline16`), which run the manager's `e`/`d` verbs. Local previews
 show no cells until their server queue ID arrives. Send-now refuses attachments
 while idle, preserving the original queued item. Each cell names
@@ -463,7 +493,7 @@ formatter skips its passes entirely. Bottom detection and scroll pinning use
 each window's screen rows, including line wrapping, while preserving each
 window's input cursor. See [031](../postmortem/031-stream-frontier-and-screen-rows.md).
 
-Large first chunks, queued reply/reasoning bursts and corrected replies keep
+Large first chunks, queued reply/thinking bursts and corrected replies keep
 the windows that were following immediately before the edit pinned afterward.
 The check happens when the text is written, so scrolling up while a timer is
 pending still takes effect. Partial-line formatting keeps one assistant base
@@ -532,8 +562,8 @@ that wrap call, so later renders use the current text and font settings.
 | `dsh-emacs-markdown-table-border` | Table border |
 | `dsh-emacs-markdown-table-zebra` | Table zebra striping |
 
-Customize the faces above for transcript Markdown. The renderer does not use
-the `dsh-emacs-markdown-*-face` definitions in `dsh-emacs-faces.el`.
+Customize the faces above for transcript Markdown; they are defined in
+`dsh-emacs-markdown.el`.
 
 ## Example: customize the tool card colors
 

@@ -11,11 +11,13 @@ after the `❯ ` prompt through the same `commands.execute` RPC the web UI uses:
 the host admits only registered commands (and never feeds them to the model),
 then logs `command/run` + `command/done` session events, which dsh-emacs
 renders as one web-style flow node in the transcript — a leading bash terminal
-icon (the same dsh-web SVG as bash tool rows, `💻` in terminal Emacs) followed
-by the command name, a classic `-\|/` spinner while the command is running, and
-on completion a short status (`✓ done` / `✗ failed`, green on success / red on
-error) in the header while the outcome text is folded into a collapsible body
-below, collapsed by default (`RET` on the row expands it).
+icon (the same dsh-web SVG as bash tool rows, or one dot in `simple` or where
+Emacs cannot draw SVG) followed by the command name, with the pending header
+tint in `full` (the dot in `simple`) carrying the running state, and on
+completion a short status (`✓ done` /
+`✗ failed`; green on success and red on error in `full`, muted in `simple`)
+in the header while the outcome text is folded into a collapsible body below,
+collapsed by default (`RET` on the row expands it).
 
 **Semantics** (mirror dsh web): a leading `/name` where `name` is lowercase
 `[a-z][a-z0-9_-]*` followed by whitespace or end of line is a command line —

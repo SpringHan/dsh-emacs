@@ -4,10 +4,6 @@
 
 (require 'dsh-test-support)
 
-(defvar vertico-mode)
-(defvar vertico--index)
-(defvar vertico--candidates)
-
 ;; Protocol layer: the `inbox' projection value → queue item structs (field
 ;; names appear only in the constructor).  A `next-turn' entry is `queued'; a
 ;; `next-step' entry with a `user' source is `steering', any other one
@@ -83,6 +79,34 @@
     (should (equal 40 (length (dsh-emacs-queue-preview
                                (make-string 100 ?x)))))
     (should (string-suffix-p "..." (dsh-emacs-queue-preview (make-string 100 ?x))))))
+
+;; Menu labels must stay unique even when an item's literal text already
+;; looks like a generated suffix: "same", "same", "same [2]" used to
+;; produce two "[Q] same [2]" labels, so a label lookup could act on the
+;; wrong host item.
+(ert-deftest dsh-emacs-test-queue-menu-labels-stay-unique-on-suffix-collision ()
+  :tags '(dsh-unit)
+  (let* ((items (list (dsh-emacs-test--queue-item "id-1" "queued" "same")
+                      (dsh-emacs-test--queue-item "id-2" "queued" "same")
+                      (dsh-emacs-test--queue-item "id-3" "queued" "same [2]")))
+         (table (dsh-emacs-ui-menu-entries items #'dsh-emacs-queue--label))
+         (labels (mapcar #'car table)))
+    (ert-info ((format "%s" "menu-labels-are-unique"))
+      (should (= (length labels)
+                 (length (delete-dups (copy-sequence labels))))))
+    (ert-info ((format "%s" "menu-labels-keep-their-own-item"))
+      (should (equal '("id-1" "id-2" "id-3")
+                     (mapcar (lambda (entry)
+                               (dsh-protocol-queue-item-id (cdr entry)))
+                             table))))
+    (ert-info ((format "%s" "menu-label-lookup-hits-the-right-item"))
+      (should (equal "id-3"
+                     (dsh-protocol-queue-item-id
+                      (cdr (assoc (nth 2 labels) table))))))
+    (ert-info ((format "%s" "menu-labels-keep-the-queue-prefix"))
+      (should (cl-every (lambda (label)
+                          (string-prefix-p "[Q] same" label))
+                        labels)))))
 
 ;; diff: consume (disappear), newly queued, newly steering, promote
 (ert-deftest dsh-emacs-test-queue-queue-diff-events-consume-queue-steer ()
@@ -564,8 +588,8 @@
 ;; by `dsh-emacs-events--host-item' via session-id to that session's chat
 ;; buffer's dsh-emacs-queue-apply --- the mirror and the [next] preview row
 ;; update immediately; an inbox cell for another session (no open chat
-;; buffer) is dropped instead of landing in whatever buffer happens to be
-;; current.
+;; buffer) is retained on the core connection without painting the current
+;; buffer.
 (ert-deftest dsh-emacs-test-queue-queue-frame-dispatch-routes-to-chat ()
   :tags '(dsh-unit)
   (let* ((old-chats dsh-emacs--chat-buffers)
@@ -606,7 +630,7 @@
                 (should (equal "dispatched"
                                (dsh-protocol-queue-item-text (car dsh-emacs--queue-items))))
                 (should (dsh-test-composer-next-row))))
-            ;; Another session's inbox cell (no open chat buffer) → dropped:
+            ;; Another session's inbox cell must not paint an unrelated chat:
             ;; this mirror and preview row stay as they were, and the current
             ;; buffer does not silently adopt the foreign queue.
             (with-current-buffer neutral
@@ -633,6 +657,169 @@
       (when (buffer-live-p chat) (kill-buffer chat))
       (when (buffer-live-p neutral) (kill-buffer neutral))
       (when (process-live-p proc) (delete-process proc)))))
+
+(ert-deftest dsh-emacs-test-queue-reopen-seeds-current-control-inbox ()
+  :tags '(dsh-unit)
+  (dolist (closed-update '(unchanged replaced cleared local-edit new-connection))
+    (ert-info ((format "Closed chat update: %s" closed-update))
+      (let* ((dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+             (dsh-emacs--sessions nil)
+             (dsh-emacs--current-session nil)
+             (dsh-emacs--current-buffer nil)
+             (dsh-emacs--sessions-buffer
+              (generate-new-buffer " *queue-owner-list*"))
+             (dsh-emacs-events--host-process
+              (make-pipe-process :name "queue-owner-core" :noquery t))
+             (processes (list dsh-emacs-events--host-process))
+             (stream-buffers nil)
+             (announcements nil)
+             chat)
+        (save-window-excursion
+          (unwind-protect
+              (cl-letf (((symbol-function 'dsh-emacs-server-ensure) #'ignore)
+                        ((symbol-function 'dsh-emacs--rpc-async) #'ignore)
+                        ((symbol-function 'dsh-emacs--link-session-preset) #'ignore)
+                        ((symbol-function 'dsh-emacs-command-catalog-prefetch) #'ignore)
+                        ((symbol-function 'dsh-emacs-skill-prefetch) #'ignore)
+                        ((symbol-function 'dsh-emacs-reference-prefetch) #'ignore)
+                        ((symbol-function 'dsh-emacs-queue--announce)
+                         (lambda (events) (push events announcements)))
+                        ((symbol-function 'open-network-stream)
+                         (lambda (name buffer &rest _args)
+                           (push buffer stream-buffers)
+                           (let ((process (make-pipe-process
+                                           :name name :buffer buffer
+                                           :noquery t)))
+                             (push process processes)
+                             process))))
+                (dsh-emacs-open-session "queue-reopen")
+                (setq chat dsh-emacs--current-buffer)
+                (dsh-emacs-events--host-control-baseline
+                 dsh-emacs-events--host-process
+                 `((projections
+                    . ((queue-reopen
+                        . ((values
+                            . ((inbox
+                                . ((next-turn
+                                    . ,(vector
+                                        (dsh-emacs-test--inbox-message
+                                         "original" "Pending original")))))))))))))
+                (with-current-buffer chat
+                  (should (equal (mapcar #'dsh-protocol-queue-item-id
+                                         (dsh-emacs-queue-items))
+                                 '("original")))
+                  (when (eq closed-update 'local-edit)
+                    ;; Optimistic chat edits must not mutate the retained
+                    ;; server snapshot before its confirming frame arrives.
+                    (setf (dsh-protocol-queue-item-text
+                           (car (dsh-emacs-queue-items))) "Local edit")))
+                (kill-buffer chat)
+                (should (process-live-p dsh-emacs-events--host-process))
+                (pcase closed-update
+                  ((or 'replaced 'cleared)
+                   (dsh-emacs-events--host-apply-projection
+                    dsh-emacs-events--host-process
+                    `((sessionId . "queue-reopen") (key . "inbox")
+                      (value . ((next-turn
+                                 . ,(if (eq closed-update 'cleared) []
+                                      (vector (dsh-emacs-test--inbox-message
+                                               "replacement" "Pending replacement")))))))))
+                  ('new-connection
+                   (setq dsh-emacs-events--host-process
+                         (make-pipe-process :name "queue-new-core" :noquery t))
+                   (push dsh-emacs-events--host-process processes)))
+                (setq announcements nil)
+                (dsh-emacs-open-session "queue-reopen")
+                (setq chat dsh-emacs--current-buffer)
+                (with-current-buffer chat
+                  (let ((expected (pcase closed-update
+                                    ((or 'unchanged 'local-edit) '("original"))
+                                    ('replaced '("replacement")))))
+                    (should (equal (mapcar #'dsh-protocol-queue-item-id
+                                           (dsh-emacs-queue-items))
+                                   expected))
+                    ;; Yield to the real zero-delay paint timer.  Calling
+                    ;; refresh here would hide broken repaint scheduling.
+                    (sleep-for 0.01)
+                    (should-not dsh-emacs-queue--paint-timer)
+                    (should (eq (not (null (dsh-test-composer-next-row)))
+                                (not (null expected))))
+                  (should
+                   (equal (mapcar #'dsh-protocol-queue-item-text
+                                  (dsh-emacs-queue-items))
+                          (pcase closed-update
+                            ((or 'unchanged 'local-edit) '("Pending original"))
+                            ('replaced '("Pending replacement")))))))
+                (should-not announcements))
+            (when (buffer-live-p chat) (kill-buffer chat))
+            (when (buffer-live-p dsh-emacs--sessions-buffer)
+              (kill-buffer dsh-emacs--sessions-buffer))
+            (dolist (process processes)
+              (when (process-live-p process) (delete-process process)))
+            (dolist (buffer stream-buffers)
+              (when (buffer-live-p buffer) (kill-buffer buffer)))))))))
+
+(ert-deftest dsh-emacs-test-queue-follow-reconnect-preserves-local-delete ()
+  :tags '(dsh-unit)
+  (let* ((core (make-pipe-process :name "queue-reconnect-core" :noquery t))
+         (dsh-emacs-events--host-process core)
+         (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+         (dsh-emacs--sessions nil)
+         stream-buffer announcements)
+    (unwind-protect
+        (with-temp-buffer
+          (dsh-emacs-mode)
+          (setq-local dsh-emacs--buffer-session "queue-reconnect")
+          (puthash "queue-reconnect" (current-buffer) dsh-emacs--chat-buffers)
+          (dsh-emacs-events--host-apply-projection
+           core `((sessionId . "queue-reconnect") (key . "inbox")
+                  (value . ((next-turn
+                             . ,(vector (dsh-emacs-test--inbox-message
+                                         "deleted" "Remove this")))))))
+          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                     (lambda (_method _args callback) (funcall callback t nil)))
+                    ((symbol-function 'dsh-emacs-queue--announce)
+                     (lambda (events) (push events announcements)))
+                    ((symbol-function 'open-network-stream)
+                     (lambda (name buffer &rest _args)
+                       (setq stream-buffer buffer)
+                       (make-pipe-process :name name :buffer buffer :noquery t))))
+            (dsh-emacs-queue--delete (car (dsh-emacs-queue-items)))
+            (should-not (dsh-emacs-queue-items))
+            ;; The delete RPC completed, but its control projection has not.
+            ;; Reconnecting only session/follow must not replay the old cell.
+            (dsh-emacs-events-connect (current-buffer))
+            (should-not (dsh-emacs-queue-items))
+            (should-not (dsh-test-composer-next-row))
+            (should (equal dsh-emacs--queue-deleted '("deleted")))
+            (should (eq dsh-emacs--queue-process core))
+            (should-not announcements)))
+      (when (process-live-p core) (delete-process core))
+      (when (buffer-live-p stream-buffer) (kill-buffer stream-buffer)))))
+
+(ert-deftest dsh-emacs-test-queue-session-removal-releases-cached-inbox ()
+  :tags '(dsh-unit)
+  (let* ((core (make-pipe-process :name "queue-removal-core" :noquery t))
+         (dsh-emacs-events--host-process core)
+         (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+         (dsh-emacs--sessions nil))
+    (unwind-protect
+        (progn
+          (dolist (session '("removed" "kept"))
+            (dsh-emacs-events--host-apply-projection
+             core `((sessionId . ,session) (key . "inbox")
+                    (value . ((next-turn
+                               . ,(vector (dsh-emacs-test--inbox-message
+                                           session session))))))))
+          (let ((inboxes (process-get core 'dsh-emacs-inboxes)))
+            (should (= (hash-table-count inboxes) 2))
+            (dsh-emacs-events--host-session-removed "removed")
+            (should (eq (gethash "removed" inboxes 'missing) 'missing))
+            (should (equal (mapcar #'dsh-protocol-queue-item-id
+                                   (gethash "kept" inboxes))
+                           '("kept")))
+            (should (= (hash-table-count inboxes) 1))))
+      (when (process-live-p core) (delete-process core)))))
 
 ;; JSON level: a real `/api/remote.mux' `item' frame carrying the `inbox'
 ;; projection cell (the exact 0.1.7 wire form, `next-turn'/'next-step' as
@@ -719,7 +906,8 @@
 (ert-deftest dsh-emacs-test-queue-composer-next-icon-is-chrome ()
   :tags '(dsh-unit)
   (let ((item (dsh-emacs-test--queue-item "a" "queued" "Alpha")))
-    (cl-letf (((symbol-function 'image-type-available-p) (lambda (_type) t))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (_type) t))
               ((symbol-function 'create-image)
                (lambda (_data _type _data-p &rest props) (cons 'image props))))
       (let* ((row (dsh-emacs-composer--render-next-row item))
@@ -751,7 +939,8 @@
         (edited nil)
         (deleted nil)
         (answer "Alpha fixed"))
-    (cl-letf (((symbol-function 'image-type-available-p) (lambda (_type) t))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (_type) t))
               ((symbol-function 'create-image)
                (lambda (_data _type _data-p &rest props) (cons 'image props)))
               ((symbol-function 'read-string) (lambda (&rest _args) answer))
@@ -861,8 +1050,9 @@
                  (lambda (method args callback)
                    (push (list method args) calls)
                    (funcall callback t nil)))
-                ((symbol-function 'dsh-emacs--submit-prompt)
-                 (lambda (&rest args) (push args submitted))))
+                ((symbol-function 'dsh-emacs--submit-plain)
+                 (lambda (message &rest args)
+                   (push (cons message args) submitted))))
         (setq dsh-emacs--queue-items (list item))
         (condition-case nil
             (call-interactively
@@ -889,12 +1079,104 @@
               item (dsh-emacs-test--queue-item "text-q" "queued" "Plain")
               dsh-emacs--queue-items (list item))
         (dsh-emacs-queue--send-now item)
-        (ert-info ((format "%s" "inline-idle-send-still-resubmits-text"))
-          (should (equal submitted '(("Plain"))))
+        (ert-info ((format "%s" "inline-idle-send-submits-literal-text"))
+          (should (equal submitted '(("Plain" :input-consumed t))))
           (should (equal calls
                          '(("session/updateQueue"
                             ((request (sessionId . "inline-send") (itemId . "text-q")
                                       (action (kind . "remove")))))))))))))
+
+;; A queued item is a literal message: sending it now must not re-enter the
+;; composer's input parsing.  A server-originated `!' line must stay text (the
+;; client would otherwise run it locally), a queued `/name' line must not run
+;; as a command, and none of them may consume the unrelated draft the user is
+;; editing — the queue text never passes through the input area.
+(ert-deftest dsh-emacs-test-queue-idle-send-now-bypasses-input-parsing ()
+  :tags '(dsh-unit)
+  (dolist (queued '("!echo pwned" "/compact" "plain queued text"))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (setq-local dsh-emacs--buffer-session "send-now")
+      (dsh-emacs--replace-input "draft in progress")
+      (let ((item (dsh-emacs-test--queue-item "q1" "queued" queued))
+            (calls nil) (submitted nil) (shell nil) (commands nil))
+        (cl-letf (((symbol-function 'dsh-emacs--busy-p) (lambda () nil))
+                  ((symbol-function 'dsh-emacs--rpc-async)
+                   (lambda (method args callback)
+                     (push (list method args) calls)
+                     (funcall callback t nil)))
+                  ((symbol-function 'dsh-emacs--submit-plain)
+                   (lambda (message &rest args)
+                     (push (cons message args) submitted)
+                     ;; Mirror the real path's input consumption: a submit
+                     ;; without :input-consumed wipes the draft, which is
+                     ;; exactly the regression this test pins down.
+                     (unless (plist-get args :input-consumed)
+                       (dsh-emacs--clear-input))))
+                  ((symbol-function 'dsh-emacs-shell-submit)
+                   (lambda (&rest args) (push args shell)))
+                  ((symbol-function 'dsh-emacs-command-execute)
+                   (lambda (&rest args) (push args commands)))
+                  ((symbol-function 'dsh-emacs--push-input-history) #'ignore)
+                  ((symbol-function 'dsh-emacs-render-command-optimistic)
+                   #'ignore))
+          (setq dsh-emacs--queue-items (list item))
+          (dsh-emacs-queue--send-now item)
+          (ert-info ((concat "idle-send-now-literal-" queued))
+            (should (null shell))
+            (should (null commands))
+            (should (equal submitted (list (cons queued '(:input-consumed t)))))
+            (should (equal "draft in progress" (dsh-emacs--get-input)))
+            (should (equal '("session/updateQueue")
+                           (mapcar #'car calls)))))))))
+
+;; The real submit path must leave the composer draft alone: send-now passes
+;; :input-consumed t because the queue text never passed through the input area.
+(ert-deftest dsh-emacs-test-queue-idle-send-now-keeps-the-current-draft ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (setq-local dsh-emacs--buffer-session "send-now-real"
+                dsh-emacs--event-ready t)
+    (dsh-emacs--replace-input "draft in progress")
+    (let ((item (dsh-emacs-test--queue-item "q1" "queued" "queued work"))
+          (prompts nil))
+      (cl-letf (((symbol-function 'dsh-emacs--busy-p) (lambda () nil))
+                ((symbol-function 'dsh-emacs--rpc-async)
+                 (lambda (method args callback)
+                   (when (equal method "session/prompt")
+                     (push args prompts))
+                   (funcall callback t nil)))
+                ((symbol-function 'dsh-emacs--render-user-message-optimistic)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'dsh-emacs--push-input-history) #'ignore)
+                ((symbol-function 'dsh-emacs--ml-busy-set) #'ignore)
+                ((symbol-function 'dsh-emacs-events--watchdog-start) #'ignore)
+                ((symbol-function 'dsh-emacs-render--follow-stream) #'ignore))
+        (setq dsh-emacs--queue-items (list item))
+        (dsh-emacs-queue--send-now item)
+        (ert-info ((concat "idle-send-now-keeps-draft"))
+          (should (equal "draft in progress" (dsh-emacs--get-input)))
+          (should (= 1 (length prompts))))))))
+
+;; Child queues are read-only: the removal RPC must not run before the
+;; capability check, or the item would leave the host queue with nothing sent.
+(ert-deftest dsh-emacs-test-queue-send-now-rejects-subagent-before-removal ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (setq-local dsh-emacs--buffer-session "child"
+                dsh-emacs--buffer-subagent 'dummy)
+    (let ((item (dsh-emacs-test--queue-item "q1" "queued" "text"))
+          (calls nil))
+      (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                 (lambda (&rest args) (push args calls))))
+        (setq dsh-emacs--queue-items (list item))
+        (should-error (dsh-emacs-queue--send-now item) :type 'user-error)
+        (ert-info ((concat "send-now-rejects-subagent-before-removal"))
+          (should (null calls))
+          (should (equal (list item) dsh-emacs--queue-items))
+          (should (null dsh-emacs--queue-deleted)))))))
 
 ;; A projection replaces structs even when only placement changes.  The row's
 ;; arrow must run against the new placement in both directions.
@@ -1010,7 +1292,8 @@
                              (and (string-search "Alpha" plain)
                                   ;; SVG available: the icon preview line starts with icon(space);
                                   ;; otherwise fall back to the text form
-                                  (if (image-type-available-p 'svg)
+                                  (if (and (display-graphic-p)
+                                           (image-type-available-p 'svg))
                                       (string-prefix-p " " plain)
                                     (string-search "≡" plain)))))))
             ;; Burst 2: remove frame (mirror cleared immediately, preview line not
@@ -1496,151 +1779,213 @@
             (should completed)))
       (when (buffer-live-p buf) (kill-buffer buf)))))
 
-;; Queue menu: menu keys act on entry resolution (vertico highlight > typed
-;; exact/prefix > queue-head fallback)
-(ert-deftest dsh-emacs-test-queue-queue-menu-item-resolves-first ()
+;; Queue menu: candidate order is declared through completion metadata, the
+;; native protocol every frontend honors, and the declared order is the queue's
+;; own order (reversing the queue must reverse the candidates).
+(ert-deftest dsh-emacs-test-queue-queue-menu-keeps-order-by-metadata ()
   :tags '(dsh-unit)
-  (let* ((a (dsh-emacs-test--queue-item "a" "queued" "fix the bug"))
-         (b (dsh-emacs-test--queue-item "b" "steering" "steered now"))
-         (table (list (cons "[Q] fix the bug" a)
-                      (cons "[S] steered now" b)))
-         (dsh-emacs--queue-pick-table table))
-    (cl-letf (((symbol-function 'minibuffer-contents)
-               (lambda () "fix")))
-      (ert-info ((format "%s" "queue-menu-item-resolves-first"))
-        (should (equal a (dsh-emacs-queue--menu-item)))))
-    (cl-letf (((symbol-function 'minibuffer-contents)
-               (lambda () "[S] steered now")))
-      (ert-info ((format "%s" "queue-menu-item-resolves-typed"))
-        (should (equal b (dsh-emacs-queue--menu-item)))))
-    (cl-letf (((symbol-function 'minibuffer-contents)
-               (lambda () "")))
-      (ert-info ((format "%s" "queue-menu-item-resolves-first-fallback"))
-        (should (equal a (dsh-emacs-queue--menu-item)))))))
-
-;; Queue menu: vertico highlight path — reads vertico--index/vertico--candidates
-;; directly (the old accessor `vertico--current' no longer exists, and a string
-;; assoc fails and falls back to the queue head, so the old implementation is
-;; bound to fail). equal ignores text properties, so faces on candidates do not
-;; affect matching
-(ert-deftest dsh-emacs-test-queue-queue-menu-item-vertico-highlight-wins ()
-  :tags '(dsh-unit)
-  (with-temp-buffer
-    (let* ((vertico-mode t)
-           (vertico--index 1)
-           (vertico--candidates
-            (list (propertize "[Q] fix the bug" 'face 'completions-common-part)
-                  (propertize "[S] steered now" 'face 'vertico-current)))
-           (a (dsh-emacs-test--queue-item "a" "queued" "fix the bug"))
-           (b (dsh-emacs-test--queue-item "b" "steering" "steered now"))
-           (dsh-emacs--queue-pick-table
-            (list (cons "[Q] fix the bug" a) (cons "[S] steered now" b))))
-      (cl-letf (((symbol-function 'minibuffer-contents) (lambda () "")))
-        (ert-info ("queue-menu-item-vertico-highlight-wins")
-          (should (equal b (dsh-emacs-queue--menu-item)))))
-      (setq vertico--index 0)
-      (ert-info ("queue-menu-item-vertico-index-0")
-        (should (equal a (dsh-emacs-queue--menu-item)))))))
-
-;; Queue menu command: actions are deferred via run-at-time until after the
-;; minibuffer closes, then run in the chat buffer that opened the menu. In the
-;; real environment exit-minibuffer is (throw 'exit nil), so code after exit in
-;; the command never runs — actions must be scheduled as a timer before exit.
-;; The test simulates the real throw (catch 'exit wraps the command), asserting
-;; the RPC is not executed inline and can only fire via the deferred timer.
-(ert-deftest dsh-emacs-test-queue-queue-menu-action-not-inline-after-exit ()
-  :tags '(dsh-unit)
-  (let ((calls nil)
-        (deferred nil)
-        (chat (generate-new-buffer " *t-queue-chat*"))
-        (table (list (cons "[Q] first"
-                           (dsh-emacs-test--queue-item "m1" "queued" "first"))
-                     (cons "[Q] second"
-                           (dsh-emacs-test--queue-item "m2" "queued" "second")))))
+  (let ((buf (get-buffer-create " *t-queue-order*"))
+        (sort-fn 'unset)
+        (labels nil))
     (unwind-protect
-        (save-window-excursion
-          (switch-to-buffer chat)
-          (setq-local dsh-emacs--buffer-session "sess-q")
-          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
-                     (lambda (method params _cb)
-                       (let* ((req (cdr (assq 'request params)))
-                              (action (cdr (assq 'action req))))
-                         (push (list method
-                                     (cdr (assq 'itemId req))
-                                     (cdr (assq 'kind action)))
-                               calls))))
-                    ((symbol-function 'minibuffer-contents)
-                     (lambda () ""))
-                    ((symbol-function 'run-at-time)
-                     (lambda (_delay _repeat fn) (push fn deferred)))
-                    ((symbol-function 'minibuffer-selected-window)
-                     (lambda () (selected-window))))
-            (let ((dsh-emacs--queue-pick-table table))
-              (catch 'exit
-                (dsh-emacs-queue--menu-delete)))
-            ;; exit already threw: the rest of the command is skipped, RPC not run inline
-            (ert-info ((format "%s" "queue-menu-action-not-inline-after-exit"))
-              (should (null calls)))
-            ;; The action can only fire via the timer registered before exit
-            (dolist (fn (nreverse deferred)) (funcall fn))
-            (ert-info ((format "%s" "queue-menu-delete-runs-in-chat-buffer"))
-              (should (equal '("session/updateQueue" "m1" "remove")
-                             (car (nreverse calls)))))))
-      (when (buffer-live-p chat) (kill-buffer chat)))))
-
-;; x key deletes the whole queue: likewise register the timer first, then exit,
-;; and RPC each entry one by one after confirmation
-(ert-deftest dsh-emacs-test-queue-queue-delete-all-schedules-before-exit ()
-  :tags '(dsh-unit)
-  (let ((calls nil)
-        (deferred nil)
-        (chat (generate-new-buffer " *t-queue-chat*"))
-        (table (list (cons "[Q] first"
-                           (dsh-emacs-test--queue-item "x1" "queued" "first"))
-                     (cons "[Q] second"
-                           (dsh-emacs-test--queue-item "x2" "queued" "second")))))
-    (unwind-protect
-        (save-window-excursion
-          (switch-to-buffer chat)
-          (setq-local dsh-emacs--buffer-session "sess-q")
-          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
-                     (lambda (method params _cb)
-                       (push (cdr (assq 'itemId
-                                        (cdr (assq 'request params))))
-                             calls)))
-                    ((symbol-function 'y-or-n-p)
-                     (lambda (_prompt) t))
-                    ((symbol-function 'run-at-time)
-                     (lambda (_delay _repeat fn) (push fn deferred)))
-                    ((symbol-function 'minibuffer-selected-window)
-                     (lambda () (selected-window))))
-            (let ((dsh-emacs--queue-pick-table table))
-              (catch 'exit
-                (dsh-emacs-queue--menu-delete-all)))
-            (ert-info ((format "%s" "queue-delete-all-schedules-before-exit"))
-              (should (null calls)))
-            (dolist (fn (nreverse deferred)) (funcall fn))
-            (ert-info ((format "%s" "queue-delete-all-confirms-and-deletes-both"))
-              (should (equal '("x1" "x2")
-                             (sort (copy-sequence calls) #'string<))))))
-      (when (buffer-live-p chat) (kill-buffer chat)))))
-
-;; Queue menu key installation: question-isomorphic use-local-map (copy the
-;; current local map + the single key)
-(ert-deftest dsh-emacs-test-queue-queue-menu-keys-bound-via-local-map ()
-  :tags '(dsh-unit)
-  (let ((buf (get-buffer-create " *t-queue-keymap*")))
-    (unwind-protect
-        (with-current-buffer buf
-          (use-local-map minibuffer-local-completion-map)
-          (dsh-emacs-queue--chooser-setup-hook)
-          (ert-info ((format "%s" "queue-menu-keys-bound-via-local-map"))
-            (should (eq (key-binding (kbd "e")) #'dsh-emacs-queue--menu-edit))
-            (should (eq (key-binding (kbd "s")) #'dsh-emacs-queue--menu-steer))
-            (should (eq (key-binding (kbd "d")) #'dsh-emacs-queue--menu-delete))
-            (should (eq (key-binding (kbd "x")) #'dsh-emacs-queue--menu-delete-all))
-            (should (eq (key-binding (kbd "RET")) #'dsh-emacs-queue--menu-send))))
+        (progn
+          (with-current-buffer buf
+            (dsh-emacs-mode)
+            (setq-local dsh-emacs--buffer-session "sess-q")
+            (setq dsh-emacs--queue-items
+                  (list (dsh-emacs-test--queue-item "i1" "queued" "one")
+                        (dsh-emacs-test--queue-item "i2" "steering" "two"))))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (_prompt collection &rest _)
+                       (setq sort-fn
+                             (completion-metadata-get
+                              (completion-metadata "" collection nil)
+                              'display-sort-function)
+                             labels (all-completions "" collection nil))
+                       (signal 'quit nil))))
+            (with-current-buffer buf
+              (condition-case nil (dsh-emacs-list-queue) (quit nil))))
+          (ert-info ("queue-menu-keeps-order-by-metadata")
+            (should (eq sort-fn #'identity)))
+          (ert-info ("queue-menu-candidates-follow-queue-order")
+            (should (equal labels '("[Q] one" "[S] two")))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+;; Each action key runs its own verb on the label returned by normal
+;; completion; RET is the default send.  The verbs are stubbed because delete
+;; and idle send-now both emit one remove RPC, so the RPC alone cannot tell
+;; them apart.
+(ert-deftest dsh-emacs-test-queue-queue-menu-actions-run-their-own-verb ()
+  :tags '(dsh-unit)
+  (dolist (case '(("RET" . send-now)
+                  ("C-c s" . send-now)
+                  ("C-c e" . edit)
+                  ("C-c d" . delete)))
+    (ert-info ((format "%s" (format "queue-menu-%s-runs-%s"
+                                    (car case) (cdr case))))
+      (let ((chat (generate-new-buffer " *t-queue-action*"))
+            (ran nil))
+        (unwind-protect
+            (with-current-buffer chat
+              (setq-local dsh-emacs--buffer-session "sess-q")
+              (setq dsh-emacs--queue-items
+                    (list (dsh-emacs-test--queue-item "alpha-id" "queued" "alpha")
+                          (dsh-emacs-test--queue-item "delta-id" "queued" "delta")))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (&rest _)
+                           (cl-letf (((symbol-function 'this-command-keys-vector)
+                                      (lambda () (kbd (car case)))))
+                             (dsh-emacs-ui--menu-record-action))
+                           "[Q] delta"))
+                        ((symbol-function 'dsh-emacs-queue--send-now)
+                         (lambda (item)
+                           (push (cons 'send-now
+                                       (dsh-protocol-queue-item-id item))
+                                 ran)))
+                        ((symbol-function 'dsh-emacs-queue--delete)
+                         (lambda (item)
+                           (push (cons 'delete
+                                       (dsh-protocol-queue-item-id item))
+                                 ran)))
+                        ((symbol-function 'dsh-emacs-queue--edit-item)
+                         (lambda (item)
+                           (push (cons 'edit
+                                       (dsh-protocol-queue-item-id item))
+                                 ran))))
+                (dsh-emacs-list-queue))
+              (should (equal ran (list (cons (cdr case) "delta-id")))))
+          (when (buffer-live-p chat) (kill-buffer chat)))))))
+
+;; The manager mounts its keys on the frontend's own RET command (so its
+;; candidate preparation still runs); delete-all is a global action and plain
+;; letters stay input.
+(ert-deftest dsh-emacs-test-queue-queue-menu-mounts-keys-on-native-accept ()
+  :tags '(dsh-unit)
+  (let ((chat (generate-new-buffer " *t-queue-keys*"))
+        (installed nil))
+    (unwind-protect
+        (with-current-buffer chat
+          (setq-local dsh-emacs--buffer-session "sess-q")
+          (setq dsh-emacs--queue-items
+                (list (dsh-emacs-test--queue-item "i1" "queued" "one")))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _)
+                       (with-temp-buffer
+                         (let ((accept (lambda () (interactive) nil)))
+                           (local-set-key (kbd "RET") accept)
+                           (dsh-emacs-ui--menu-setup)
+                           (setq installed
+                                 (list (eq (key-binding (kbd "C-c s")) accept)
+                                       (eq (key-binding (kbd "C-c e")) accept)
+                                       (eq (key-binding (kbd "C-c d")) accept)
+                                       (eq (key-binding (kbd "C-c x"))
+                                           #'dsh-emacs-ui--menu-global-action)
+                                       (eq (key-binding (kbd "d"))
+                                           #'self-insert-command)))))
+                       (signal 'quit nil))))
+            (condition-case nil (dsh-emacs-list-queue) (quit nil)))
+          (should (equal installed '(t t t t t))))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+
+;; Delete-all needs no selected candidate and covers every non-context item.
+(ert-deftest dsh-emacs-test-queue-queue-menu-delete-all-needs-no-selection ()
+  :tags '(dsh-unit)
+  (let ((chat (generate-new-buffer " *t-queue-all*"))
+        (seen nil))
+    (unwind-protect
+        (with-current-buffer chat
+          (setq-local dsh-emacs--buffer-session "sess-q")
+          (setq dsh-emacs--queue-items
+                (list (dsh-emacs-test--queue-item "alpha-id" "queued" "alpha")
+                      (dsh-emacs-test--queue-item "ctx-id" "context" "hidden")
+                      (dsh-emacs-test--queue-item "steer-id" "steering" "steer")))
+          (cl-letf (((symbol-function 'completing-read)
+                     (lambda (&rest _)
+                       (cl-letf (((symbol-function 'this-command-keys-vector)
+                                  (lambda () (kbd "C-c x"))))
+                         (dsh-emacs-ui--menu-record-action))
+                       (dsh-emacs-ui--menu-global-action)))
+                    ((symbol-function 'dsh-emacs-queue--delete-all)
+                     (lambda (items)
+                       (setq seen (mapcar #'dsh-protocol-queue-item-id items)))))
+            (dsh-emacs-list-queue))
+          (should (equal seen '("alpha-id" "steer-id"))))
+      (when (buffer-live-p chat) (kill-buffer chat)))))
+
+;; The confirmation gates the whole deletion; a declined prompt deletes nothing.
+(ert-deftest dsh-emacs-test-queue-delete-all-confirms-before-deleting ()
+  :tags '(dsh-unit)
+  (let ((items (list (dsh-emacs-test--queue-item "i1" "queued" "one")
+                     (dsh-emacs-test--queue-item "i2" "steering" "two")))
+        (deleted nil)
+        (asked 0))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (_prompt) (cl-incf asked) nil))
+              ((symbol-function 'dsh-emacs-queue--delete)
+               (lambda (item)
+                 (push (dsh-protocol-queue-item-id item) deleted))))
+      (dsh-emacs-queue--delete-all items))
+    (ert-info ("delete-all-declined-deletes-nothing")
+      (should (= asked 1))
+      (should-not deleted))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_prompt) t))
+              ((symbol-function 'dsh-emacs-queue--delete)
+               (lambda (item)
+                 (push (dsh-protocol-queue-item-id item) deleted))))
+      (dsh-emacs-queue--delete-all items))
+    (ert-info ("delete-all-confirmed-deletes-every-item")
+      (should (equal (nreverse deleted) '("i1" "i2"))))))
+
+;; The edit RPC replaces an item's content with one text block, so the manager
+;; refuses a non-text item instead of silently dropping its attachment.
+(ert-deftest dsh-emacs-test-queue-edit-item-refuses-attachments ()
+  :tags '(dsh-unit)
+  (let ((item (dsh-emacs-test--queue-item "att-id" "queued" "picture" nil t))
+        (edited nil))
+    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "rewritten"))
+              ((symbol-function 'dsh-emacs-queue--edit)
+               (lambda (it text)
+                 (push (cons (dsh-protocol-queue-item-id it) text) edited))))
+      (ert-info ("queue-edit-item-rejects-attachment")
+        (should-error (dsh-emacs-queue--edit-item item) :type 'user-error)
+        (should-not edited)))))
+
+(ert-deftest dsh-emacs-test-queue-edit-item-applies-non-blank-text ()
+  :tags '(dsh-unit)
+  (let ((item (dsh-emacs-test--queue-item "text-id" "queued" "original"))
+        (edited nil))
+    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "rewritten"))
+              ((symbol-function 'dsh-emacs-queue--edit)
+               (lambda (it text)
+                 (setq edited (list (dsh-protocol-queue-item-id it) text)))))
+      (dsh-emacs-queue--edit-item item)
+      (ert-info ("queue-edit-item-applies-text")
+        (should (equal edited '("text-id" "rewritten")))))
+    (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "   "))
+              ((symbol-function 'dsh-emacs-queue--edit)
+               (lambda (_it _text) (ert-fail "Blank edit reached the RPC"))))
+      (ert-info ("queue-edit-item-ignores-blank-text")
+        (dsh-emacs-queue--edit-item item)))))
+
+;; An empty or context-only queue reports that instead of opening a list.
+(ert-deftest dsh-emacs-test-queue-queue-menu-rejects-empty-and-context-only ()
+  :tags '(dsh-unit)
+  (dolist (items (list nil
+                       (list (dsh-emacs-test--queue-item
+                              "ctx" "context" "hidden"))))
+    (let ((chat (generate-new-buffer " *t-queue-empty*")))
+      (unwind-protect
+          (with-current-buffer chat
+            (setq-local dsh-emacs--buffer-session "sess-q")
+            (setq dsh-emacs--queue-items items)
+            (cl-letf (((symbol-function 'completing-read)
+                       (lambda (&rest _)
+                         (ert-fail "Empty queue opened the menu"))))
+              (ert-info ((format "%s" (format "queue-menu-rejects-%d-items"
+                                              (length items))))
+                (should-error (dsh-emacs-list-queue) :type 'user-error))))
+        (when (buffer-live-p chat) (kill-buffer chat))))))
 
 (provide 'dsh-test-queue)
 ;;; dsh-test-queue.el ends here

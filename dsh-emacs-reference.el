@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "28.1"))
 
 ;;; Commentary:
@@ -66,9 +66,8 @@
 (require 'subr-x)
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-server)
+(require 'dsh-emacs-ui)
 
-(declare-function dsh-emacs--completing-read-ordered
-                  "dsh-emacs.el" (prompt collection &rest args))
 ;; Corfu's native auto path is the same integration seam installed by
 ;; `dsh-emacs-mode'; use it for async refreshes instead of generic CAPF
 ;; dispatch, which treats a sole non-exact candidate differently.
@@ -79,7 +78,7 @@
 (declare-function dsh-emacs-session--visible-p
                   "dsh-emacs-session.el" (session &optional current-session-id))
 
-;; dsh-emacs.el's input-area anchor (buffer-local), borrowed read-only here
+;; dsh-emacs-input.el's input-area anchor (buffer-local), read-only here
 (defvar dsh-emacs--input-marker)
 (defvar dsh-emacs--archived-sessions)
 ;; Optional corfu variables (corfu-auto-trigger is defined by corfu-auto.el).
@@ -585,10 +584,20 @@ first message restores candidates without a fetch."
   "Alist (ROW . MENTION) for every session cache entry, in cache order.
 ENTRIES defaults to the current cache.  ROW is the short completion row
 (`@label'; a repeated label gains a ` #n' suffix so every session stays
-reachable and the exit lookup stays unambiguous); MENTION is the
-canonical text the pick inserts.  File/directory entries are their own
-row and never appear here."
-  (let ((seen (make-hash-table :test 'equal)))
+reachable); MENTION is the canonical text the pick inserts.  Every
+final ROW is unique, both against the other session rows (a label that
+already reads like a suffixed row cannot steal a generated one) and
+against every file/directory row: an @label that spells a file path is
+suffixed, so picking the file can never resolve to the session.  That
+keeps the exit lookup unambiguous."
+  (let* ((entries (or entries dsh-emacs--reference-candidates))
+         (seen (make-hash-table :test 'equal))
+         (used (make-hash-table :test 'equal)))
+    ;; Reserve the file/directory rows first: cache order puts them before
+    ;; sessions, but reserve every one so a later session cannot alias one.
+    (dolist (entry entries)
+      (unless (eq (plist-get (cdr entry) :kind) 'session)
+        (puthash (car entry) t used)))
     (delq nil
           (mapcar
            (lambda (entry)
@@ -597,22 +606,24 @@ row and never appear here."
                       (label (or (plist-get props :label)
                                  (plist-get props :session-id)))
                       (base (concat "@" label))
-                      (n (1+ (gethash base seen 0))))
+                      (n (1+ (gethash base seen 0)))
+                      (row (if (= n 1) base (format "%s #%d" base n))))
+                 (while (gethash row used)
+                   (setq n (1+ n)
+                         row (format "%s #%d" base n)))
                  (puthash base n seen)
-                 (cons (if (= n 1)
-                           base
-                         (format "%s #%d" base n))
-                       (car entry)))))
-           (or entries dsh-emacs--reference-candidates)))))
+                 (puthash row t used)
+                 (cons row (car entry)))))
+           entries))))
 
 (defun dsh-emacs-reference--entry-for (text)
   "The cache entry (MENTION . PROPS) behind completion row TEXT.
-File/directory rows are their own mention; a session row (the short
-`@label' display) resolves through `dsh-emacs-reference--session-rows'
-to its canonical mention first."
-  (or (assoc text dsh-emacs--reference-candidates)
-      (let ((mention (cdr (assoc text (dsh-emacs-reference--session-rows)))))
-        (and mention (assoc mention dsh-emacs--reference-candidates)))))
+A session row (the short `@label' display) resolves first through
+`dsh-emacs-reference--session-rows' to its canonical mention; a
+file/directory row is its own mention."
+  (or (let ((mention (cdr (assoc text (dsh-emacs-reference--session-rows)))))
+        (and mention (assoc mention dsh-emacs--reference-candidates)))
+      (assoc text dsh-emacs--reference-candidates)))
 
 (defun dsh-emacs-reference--row-icon (path kind)
   "Type icon for a completion row of KIND, or nil when none can render.
@@ -716,7 +727,8 @@ drilling can continue.  Only accepted STATUS values `finished' and
 `sole' finalize a reference; an ambiguous `exact' remains editable."
   (let* ((entry (dsh-emacs-reference--entry-for cand))
          (props (cdr entry))
-         (mention (cdr (assoc cand rows)))
+         (mention (and (eq (plist-get props :kind) 'session)
+                       (cdr (assoc cand rows))))
          (start (- (point) (length cand))))
     (when (and (memq status '(finished sole))
                (>= start (point-min))
@@ -1097,7 +1109,7 @@ session span carrying the real SESSION-ID."
             (cwd (and sid (dsh-emacs--chat-cwd sid)))
             (abs (and cwd value (expand-file-name value cwd))))
        (if (and abs (file-exists-p abs))
-           (find-file abs)
+           (dsh-emacs-ui-navigate (point-marker) #'find-file abs)
          (user-error "Reference file not found locally: %s"
                      (or value "")))))))
 
@@ -1207,10 +1219,18 @@ character also returns it, so backspace there can delete the whole chip."
 
 (defun dsh-emacs-reference--chip-guard-before ()
   "Prevent a chip's canonical mention from being edited in the middle.
-If point rests on a chip character and THIS-COMMAND would edit, hop to the
-chip's end first so the edit lands after it and the wire text stays a valid
-mention.  Deleting at a chip boundary removes the whole chip (handled by
-`dsh-emacs-reference--chip-delete-guard').
+If point rests strictly inside a chip and THIS-COMMAND would edit, hop to
+the chip's end first so the edit lands after it and the wire text stays a
+valid mention.  Deleting at a chip boundary removes the whole chip (handled
+by `dsh-emacs-reference--chip-delete-guard').
+
+At the chip's LEADING edge, insertion commands (typing, quoted insert,
+yank) go BEFORE the chip and cannot split it, so they are left alone.
+Hopping there made the text before an `@' reference uneditable.  In
+OVERWRITE mode typing replaces the character at point instead, so the
+leading-edge exception is off there and the old hop to the chip's end is
+kept — otherwise `self-insert-command' would replace the chip's first
+character and silently destroy the reference.
 
 A forward `kill-line' (C-k) that starts on a chip is different: it kills to
 the end of the input, which normally covers the whole chip, so hopping to the
@@ -1221,7 +1241,14 @@ whole chip as one atomic unit (plus any trailing text) — never a fragment."
     (when (and (dsh-emacs-reference--editing-command-p this-command)
                (get-text-property pt 'dsh-emacs-reference-chip))
       (let ((chip (dsh-emacs-reference--chip-region pt)))
-        (when (and chip (< pt (cdr chip)))
+        (when (and chip (< pt (cdr chip))
+                   (or (< (car chip) pt)
+                       (not (and (memq this-command
+                                        '(self-insert-command quoted-insert
+                                          yank yank-pop))
+                                 (not (or (bound-and-true-p overwrite-mode)
+                                          (bound-and-true-p
+                                           binary-overwrite-mode)))))))
           (goto-char (if (eq this-command 'kill-line)
                          (car chip)
                        (cdr chip))))))))
@@ -1242,28 +1269,44 @@ calls."
       (delete-region (car region) (cdr region))
       t)))
 
+(defun dsh-emacs-reference--user-delete-command-p ()
+  "Non-nil when THIS-COMMAND is a user-level delete, or a direct call.
+A compound command can call `delete-char' internally for a single-character
+replacement — `quoted-insert' in overwrite mode does exactly that.  Promoting
+such an internal call to whole-chip deletion would swallow the entire
+reference instead of replacing one character of the text after it."
+  (or (null this-command)
+      (memq this-command
+            '(delete-char delete-forward-char
+              delete-backward-char backward-delete-char
+              backward-delete-char-untabify))))
+
 (defun dsh-emacs-reference--chip-delete-backward (orig &optional arg killflag)
-  "`delete-backward-char' advice: backspace at a chip deletes the whole chip."
-  (if (dsh-emacs-reference--delete-chip-at-boundary)
+  "`delete-backward-char' advice: backspace at a chip deletes the whole chip.
+Only for a user-level delete; an internal call from a compound command keeps
+its original one-character meaning."
+  (if (and (dsh-emacs-reference--user-delete-command-p)
+           (dsh-emacs-reference--delete-chip-at-boundary))
       nil
     (funcall orig arg killflag)))
 
 (defun dsh-emacs-reference--chip-delete-forward (orig &optional arg killflag)
-  "`delete-char' advice: forward-delete at a chip deletes the whole chip."
-  (if (dsh-emacs-reference--delete-chip-at-boundary)
+  "`delete-char' advice: forward-delete at a chip deletes the whole chip.
+Only for a user-level delete; `quoted-insert' in overwrite mode uses the
+original single-character delete."
+  (if (and (dsh-emacs-reference--user-delete-command-p)
+           (dsh-emacs-reference--delete-chip-at-boundary))
       nil
     (funcall orig arg killflag)))
-
-(defvar dsh-emacs-reference--chip-delete-guard-installed nil
-  "Non-nil once the global delete-command advice has been added once.")
 
 (defun dsh-emacs-reference--chip-guard-install ()
   "Install the composer chip editing guards (buffer-local, idempotent)."
   (add-hook 'pre-command-hook #'dsh-emacs-reference--chip-guard-before nil t)
-  (unless dsh-emacs-reference--chip-delete-guard-installed
-    (setq dsh-emacs-reference--chip-delete-guard-installed t)
-    (advice-add 'delete-backward-char :around #'dsh-emacs-reference--chip-delete-backward)
-    (advice-add 'delete-char :around #'dsh-emacs-reference--chip-delete-forward)))
+  (pcase-dolist (`(,command . ,guard)
+                '((delete-backward-char . dsh-emacs-reference--chip-delete-backward)
+                  (delete-char . dsh-emacs-reference--chip-delete-forward)))
+    (unless (advice-member-p guard command)
+      (advice-add command :around guard))))
 
 (defun dsh-emacs-reference--composer-file-chip (start end path)
   "Wrap a completed file mention START..END as a composer chip.
@@ -1303,16 +1346,43 @@ style from bleeding onto following typed text."
 (defun dsh-emacs-reference--display-pairs ()
   "Completion display pairs for the M-x menu: (DISPLAY . MENTION).
 DISPLAY is the web-style row (file path / directory with slash /
-session label); MENTION is the text inserted on pick."
-  (mapcar
-   (lambda (entry)
-     (cons
-      (pcase (plist-get (cdr entry) :kind)
-        ('session (plist-get (cdr entry) :label))
-        ('directory (concat (plist-get (cdr entry) :path) "/"))
-        (_ (plist-get (cdr entry) :path)))
-      (car entry)))
-   (dsh-emacs-reference--visible-candidates)))
+session label); MENTION is the text inserted on pick.  DISPLAY rows are
+unique: a session label gains a ` #n' suffix when it spells a file path
+or an earlier session row, so the picked DISPLAY maps back to exactly
+one MENTION."
+  (let* ((entries (dsh-emacs-reference--visible-candidates))
+         (used (make-hash-table :test 'equal))
+         (seen (make-hash-table :test 'equal))
+         (base-rows
+          (mapcar
+           (lambda (entry)
+             (let ((props (cdr entry)))
+               (pcase (plist-get props :kind)
+                 ('session nil)
+                 ('directory (concat (plist-get props :path) "/"))
+                 (_ (plist-get props :path)))))
+           entries)))
+    ;; Reserve every file/directory row before a session can claim a suffix,
+    ;; so a session label earlier in the cache cannot shadow a later file.
+    (dolist (row base-rows)
+      (when row (puthash row t used)))
+    (cl-loop for entry in entries
+             for base in base-rows
+             collect
+             (cons
+              (or base
+                  (let* ((props (cdr entry))
+                         (label (or (plist-get props :label)
+                                    (plist-get props :session-id)))
+                         (n (1+ (gethash label seen 0)))
+                         (row (if (= n 1) label (format "%s #%d" label n))))
+                    (while (gethash row used)
+                      (setq n (1+ n)
+                            row (format "%s #%d" label n)))
+                    (puthash label n seen)
+                    (puthash row t used)
+                    row))
+              (car entry)))))
 
 (defun dsh-emacs-reference--insert-at-point (mention)
   "Insert MENTION into the editable input area at point.
@@ -1368,11 +1438,11 @@ again once results arrive.  Requires a chat buffer with a session."
       (if (dsh-emacs-reference--require-cache session-id query)
           (progn
             (condition-case nil
-                (let* ((pairs (dsh-emacs-reference--display-pairs))
-                       (picked (dsh-emacs--completing-read-ordered
-                                "Reference: " pairs nil t)))
-                  (when picked
-                    (dsh-emacs-reference--insert-at-point picked)))
+                (let ((pairs (dsh-emacs-reference--display-pairs)))
+                  (when-let* ((picked (dsh-emacs-ui--completing-read-ordered
+                                       "Reference: " pairs nil t))
+                              (pair (assoc picked pairs)))
+                    (dsh-emacs-reference--insert-at-point (cdr pair))))
               (quit nil)))
         (message "Reference candidates are still loading…")))))
 

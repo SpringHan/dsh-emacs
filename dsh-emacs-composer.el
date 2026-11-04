@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -17,13 +17,13 @@
 ;;       ├── Next Message      -- optional pending-message preview
 ;;       ├── Goal Row          -- optional goal, phase and actions
 ;;       ├── Attachments       -- optional staged-attachment row
-;;       └── Input Area        -- editing/geometry owned by dsh-emacs.el
+;;       └── Input Area        -- editing/geometry owned by dsh-emacs-input.el
 ;;
 ;; Goal data comes from the goal projection; its actions carry a CAS ref.
 ;; Queue data stays in dsh-emacs-queue.el, which determines which pending
-;; message is visible and when burst updates repaint.  Staged attachments stay
-;; in dsh-emacs.el (the acquisition and submit paths own them).  Composer reads
-;; that mirror without copying it; a row's per-file remove cell only calls back
+;; message is visible and when burst updates repaint.  Staged attachments live
+;; in dsh-emacs-attachments.el; the coordinator owns send/rollback timing.
+;; Composer reads that list without copying it; a row's remove cell calls back
 ;; into `dsh-emacs--remove-attachment'.  All rows fold line breaks and fit the
 ;; narrowest viewing window.  No row is transcript or editable input, and none
 ;; is included when sending.
@@ -44,10 +44,11 @@
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-server)
 (require 'dsh-emacs-faces)
+(require 'dsh-emacs-attachments)
 
 ;; render.el calls back through this seam.  Declare it without requiring
-;; render here to avoid a cycle.  Input-marker geometry remains owned by
-;; dsh-emacs.el; this module only reads the shared variable.
+;; render here to avoid a cycle.  Input-marker geometry is owned by
+;; dsh-emacs-input.el; this module only reads the shared variable.
 (declare-function dsh-emacs-render--input-insert-point "dsh-emacs-render" ())
 (declare-function dsh-emacs-reference-fontify "dsh-emacs-reference"
                   (string &optional references))
@@ -55,8 +56,6 @@
 (declare-function dsh-emacs-queue--send-now "dsh-emacs-queue" (item))
 (declare-function dsh-emacs-queue--edit "dsh-emacs-queue" (item new-text))
 (declare-function dsh-emacs-queue--delete "dsh-emacs-queue" (item))
-(declare-function dsh-emacs-pending-attachments "dsh-emacs" ())
-(declare-function dsh-emacs--remove-attachment "dsh-emacs" (attachment))
 (defvar dsh-emacs--input-marker)
 (defvar dsh-emacs-queue--optimistic-submit)
 (defvar-local dsh-emacs--composer-goal-pending nil
@@ -150,9 +149,11 @@ Colored via `currentColor', mapped to the goal face's foreground by
 
 (defun dsh-emacs-composer--goal-icon ()
   "Return the goal SVG icon image string, or nil when SVG is unavailable.
-The result reserves two columns carrying the icon `display' property plus the
-composer goal face, so the row's chrome tag / read-only stay one run."
-  (when (image-type-available-p 'svg)
+Unavailable means no SVG image support or a non-graphical frame; callers then
+draw their text fallback.  The result reserves two columns carrying the icon
+`display' property plus the composer goal face, so the row's chrome tag /
+read-only stay one run."
+  (when (and (display-graphic-p) (image-type-available-p 'svg))
     (let ((fg (face-foreground 'dsh-emacs-composer-goal-face nil t)))
       (propertize "  "
                   'face 'dsh-emacs-composer-goal-face
@@ -238,9 +239,11 @@ composer goal face, so the row's chrome tag / read-only stay one run."
 
 (defun dsh-emacs-composer--action-image (svg &optional face)
   "Return an image display spec for action SVG, or nil.
-SVG is colored through `currentColor' mapped to FACE's foreground, defaulting
-to `dsh-emacs-composer-goal-action-face'."
-  (and (image-type-available-p 'svg)
+Nil means no SVG image support or a non-graphical frame; callers then show
+their text fallback.  SVG is colored through `currentColor' mapped to FACE's
+foreground, defaulting to `dsh-emacs-composer-goal-action-face'."
+  (and (display-graphic-p)
+       (image-type-available-p 'svg)
        (let* ((face (or face 'dsh-emacs-composer-goal-action-face))
               (color (or (face-foreground face nil t) "gray50")))
          (create-image svg 'svg t
@@ -342,10 +345,10 @@ highlight and HELP, so a read-only Composer row hosts real click targets."
   "Return (GLYPH . SVG) of the dsh web goal action KEY, or nil.
 KEY is pause / resume / edit / clear."
   (pcase key
-    ('pause (cons "⏸" dsh-emacs-composer--pause-svg))
+    ('pause (cons "||" dsh-emacs-composer--pause-svg))
     ('resume (cons "▶" dsh-emacs-composer--resume-svg))
     ('edit (cons "✎" dsh-emacs-composer--edit-svg))
-    ('clear (cons "🗑" dsh-emacs-composer--clear-svg))))
+    ('clear (cons "✕" dsh-emacs-composer--clear-svg))))
 
 (defun dsh-emacs-composer--goal-action-strip (goal)
   "Return (STRING . WIDTH-COLUMNS) of the clickable action cells for GOAL.
@@ -454,7 +457,7 @@ Graphical Emacs renders dsh web's queue glyph tinted from
 Row's dartboard takes; terminal Emacs falls back to that face's one-column
 `≡' plus a space, so both paths keep the row's column budget.  Callers add
 the separating space."
-  (if (image-type-available-p 'svg)
+  (if (and (display-graphic-p) (image-type-available-p 'svg))
       (propertize
        "  " 'face 'dsh-emacs-composer-next-face 'display
        (create-image dsh-emacs-composer--next-icon-svg 'svg t
@@ -485,7 +488,8 @@ name (`grey70') that is no CSS color.")
 KIND is `steer' (send the item now — dsh web's `IconSendOutlineRegular'),
 `edit' (rewrite its text; absent for a non-text item, whose content the edit
 RPC would flatten) or `delete'.  The cell carries the item itself, so RET or a
-click runs the same queue verb the `C-c C-q' manager binds to `s', `e' or `d'."
+click runs the same queue verb the `C-c C-q' manager binds to `C-c s',
+`C-c e' or `C-c d'."
   (pcase kind
     ('steer
      (dsh-emacs-composer--action-cell
@@ -505,7 +509,7 @@ click runs the same queue verb the `C-c C-q' manager binds to `s', `e' or `d'."
                  (dsh-emacs-queue--edit item text)))))))
     ('delete
      (dsh-emacs-composer--action-cell
-      "🗑" dsh-emacs-composer--clear-svg 'dsh-emacs-composer-next-action-face
+      "✕" dsh-emacs-composer--clear-svg 'dsh-emacs-composer-next-action-face
       "Delete queued message · C-c C-q d"
       (lambda () (interactive) (dsh-emacs-queue--delete item))))))
 
@@ -616,11 +620,13 @@ Clicking it drops only that entry (`dsh-emacs--remove-attachment');
          (map (make-sparse-keymap)))
     (define-key map (kbd "RET") remove)
     (define-key map [mouse-1] remove)
-    (propertize " ✕"
-                'face 'dsh-emacs-composer-attachment-face
-                'keymap map
-                'mouse-face 'highlight
-                'help-echo (format "Remove %s · C-c C-d discards all" name))))
+    (concat " "
+            (propertize "✕"
+                        'face 'dsh-emacs-composer-attachment-face
+                        'keymap map
+                        'mouse-face 'highlight
+                        'help-echo (format "Remove %s · C-c C-d discards all" name))
+            " ")))
 
 (defun dsh-emacs-composer--render-attachments-row (attachments)
   "Return the single-line staged-attachments row for ATTACHMENTS.
@@ -803,7 +809,8 @@ tombstone identity).  Failures surface via `message' and leave the row unchanged
                (setq dsh-emacs--composer-goal-pending nil)
                (dsh-emacs-composer-render))
              (if (null ok)
-                 (message "Failed to %s goal: %S" verb value)
+                 (message "Failed to %s goal: %s" verb
+                          (dsh-emacs-rpc-error-text value))
                ;; The projection stream is authoritative and can outrun the
                ;; HTTP response.  Apply the optimistic response only while
                ;; this exact request still owns the pending slot and its CAS

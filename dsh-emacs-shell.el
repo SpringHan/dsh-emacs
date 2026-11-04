@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -28,7 +28,7 @@
 ;; directory is the chat buffer's `default-directory' (the session workspace,
 ;; see `dsh-emacs--chat-buffer-sync'), matching what commands such as magit
 ;; expect.  Results render as the same tool row as slash command lines (bash
-;; icon + spinner + status coloring, see `dsh-emacs-render-shell-start' /
+;; icon + status coloring, see `dsh-emacs-render-shell-start' /
 ;; `dsh-emacs-render-shell-done' in dsh-emacs-render.el).
 ;;
 ;; Semantics: `!' must be followed by a non-empty command (`! ls' works too) —
@@ -52,10 +52,10 @@
 
 (require 'dsh-emacs-render)
 
-;; dsh-emacs.el holds the input-area state and history; like command/queue,
+;; dsh-emacs-input.el owns input state and history; like command/queue,
 ;; this module is called declaratively (dsh-emacs.el guarantees load order).
-(declare-function dsh-emacs--push-input-history "dsh-emacs" (text))
-(declare-function dsh-emacs--clear-input "dsh-emacs" ())
+(declare-function dsh-emacs--push-input-history "dsh-emacs-input" (text))
+(declare-function dsh-emacs--clear-input "dsh-emacs-input" ())
 
 (defgroup dsh-emacs-shell nil
   "Local `!command' shell commands."
@@ -173,7 +173,7 @@ The executable follows the Emacs variable, which may differ from the
 current SHELL environment variable.
 BUFFER defaults to the current buffer; the command runs with that
 buffer's `default-directory' (the session workspace).  A pending row
-with the bash icon and a running spinner is rendered immediately
+with the bash icon and the pending tint is rendered immediately
 (`dsh-emacs-render-shell-start'); when the process finishes the row is
 restyled with the merged stdout+stderr and the exit status
 (`dsh-emacs-render-shell-done').  With `dsh-emacs-shell-null-stdin' the

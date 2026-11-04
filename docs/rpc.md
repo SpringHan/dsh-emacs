@@ -186,13 +186,19 @@ implemented in the client; the two surfaces that had to move:
    `inbox` projection has existed unchanged since before 0.1.5 and is present in
    the 0.1.5 baseline too, so this source switch is forward-compatible rather
    than a version fork.
-2. **`agentPresets/list` display names.** `dsh-emacs--preset-display-name` used
-   to key the web-consistent labels (`Standard mode` …) on
-   `(equal "system" trust)`, and the row no longer carries `trust`. The mapping
-   now keys on the preset id alone — which is what the web's own
-   `presetDisplayText` does — and `dsh-emacs-protocol.el` dropped the roster's
-   removed `authorable` field (plus its already-stale `hasDocument` sibling,
-   which no server version ever sent).
+2. **`agentPresets/list` display names.** A roster row carries `name` only when
+   the preset declaration publishes one; the shipped presets publish none.
+   `dsh-emacs--preset-display-name` used to key client-side English labels
+   (`Standard mode` …) on the preset id, first via `(equal "system" trust)` and
+   then on the id alone. That map is removed: the new-session picker shows the
+   published `name`, falling back to the id (appending the id when two rows
+   would render identically), and ensures the server then fetches the roster
+   synchronously when it is not cached yet (a failed fetch reports an error
+   instead of creating with an unchosen preset). `dsh-emacs-protocol.el` likewise
+   dropped the roster's removed `authorable` field (plus its already-stale
+   `hasDocument` sibling, which no server version ever sent). The web itself
+   still localizes built-ins through its own dictionary
+   (`presetDisplayText`), keyed on the id because there is no `trust`.
 
 Everything else in the table is additive or unread by the client: the widened
 `session/list` row, the `turnWindow`/`application` options, the workspace pin
@@ -867,7 +873,10 @@ value    { sessionId, agentPreset? }
   (with the published sessionId); unknown workspace → `workspace/not-found`.
 - An unknown/assembly-failing `agentPreset` is rejected by the preset assembly
   layer (`agent-preset/not-found` / `agent-preset/invalid`, see §4.6); a subagent
-  identity → `session/agent-busy`.
+  identity → `session/agent-busy`. Emacs retries such a create once without
+  `agentPreset` (including a stale `dsh-emacs-default-preset`), so it continues
+  under the host default; the web applies the same recovery when restoring a
+  saved blank Session.
 
 #### session.selectModel
 ```
@@ -2328,10 +2337,13 @@ not enter the transcript; they instead feed the modeline's `step N` badge
 renders as a compact outcome card (initially `Incomplete reply`) rebuilt in order
 from the packed records of `data.stream`
 (`reasoning-chunks`/`tool-call-chunks`/`text-chunks`) (reasoning is subject to
-`dsh-emacs-show-reasoning`); if that attempt still has a live streaming body when
+`dsh-emacs-show-thinking`); if that attempt still has a live streaming body when
 it settles, the live body is taken over by the card rather than drawn twice;
 `session/end-seed` advances the event sequence anchor without rendering a row;
 the restore boundary is internal bookkeeping, not conversation content.
+`agent/inbox/spliced` paints no row: it replays the inbox queue/claim state
+so a non-human message an inbox claim admits renders as dsh web's collapsed
+turn-trigger row (postmortem/159).
 `deliverables/presented` renders after `turn/end` as
 a single `Deliverables · N files` line, collapsed by default (turnTail position;
 expanded, it lists one indented line per path, click to open, with no body
@@ -2729,7 +2741,7 @@ projection cell `{active, settled}`.
    value.
 
 **dsh-emacs** (postmortem/073): holds `attachWait` around the read, renders the
-expired result as `❓ Ask question · pending`, answers a continued call with
+expired result as `Ask question · pending`, answers a continued call with
 `M-x dsh-emacs-answer-question` (`C-c C-p`), and completes the original card from
 `settled`. Dormant against a 0.1.7 server (no `wait`, no cell).
 

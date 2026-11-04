@@ -58,6 +58,15 @@ without navigation or an xref entry. Full ids disambiguate duplicate labels.
 honoring Emacs display rules. No extra chat prefix or minibuffer action map
 is installed.
 
+When a child talks to the parent, the parent transcript attributes the turn
+with dsh web's collapsed trigger row — **Task message received** for a
+`send_message` relay and **Subtask status updated** for settlement — carrying
+the event clock; `RET` unfolds the recorded notice. The row remains visible
+above the turn's **Completed in …** summary whether the child was admitted to
+a new turn or steered into step 1 of an idle one, so a child-driven reply is
+never presented as unprompted. Mid-turn, canceled and requeued injections
+stay hidden.
+
 Run the command again **inside a child** to select its children. This avoids
 fetching an entire descendant tree and keeps the direct parent unambiguous.
 `M-,` returns to the actual originating buffer and position. The separate
@@ -95,7 +104,12 @@ of adding a separate spinner.  The pulse is a motion-line clip in the
 `dsh-subagents` slot (about 1.2s per cycle), so motion-line must be installed;
 without it the icon and count keep their static tint.  It stops when the last
 child settles or the connection drops; a stale running flag on a disconnected
-connection never animates.  Only an SVG-capable display repaints the icon (the
+connection never animates.  While a direct child still runs after the parent
+turn ends, the parent chat's whale animation and activity clock also continue.
+The whale requires both the host and chat connections: disconnecting the chat
+clears its child activity, and the next follow snapshot restores it from the
+current catalog even when the projection watermarks have not changed.
+Only an SVG-capable display repaints the icon (the
 `nerd-icons` and `Sub` fallbacks stay static), and the slot is buffer-local,
 so a child conversation's own indicator animates independently.
 Empty catalogs have no count
@@ -197,6 +211,9 @@ is no separate tree mode or display timer. Xref's public marker stack is suffici
 `M-.` backend is not installed. On Emacs 28.1 the default return command is
 `xref-pop-marker-stack`; Emacs 29+ may use `xref-go-back`. Existing
 user bindings are left intact.
+Revisiting an already open child records the departure immediately; the first
+visit records it after the follow snapshot succeeds. Returning to the parent
+adds one entry, so `M-,` can return to the child too.
 
 ## Metrics
 

@@ -181,7 +181,7 @@
       (cl-letf (((symbol-function 'dsh-emacs-server-ensure) (lambda () nil))
                 ((symbol-function 'dsh-emacs--active-session-id)
                  (lambda () "sess"))
-                ((symbol-function 'dsh-emacs--completing-read-ordered)
+                ((symbol-function 'dsh-emacs-ui--completing-read-ordered)
                  (lambda (_prompt coll &rest _args)
                    (setq collection coll)
                    nil)))
@@ -189,6 +189,54 @@
       (ert-info ((format "%s" "reference-menu-preserves-file-dir-session-order"))
         (should (equal (dsh-test-completion-items collection)
                        '("file.txt" "dir/" "Session")))))))
+
+;; --- M-x menu: completing-read returns the DISPLAY row, so the pick must map
+;; back to its own MENTION; a file and a session with the same label stay
+;; distinct rows and insert the right reference ---
+(ert-deftest dsh-emacs-test-reference-reference-menu-picks-the-paired-mention ()
+  :tags '(dsh-unit)
+  (let* ((mention (concat "@[Design]("
+                          (dsh-test-reference--session-uri "design") ")"))
+         (entries (list (cons "@Design" '(:kind file :path "Design"))
+                        (cons mention '(:kind session :label "Design"
+                                                :session-id "design"))))
+         (pick nil))
+    (with-temp-buffer
+      (dsh-test-reference-reset)
+      (insert "hi @")
+      (setq-local dsh-emacs--input-marker (point-min-marker))
+      (goto-char (point-max))
+      (setq dsh-emacs--reference-query ""
+            dsh-emacs--reference-candidates entries)
+      (ert-info ((format "%s" "menu-rows-stay-unique"))
+        (should (equal (mapcar #'car (dsh-emacs-reference--display-pairs))
+                       '("Design" "Design #2"))))
+      (cl-letf (((symbol-function 'dsh-emacs-server-ensure) (lambda () nil))
+                ((symbol-function 'dsh-emacs--active-session-id)
+                 (lambda () "sess"))
+                ((symbol-function 'dsh-emacs-reference--require-cache)
+                 (lambda (&rest _) t))
+                ((symbol-function 'dsh-emacs-ui--completing-read-ordered)
+                 (lambda (_prompt _coll &rest _args) pick)))
+        (setq pick "Design")
+        (dsh-emacs-reference)
+        (ert-info ((format "%s" "menu-file-row-inserts-file-mention"))
+          (should (equal (dsh-emacs--get-input) "hi @Design")))
+        ;; Pick the session row: it keeps the short label in the buffer and
+        ;; expands to its canonical mention on send.
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "hi @"))
+        (setq-local dsh-emacs--input-marker (point-min-marker))
+        (goto-char (point-max))
+        (setq pick "Design #2")
+        (dsh-emacs-reference)
+        (ert-info ((format "%s" "menu-session-row-inserts-canonical-mention"))
+          (should (equal (buffer-substring-no-properties
+                          (point-min) (point-max))
+                         "hi @Design"))
+          (should (equal (dsh-emacs--get-input)
+                         (concat "hi " mention))))))))
 
 (ert-deftest dsh-emacs-test-reference-refresh-updates-only-current-corfu ()
   :tags '(dsh-unit)
@@ -502,6 +550,104 @@
       (should (equal (dsh-emacs-reference--session-rows)
                      '(("@My Talk" . "@[My Talk](dsh-session:cyJpZCI6InMxIn0)")
                        ("@My Talk #2" . "@[My Talk](dsh-session:cyJpZCI6InMyIn0)")))))))
+
+;; --- session-rows: a literal suffix in a label cannot collide with a generated
+;; suffix row; every final row still resolves to its own session in the cache ---
+(ert-deftest dsh-emacs-test-reference-session-rows-suffixed-label-collision ()
+  :tags '(dsh-unit)
+  (let* ((entries
+          (mapcar (lambda (spec)
+                    (pcase-let ((`(,sid ,label) spec))
+                      (cons (concat "@[" label "]("
+                                    (dsh-test-reference--session-uri sid) ")")
+                            (list :kind 'session :label label
+                                  :session-id sid))))
+                  '(("s1" "same")
+                    ("s2" "same")
+                    ("s3" "same #2"))))
+         (dsh-emacs--reference-candidates entries)
+         (rows (dsh-emacs-reference--session-rows)))
+    (ert-info ((format "%s" "session-rows-suffixed-label-collision"))
+      (should (equal (mapcar #'car rows)
+                     '("@same" "@same #2" "@same #2 #2")))
+      (should (= (length rows)
+                 (length (delete-dups (mapcar #'car rows)))))
+      (should (equal (mapcar #'cdr rows) (mapcar #'car entries)))
+      (should (equal (mapcar (lambda (row)
+                               (plist-get (cdr (dsh-emacs-reference--entry-for
+                                                row))
+                                          :session-id))
+                             (mapcar #'car rows))
+                     '("s1" "s2" "s3")))
+      (should (eq (dsh-emacs-reference--entry-for "@same #2 #2")
+                  (nth 2 entries)))
+      (should-not (eq (dsh-emacs-reference--entry-for "@same #2 #2")
+                      (nth 1 entries))))))
+
+;; --- session-rows: a session label that spells a file path cannot take the
+;; file's row; each row still resolves to its own cache entry ---
+(ert-deftest dsh-emacs-test-reference-session-rows-avoid-file-rows ()
+  :tags '(dsh-unit)
+  (let* ((mention (concat "@[README.md]("
+                          (dsh-test-reference--session-uri "other-session") ")"))
+         (entries (list (cons "@README.md"
+                              '(:kind file :path "README.md"))
+                        (cons mention
+                              '(:kind session :label "README.md"
+                                      :session-id "other-session"))))
+         (dsh-emacs--reference-candidates entries)
+         (rows (dsh-emacs-reference--session-rows)))
+    (ert-info ((format "%s" "session-rows-avoid-file-rows"))
+      (should (equal (mapcar #'car rows) '("@README.md #2")))
+      (should (equal (mapcar #'cdr rows) (list mention)))
+      (should (eq (dsh-emacs-reference--entry-for "@README.md")
+                  (nth 0 entries)))
+      (should (eq (dsh-emacs-reference--entry-for "@README.md #2")
+                  (nth 1 entries))))))
+
+;; --- capf: when a file and a session share a label, the file row stays a
+;; file pick and the suffixed session row stays a session pick ---
+(ert-deftest dsh-emacs-test-reference-capf-file-row-beats-same-label-session ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (insert "@README.md")
+    (setq-local dsh-emacs--input-marker (point-min-marker)
+                dsh-emacs--reference-query ""
+                dsh-emacs--reference-candidates
+                (list (cons "@README.md"
+                            '(:kind file :path "README.md"))
+                      (cons (concat "@[README.md]("
+                                    (dsh-test-reference--session-uri "other") ")")
+                            '(:kind session :label "README.md"
+                                    :session-id "other"))))
+    (cl-letf (((symbol-function 'dsh-emacs--active-session-id)
+               (lambda () "audit-current"))
+              ((symbol-function 'dsh-emacs-reference--require-cache)
+               (lambda (&rest _) t)))
+      (let* ((capf (dsh-emacs-reference-completion-at-point))
+             (table (nth 2 capf))
+             (exit (plist-get (nthcdr 3 capf) :exit-function)))
+        (ert-info ((format "%s" "capf-file-session-rows-are-unique"))
+          (should (equal (dsh-test-completion-items table)
+                         '("@README.md" "@README.md #2"))))
+        ;; The front-end inserted the file row; exit must leave a file chip,
+        ;; not wrap it in the session's canonical mention.
+        (funcall exit "@README.md" 'finished)
+        (ert-info ((format "%s" "capf-file-row-stays-a-file"))
+          (should (equal (dsh-emacs--get-input) "@README.md"))
+          (should (null (get-text-property
+                         (point-min) 'dsh-emacs-reference-canonical)))
+          (should (get-text-property (point-min) 'dsh-emacs-reference-chip)))
+        ;; The session row keeps its own canonical mention.
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "@README.md #2"))
+        (goto-char (point-max))
+        (funcall exit "@README.md #2" 'finished)
+        (ert-info ((format "%s" "capf-session-row-stays-a-session"))
+          (should (equal (dsh-emacs--get-input)
+                         (concat "@[README.md]("
+                                 (dsh-test-reference--session-uri "other") ")"))))))))
 
 ;; --- affixate: file/directory rows get a leading type-icon column (consult-buffer
 ;; style) ---
@@ -842,9 +988,12 @@
         (dsh-emacs-reference--chip-guard-before))
       (ert-info ((format "%s" "chip-guard-hops-out-of-interior"))
         (should (= (point) (point-max))))
-      ;; backspace at the trailing edge deletes the whole chip (atomic unit)
+      ;; backspace at the trailing edge deletes the whole chip (atomic unit);
+      ;; binding `this-command' models the interactive delete, which is the
+      ;; only caller allowed to promote the boundary hit to whole-chip removal
       (goto-char (point-max))
-      (delete-backward-char 1)
+      (let ((this-command 'delete-backward-char))
+        (delete-backward-char 1))
       (ert-info ((format "%s" "chip-backspace-deletes-whole-span"))
         (should (string= (buffer-substring-no-properties (point-min) (point-max)) "")))
       ;; typing after the chip must not inherit its link/face style
@@ -855,6 +1004,80 @@
         (should (let ((p (- (point) 5)))
                   (and (null (get-text-property p 'face))
                        (null (get-text-property p 'dsh-emacs-reference-chip)))))))))
+
+;; Typing at a chip's leading edge must insert BEFORE the chip: the guard may
+;; only hop when the edit starts strictly inside it.  Regression: hopping at
+;; the edge made the text before an @ reference uneditable.
+(ert-deftest dsh-emacs-test-reference-typing-before-chip-inserts-before ()
+  :tags '(dsh-unit)
+  (let ((canon "@[My Talk](dsh-session:ab12_CD)"))
+    (with-temp-buffer
+      (setq-local dsh-emacs--input-marker (point-min-marker))
+      (insert "@My Talk")
+      (dsh-emacs-reference--session-chip (point-min) (point-max) canon)
+      (goto-char (point-min))
+      (let ((this-command 'self-insert-command))
+        (dsh-emacs-reference--chip-guard-before))
+      (ert-info ((format "%s" "chip-guard-leading-edge-does-not-hop"))
+        (should (= (point) (point-min))))
+      (insert ">")
+      (ert-info ((format "%s" "typed-before-chip-stays-outside-chip"))
+        (should (string= (buffer-substring-no-properties (point-min) (point-max))
+                         ">@My Talk"))
+        (should (null (get-text-property (point-min)
+                                         'dsh-emacs-reference-chip)))
+        (should (string= (dsh-emacs-reference--expanded-text
+                          (point-min) (point-max))
+                         (concat ">" canon)))))))
+
+;; Overwrite mode must not use the leading-edge insertion exception: typing
+;; there replaces the chip's first character (`@'), dropping the reference.
+;; The guard must keep the old hop to the chip's end in overwrite mode.
+(ert-deftest dsh-emacs-test-reference-overwrite-before-chip-preserves-chip ()
+  :tags '(dsh-unit)
+  (let ((canon "@[My Talk](dsh-session:ab12_CD)"))
+    (with-temp-buffer
+      (setq-local dsh-emacs--input-marker (point-min-marker))
+      (insert "@My Talk")
+      (dsh-emacs-reference--session-chip (point-min) (point-max) canon)
+      (overwrite-mode 1)
+      (goto-char (point-min))
+      (let ((this-command 'self-insert-command))
+        (dsh-emacs-reference--chip-guard-before))
+      (ert-info ((format "%s" "overwrite-mode-guard-keeps-chip"))
+        (should (= (point) (point-max)))
+        (should (get-text-property (point-min) 'dsh-emacs-reference-chip))
+        (should (string= (dsh-emacs-reference--expanded-text
+                          (point-min) (point-max))
+                         canon))))))
+
+;; `quoted-insert' in overwrite mode calls `delete-char' internally to replace
+;; one character.  The chip delete advice must not promote that internal call
+;; to whole-chip deletion: C-q X at the reference start used to swallow the
+;; whole chip and leave only X.
+(ert-deftest dsh-emacs-test-reference-quoted-insert-overwrite-keeps-chip ()
+  :tags '(dsh-unit)
+  (let ((canon "@[My Talk](dsh-session:ab12_CD)"))
+    (with-temp-buffer
+      (setq-local dsh-emacs--input-marker (point-min-marker))
+      (insert "@My Talk tail")
+      (dsh-emacs-reference--session-chip (point-min) (+ (point-min) 8) canon)
+      (binary-overwrite-mode 1)
+      (goto-char (point-min))
+      (let ((this-command 'quoted-insert))
+        ;; The guard sees overwrite mode and hops to the chip end; the
+        ;; command then deletes one following character and inserts its own.
+        (dsh-emacs-reference--chip-guard-before)
+        (delete-char 1)
+        (insert "X"))
+      (ert-info ((format "%s" "quoted-insert-overwrite-keeps-chip"))
+        (should (get-text-property (point-min) 'dsh-emacs-reference-chip))
+        (should (string= (buffer-substring-no-properties
+                          (point-min) (point-max))
+                         "@My TalkXtail"))
+        (should (string= (dsh-emacs-reference--expanded-text
+                          (point-min) (+ (point-min) 8))
+                         canon))))))
 
 ;; --- C-k on a chip deletes the whole chip atomically (not just its tail) ---
 ;; Regression: the chip guard used to hop every edit that started on a chip
@@ -1531,6 +1754,19 @@
     (ert-info ((format "%s" "visible-candidates-restore-after-first-message"))
       (should (equal (mapcar #'car (dsh-emacs-reference--visible-candidates))
                      '("@live" "@blank" "@unknown" "@file.txt"))))))
+
+(ert-deftest dsh-emacs-test-reference-chip-guard-repairs-missing-advice ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-reference--chip-guard-install)
+    (unwind-protect
+        (progn
+          (advice-remove 'delete-char #'dsh-emacs-reference--chip-delete-forward)
+          (dsh-emacs-reference--chip-guard-install)
+          (should (advice-member-p #'dsh-emacs-reference--chip-delete-forward
+                                  'delete-char)))
+      (unless (advice-member-p #'dsh-emacs-reference--chip-delete-forward 'delete-char)
+        (advice-add 'delete-char :around #'dsh-emacs-reference--chip-delete-forward)))))
 
 (provide 'dsh-test-reference)
 ;;; dsh-test-reference.el ends here

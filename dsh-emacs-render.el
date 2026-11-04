@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -83,19 +83,16 @@
 (defvar dsh-emacs--buffer-subagent)
 ;; Notification backends are built into their respective Emacs ports.
 (declare-function dsh-emacs--chat-title "dsh-emacs" (session-id))
+(declare-function dsh-emacs-notify--open "dsh-emacs" (session-id))
 (declare-function notifications-notify "notifications" (&rest params))
 (declare-function ns-do-applescript "ns-win" (script))
 (declare-function w32-notification-notify "w32fns.c" (&rest params))
 ;; Defined in dsh-emacs-command.el; called from the optimistic slash-command
 ;; render path before that module is loaded.
 (declare-function dsh-emacs-command-parse "dsh-emacs-command" (line))
-;; Declare-only forward form: the real `defvar-local' with its initializer
-;; lives further down; this silences the byte-compiler for the earlier reset
-;; path without changing runtime initialization semantics.
-(defvar dsh-emacs--command-spinners)
 (defvar dsh-emacs--input-marker)
 (defvar dsh-emacs--composer-top-marker)
-;; Latest decoded question projection, owned by dsh-emacs.el.
+;; Latest decoded question projection, owned by dsh-emacs-interaction.el.
 (defvar dsh-emacs--session-questions)
 
 ;;; ---------------------------------------------------------------------------
@@ -116,18 +113,33 @@ This also applies to final-only replies and messages loaded from history.
 Nil keeps all formatting synchronous."
   :type '(choice (const :tag "Always synchronous" nil)
                  (integer :tag "Characters"))
-  :group 'dsh-emacs)
+  :group 'dsh-emacs-render)
 
-(defcustom dsh-emacs-show-reasoning t
-  "Whether to show reasoning (reasoning / thinking) content in the transcript.
-On by default, matching dsh web (the web UI always shows the Think row);
-set to nil for a leaner transcript."
+(defcustom dsh-emacs-show-thinking t
+  "Whether to show thinking (reasoning) content in the transcript.
+The UI row is the Think row; the wire content kind is `reasoning'.  On by
+default, matching dsh web (the web UI always shows the Think row); set to
+nil for a leaner transcript."
   :type 'boolean
   :group 'dsh-emacs-render)
 
 (defcustom dsh-emacs-show-tool-calls t
   "Whether to show tool calls (bash / read / write etc.) in the transcript."
   :type 'boolean
+  :group 'dsh-emacs-render)
+
+(defcustom dsh-emacs-render-style 'full
+  "Leading icon style for transcript event rows.
+`full' draws each row's own dsh-web icon: the per-tool SVG, the Think
+sparkle, the plan checklist, and the goal and turn-trigger glyphs.  Displays
+without SVG use their text or dot fallbacks.  `simple' replaces every event
+icon with one compact dot in the row's accent color, like pi or Claude Code;
+tool dots follow their pending/success/error/stopped state, while row labels
+and summaries use the muted `dsh-emacs-event-row-face' and status text stays
+muted, so the dot is the only colored row element.  This option affects newly
+rendered rows; reopen a session to restyle an existing transcript."
+  :type '(choice (const :tag "Full icons" full)
+                 (const :tag "Simplified dots" simple))
   :group 'dsh-emacs-render)
 
 (defcustom dsh-emacs-enable-notifications t
@@ -137,10 +149,17 @@ approval request arrives while its chat is not visible."
   :type 'boolean
   :group 'dsh-emacs-render)
 
-(defcustom dsh-emacs-thinking-expand-by-default nil
-  "Whether thinking blocks are expanded by default.
-nil = collapsed by default (the collapsed row shows a first-line preview)."
-  :type 'boolean
+(defcustom dsh-emacs-thinking-style 'expand
+  "How live reasoning is rendered in the transcript.
+`expand' (default) streams the reasoning body under the Think header and folds
+it into a collapsible row when the answer text starts, like earlier releases.
+`inline' renders dsh web's compact disclosure from the first delta: one
+collapsed Think row whose preview advances with the latest completed
+paragraph, expandable in place; the finished row keeps its position and is
+updated rather than folded above the answer.  Every Think row starts collapsed;
+open it in place to read the body, and that fold state survives updates."
+  :type '(choice (const :tag "Expanded live body" expand)
+                 (const :tag "Inline collapsed row" inline))
   :group 'dsh-emacs-render)
 
 (defcustom dsh-emacs-thinking-preview-max 48
@@ -176,25 +195,20 @@ leaves elapsed time in the Completed summary.  Turns are not aggregated.
 Existing rows are not automatically redrawn when this option changes."
   :type '(repeat (choice (const copy) (const fork)
                          (const usage) (const duration)))
-  :group 'dsh-emacs)
+  :group 'dsh-emacs-render)
 
 (defcustom dsh-emacs-max-tool-result-chars 80
   "Maximum number of characters in the tool-result preview."
   :type 'integer
   :group 'dsh-emacs-render)
 
-(defcustom dsh-emacs-tool-call-chars 100
+(defcustom dsh-emacs-max-tool-call-chars 100
   "Maximum number of characters in the tool-call arguments preview."
   :type 'integer
   :group 'dsh-emacs-render)
 
-(defcustom dsh-emacs-tool-preview-lines 8
-  "Maximum number of lines in the collapsed tool-call preview."
-  :type 'integer
-  :group 'dsh-emacs-render)
-
 (defcustom dsh-emacs-max-buffer-size 200000
-  "Maximum character count of the chat transcript buffer.
+  "Maximum size of the chat transcript buffer, in characters.
 When the buffer exceeds this size old content is trimmed from the top, never
 past the editable input area.  Trimming is deferred while loading an older
 page, while a displayed window is not following new output, and when the
@@ -292,32 +306,6 @@ web's keyed toolviews (WebRow): web_search uses the meridian-globe family
 (`dsh-emacs--tool-icon-svgs' \"web\") while local grep/glob keep the
 magnifier family.")
 
-(defconst dsh-emacs--variant-icons
-  '(("bash"   . "💻")
-    ("read"   . "📖")
-    ("search" . "🔍")
-    ("web"    . "🌐")
-    ("write"  . "✏️")
-    ("edit"   . "✏️")
-    ("code"   . "</>")
-    ("command" . "⚡")
-    ("question" . "❓")
-    ("others" . "✨"))
-  "Variant -> emoji fallback icon, mirroring dsh web's VariantIcons by meaning:
-- bash    = terminal            (IconApiOutline14)
-- read    = browse / open book  (IconBrowseOutline16)
-- search  = magnifying glass    (IconSearchOutline16)
-- web     = meridian globe      (IconGlobeOutline14, web_search's WebRow icon)
-- write   = pencil              (IconEditOutline16)
-- edit    = pencil              (IconEditOutline16)
-- code    = code brackets       (IconCodeOutline16)
-- command = lightning           (slash commands, IconFlash16 style)
-- question = question mark       (IconQuestionOutline14, the ask row's icon)
-- others  = sparkle             (IconSparkle16)
-
-The emoji is only a terminal / non-SVG fallback; graphical Emacs renders the
-real dsh-web SVG icons (see `dsh-emacs--tool-icon-svgs').")
-
 (defconst dsh-emacs--tool-icon-svgs
   ;; Each SVG template is the exact dsh-web icon (VARIANT_ICONS), with a
   ;; "__C__" placeholder for the fill color.  Path data was extracted from
@@ -334,9 +322,9 @@ real dsh-web SVG icons (see `dsh-emacs--tool-icon-svgs').")
     ("question" . "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 14 14\" fill=\"none\"><path d=\"M12.5757 7.00012C12.5757 3.92085 10.0794 1.42463 7.00012 1.42456C3.9208 1.42456 1.42456 3.9208 1.42456 7.00012C1.42463 10.0794 3.92085 12.5757 7.00012 12.5757C10.0793 12.5756 12.5756 10.0793 12.5757 7.00012ZM13.8002 7.00012C13.8001 10.7559 10.7559 13.8001 7.00012 13.8002C3.2443 13.8002 0.199291 10.7559 0.199219 7.00012C0.199219 3.24426 3.24426 0.199219 7.00012 0.199219C10.7559 0.199291 13.8002 3.2443 13.8002 7.00012Z\" fill=\"__C__\" stroke=\"none\"/><path d=\"M6.18042 8.68184C6.18043 8.09153 6.32893 7.34655 6.92127 6.8481C7.28566 6.54148 7.76104 6.27318 8.0022 6.10811C8.28964 5.91137 8.42234 5.76562 8.48328 5.58944C8.57774 5.31609 8.53121 5.00904 8.34912 4.76741C8.17409 4.53522 7.83879 4.32222 7.28186 4.32222C5.99668 4.32225 5.46969 5.11832 5.46949 5.78939H4.24414C4.24436 4.39942 5.36327 3.09691 7.28186 3.09688C8.17773 3.09688 8.89489 3.45606 9.32752 4.02999C9.75287 4.59438 9.86938 5.32775 9.64026 5.99019C9.44847 6.5444 9.04722 6.87743 8.69434 7.11898C8.29506 7.39226 8.02318 7.52192 7.70996 7.78548C7.51943 7.94582 7.40577 8.24899 7.40577 8.68184V8.75533H6.18042V8.68184Z\" fill=\"__C__\" stroke=\"none\"/><path d=\"M7.39455 9.44026V10.8109H6.16921V9.44026H7.39455Z\" fill=\"__C__\" stroke=\"none\"/></svg>")
     ("others" . "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><path d=\"M6.1 3.1Q6.6 7.8 11.3 8.3Q6.6 8.8 6.1 13.5Q5.6 8.8 0.9 8.3Q5.6 7.8 6.1 3.1Z\" fill=\"__C__\" stroke=\"none\"/><path d=\"M11.9 1Q12.2 3.7 14.9 4Q12.2 4.3 11.9 7Q11.6 4.3 8.9 4Q11.6 3.7 11.9 1Z\" fill=\"__C__\" stroke=\"none\"/><path d=\"M12.5 9.4Q12.7 11.4 14.7 11.6Q12.7 11.8 12.5 13.8Q12.3 11.8 10.3 11.6Q12.3 11.4 12.5 9.4Z\" fill=\"__C__\" stroke=\"none\"/></svg>"))
   "Variant -> dsh-web SVG icon template, with a \"__C__\" fill placeholder.
-Graphical Emacs renders these via `create-image'; terminal Emacs falls back to
-the emoji in `dsh-emacs--variant-icons'.  The \"web\" key (meridian globe,
-IconGlobeOutline14) is selected for web_search through
+Graphical Emacs renders these via `create-image'; displays without SVG fall
+back to the single dot in `dsh-emacs-render--simple-icon'.  The \"web\" key
+\(meridian globe, IconGlobeOutline14) is selected for web_search through
 `dsh-emacs--tool-name-icon-keys', mirroring dsh web's WebRow.")
 
 (defconst dsh-emacs--think-icon-svg-template
@@ -367,6 +355,27 @@ icon.  Add your own entries to curate custom tool names."
 ;;; Tool classification and summary
 ;;; ---------------------------------------------------------------------------
 
+(defun dsh-emacs-render--simple-icon (face)
+  "Return the simplified event-row glyph: one dot carrying FACE."
+  (propertize "●" 'face face))
+
+(defun dsh-emacs-render--row-label-face (accent)
+  "Return the face for an event-row label.
+In the `simple' style the leading dot is the only colored element, so the
+label uses `dsh-emacs-event-row-face' with bold weight; otherwise return
+ACCENT."
+  (if (eq dsh-emacs-render-style 'simple)
+      '(bold dsh-emacs-event-row-face)
+    accent))
+
+(defun dsh-emacs-render--row-chrome-face (face)
+  "Return FACE for event-row header chrome.
+In the `simple' style the leading dot is the only colored element, so the
+header row uses the muted `dsh-emacs-event-row-face'."
+  (if (eq dsh-emacs-render-style 'simple)
+      'dsh-emacs-event-row-face
+    face))
+
 (defun dsh-emacs-render--tool-icon-svg (variant color &optional tool-name)
   "Return the dsh-web SVG icon for VARIANT, filled with COLOR.
 TOOL-NAME selects a per-tool icon override (`dsh-emacs--tool-name-icon-keys')
@@ -382,27 +391,26 @@ meridian globe; grep/glob keep the magnifier family)."
 (defun dsh-emacs-render--tool-icon (variant &optional tool-name)
   "Return VARIANT's icon as a display string.
 TOOL-NAME picks a per-tool icon override (`dsh-emacs--tool-name-icon-keys').
-In graphical Emacs with SVG support this is the real dsh-web SVG image;
-otherwise it falls back to the emoji glyph in `dsh-emacs--variant-icons'."
-  (let* ((icon-key (or (and tool-name
-                            (cdr (assoc tool-name dsh-emacs--tool-name-icon-keys)))
-                       variant))
-         (glyph (or (cdr (assoc icon-key dsh-emacs--variant-icons)) "🔧")))
-    (if (and (display-graphic-p)
-             (fboundp 'image-type-available-p)
-             (image-type-available-p 'svg))
-        (condition-case nil
-            (let* ((fg (face-foreground 'dsh-emacs-tool-icon-face nil t))
-                   (color (if (and fg (not (equal fg "unspecified")))
-                              fg
-                            "#a78bfa")))
-              (propertize glyph
-                          'display
-                          (create-image
-                           (dsh-emacs-render--tool-icon-svg variant color tool-name)
-                           'svg t :ascent 'center :height 1.0)))
-          (error glyph))
-      glyph)))
+With `dsh-emacs-render-style' `simple', or on a display that cannot draw
+SVG, this is one tool-accent dot.  Otherwise it is the real dsh-web SVG image
+for the variant."
+  (if (or (eq dsh-emacs-render-style 'simple)
+          (not (and (display-graphic-p)
+                    (fboundp 'image-type-available-p)
+                    (image-type-available-p 'svg))))
+      (dsh-emacs-render--simple-icon 'dsh-emacs-tool-icon-face)
+    (condition-case nil
+        (let* ((fg (face-foreground 'dsh-emacs-tool-icon-face nil t))
+               (color (if (and fg (not (equal fg "unspecified")))
+                          fg
+                        "#a78bfa")))
+          (propertize "●"
+                      'face 'dsh-emacs-tool-icon-face
+                      'display
+                      (create-image
+                       (dsh-emacs-render--tool-icon-svg variant color tool-name)
+                       'svg t :ascent 'center :height 1.0)))
+      (error (dsh-emacs-render--simple-icon 'dsh-emacs-tool-icon-face)))))
 
 (defun dsh-emacs-render--event-icon (state)
   "Return a compact status dot for an exceptional execution STATE.
@@ -437,24 +445,27 @@ STATE is `retry', `error' or `idle'; the adjacent title supplies its meaning."
 
 (defun dsh-emacs-render--think-icon ()
   "Return the Thinking row leading glyph as a display string.
-In graphical Emacs with SVG support this is the real dsh-web IconThinkOutline14
-sparkle, tinted with the thinking color (matching `dsh-emacs-thinking-face');
-otherwise it falls back to the \"✶\" glyph used by terminal Emacs."
-  (if (and (display-graphic-p)
-           (fboundp 'image-type-available-p)
-           (image-type-available-p 'svg))
-      (condition-case nil
-          (let* ((fg (face-foreground 'dsh-emacs-thinking-face nil t))
-                 (color (if (and fg (not (equal fg "unspecified")))
-                            fg
-                          "#b45f06")))
-            (propertize "✶"
-                        'display
-                        (create-image
-                         (dsh-emacs-render--think-icon-svg color)
-                         'svg t :ascent 'center :height 1.0)))
-        (error "✶"))
-    "✶"))
+With `dsh-emacs-render-style' `simple' this is one thinking-accent dot.
+Otherwise, in graphical Emacs with SVG support it is the real dsh-web
+IconThinkOutline14 sparkle, tinted with the thinking color (matching
+`dsh-emacs-thinking-face'); without SVG it falls back to the \"✶\" glyph."
+  (if (eq dsh-emacs-render-style 'simple)
+      (dsh-emacs-render--simple-icon 'dsh-emacs-thinking-face)
+    (if (and (display-graphic-p)
+             (fboundp 'image-type-available-p)
+             (image-type-available-p 'svg))
+        (condition-case nil
+            (let* ((fg (face-foreground 'dsh-emacs-thinking-face nil t))
+                   (color (if (and fg (not (equal fg "unspecified")))
+                              fg
+                            "#b45f06")))
+              (propertize "✶"
+                          'display
+                          (create-image
+                           (dsh-emacs-render--think-icon-svg color)
+                           'svg t :ascent 'center :height 1.0)))
+          (error "✶"))
+      "✶")))
 
 (defconst dsh-emacs--todo-icon-svg-template
   "<svg width=\"14\" height=\"14\" viewBox=\"0 0 14 14\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M13.3277 9.69629V10.976H7.28086V9.69629H13.3277Z\" fill=\"__C__\"/><path d=\"M13.3277 2.97256V4.25225H7.28086V2.97256H13.3277Z\" fill=\"__C__\"/><path d=\"M4.64512 10.336C4.64505 9.62755 4.07081 9.05322 3.3623 9.05322C2.65386 9.05329 2.07956 9.62759 2.07949 10.336C2.07949 11.0445 2.65382 11.6188 3.3623 11.6188C4.07085 11.6188 4.64512 11.0446 4.64512 10.336ZM5.92559 10.336C5.92559 11.7515 4.77777 12.8993 3.3623 12.8993C1.94689 12.8993 0.799805 11.7515 0.799805 10.336C0.799871 8.92066 1.94693 7.7736 3.3623 7.77354C4.77773 7.77354 5.92552 8.92062 5.92559 10.336Z\" fill=\"__C__\"/><path d=\"M4.64531 3.6123C4.6453 2.90382 4.07098 2.32949 3.3625 2.32949C2.65403 2.32951 2.0797 2.90383 2.07969 3.6123C2.07969 4.32079 2.65402 4.8951 3.3625 4.89512C4.07099 4.89512 4.64531 4.3208 4.64531 3.6123ZM5.925 3.6123C5.925 5.02772 4.77792 6.1748 3.3625 6.1748C1.9471 6.17479 0.8 5.02771 0.8 3.6123C0.800013 2.19691 1.9471 1.04982 3.3625 1.0498C4.77791 1.0498 5.92499 2.1969 5.925 3.6123Z\" fill=\"__C__\"/></svg>"
@@ -469,41 +480,91 @@ falls back to a list glyph.")
 
 (defun dsh-emacs-render--todo-icon ()
   "Return the todo row leading glyph as a display string.
-In graphical Emacs with SVG support this is the real dsh-web plan checklist
-icon, tinted with the tool purple accent (`dsh-emacs-tool-icon-face'); it is
-distinct from the green row text.  Terminal Emacs falls back to the \"▤\"
-glyph carrying that same face."
-  (let ((glyph (if (and (display-graphic-p)
-                        (fboundp 'image-type-available-p)
-                        (image-type-available-p 'svg))
-                   (condition-case nil
-                       (let* ((fg (face-foreground 'dsh-emacs-tool-icon-face nil t))
-                              (color (if (and fg (not (equal fg "unspecified")))
-                                         fg
-                                       "#a78bfa")))
-                         (propertize "▤"
-                                     'display
-                                     (create-image
-                                      (dsh-emacs-render--todo-icon-svg color)
-                                      'svg t :ascent 'center :height 1.0)))
-                     (error "▤"))
-                 "▤")))
-    (propertize glyph 'face 'dsh-emacs-tool-icon-face)))
+With `dsh-emacs-render-style' `simple' this is one tool-purple dot.
+Otherwise, in graphical Emacs with SVG support it is the real dsh-web plan
+checklist icon, tinted with the tool purple accent
+\(`dsh-emacs-tool-icon-face'); it is distinct from the green row text.
+Terminal Emacs without SVG falls back to the \"▤\" glyph carrying that same
+face."
+  (if (eq dsh-emacs-render-style 'simple)
+      (dsh-emacs-render--simple-icon 'dsh-emacs-tool-icon-face)
+    (let ((glyph (if (and (display-graphic-p)
+                          (fboundp 'image-type-available-p)
+                          (image-type-available-p 'svg))
+                     (condition-case nil
+                         (let* ((fg (face-foreground 'dsh-emacs-tool-icon-face nil t))
+                                (color (if (and fg (not (equal fg "unspecified")))
+                                           fg
+                                         "#a78bfa")))
+                           (propertize "▤"
+                                       'display
+                                       (create-image
+                                        (dsh-emacs-render--todo-icon-svg color)
+                                        'svg t :ascent 'center :height 1.0)))
+                       (error "▤"))
+                   "▤")))
+      (propertize glyph 'face 'dsh-emacs-tool-icon-face))))
 
 (defun dsh-emacs-render--goal-trigger-icon ()
   "Return the goal dartboard as a display string.
-Reuses the Composer Goal Row's dsh-web goal SVG
+With `dsh-emacs-render-style' `simple' this is one goal-accent dot.
+Otherwise it reuses the Composer Goal Row's dsh-web goal SVG
 \(`dsh-emacs-composer--goal-icon') so a goal keeps one icon across the
 composer, the transcript trigger notice and the goal tool cards; terminal
 Emacs without SVG shows the row's `◎ ' text fallback."
-  (or (dsh-emacs-composer--goal-icon)
-      (propertize "◎ " 'face 'dsh-emacs-composer-goal-face)))
+  (if (eq dsh-emacs-render-style 'simple)
+      (dsh-emacs-render--simple-icon 'dsh-emacs-composer-goal-face)
+    (or (dsh-emacs-composer--goal-icon)
+        (propertize "◎ " 'face 'dsh-emacs-composer-goal-face))))
+
+(defconst dsh-emacs-render--turn-trigger-icon-svg-template
+  (concat "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+          "width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" "
+          "fill=\"none\" stroke-width=\"1\">"
+          "<path d=\"M4.74024 9.11029L1.82882 7.79865C1.75022 7.76323 "
+          "1.75026 7.65161 1.82889 7.61626L12.9665 2.60943C13.0354 2.57846 "
+          "13.1125 2.63213 13.1073 2.70749L12.3914 13.1388C12.3864 13.2117 "
+          "12.3073 13.2548 12.2433 13.2194L6.12677 9.83657\" stroke=\"__C__\"/>"
+          "<path d=\"M8.44336 11.0825L6.2832 13.2843C6.22048 13.3482 "
+          "6.11182 13.3038 6.11182 13.2143V9.86772C6.11182 9.84165 6.122 "
+          "9.8166 6.1402 9.79793L12.972 2.78748\" stroke=\"__C__\"/></svg>")
+  "dsh web's `IconPaperPlaneOutline' trigger glyph with a \"__C__\" placeholder.
+Web tints one source-family icon per trigger; the Emacs row keeps one
+incoming-message glyph and names the family in its label, so a foreign
+source never invents an identity it did not record.")
+
+(defun dsh-emacs-render--turn-trigger-icon ()
+  "Return the turn-trigger leading glyph as a display string.
+With `dsh-emacs-render-style' `simple' this is one muted dot.
+Otherwise it is dsh web's paper-plane trigger icon tinted from
+`dsh-emacs-meta-face'; terminal Emacs without SVG falls back to the `➤'
+glyph carrying that face."
+  (if (eq dsh-emacs-render-style 'simple)
+      (dsh-emacs-render--simple-icon 'dsh-emacs-meta-face)
+    (let ((glyph (propertize "➤" 'face 'dsh-emacs-meta-face)))
+      (if (and (display-graphic-p)
+               (fboundp 'image-type-available-p)
+               (image-type-available-p 'svg))
+          (condition-case nil
+              (let* ((fg (face-foreground 'dsh-emacs-meta-face nil t))
+                     (color (if (and fg (not (equal fg "unspecified"))) fg
+                              "#8b949e")))
+                (propertize glyph
+                            'display
+                            (create-image
+                             (replace-regexp-in-string
+                              "__C__" color
+                              dsh-emacs-render--turn-trigger-icon-svg-template
+                              t t)
+                             'svg t :ascent 'center :height 1.0)))
+            (error glyph))
+        glyph))))
 
 (defun dsh-emacs-render--tool-variant (tool-name)
   "Return (VARIANT . ICON) for TOOL-NAME.
-ICON is a display string: the real dsh-web SVG image in graphical Emacs, or
-the emoji fallback otherwise.  A goal tool takes the dartboard dsh web's
-`DetailsRow' keys off the `_goal' suffix instead of a variant icon."
+ICON is a display string: the real dsh-web SVG image where Emacs can draw
+SVG, or one tool-accent dot otherwise.  A goal tool takes the dartboard dsh
+web's `DetailsRow' keys off the `_goal' suffix instead of a variant icon."
   (let* ((variant (or (cdr (assoc tool-name dsh-emacs--tool-variants)) "others"))
          (icon (if (equal variant "goal")
                    (dsh-emacs-render--goal-trigger-icon)
@@ -562,6 +623,31 @@ space.  Empty/whitespace-only TEXT yields nil."
            (first (replace-regexp-in-string "[\n\r]+" " " first))
            (first (string-trim first)))
       (and (not (string-empty-p first)) first))))
+
+(defun dsh-emacs-render--thinking-live-preview (text)
+  "Return the running preview for reasoning TEXT, or nil.
+Mirrors dsh web: the first line of the latest paragraph completed so far, so
+the collapsed row advances as the model thinks.  A tail paragraph without a
+closing blank line is still in flight and contributes nothing; bold markers
+(`**') are dropped and `dsh-emacs-thinking-preview-max' bounds the width."
+  (let ((latest nil)
+        ;; The last element is the still-streaming tail unless TEXT ends with
+        ;; a blank line: `butlast' drops it, and a trailing empty element has
+        ;; no first line to show anyway.  Splitting in one pass (instead of a
+        ;; `string-match' loop) keeps this linear and independent of match data
+        ;; that helpers such as `string-trim' may overwrite.
+        (paragraphs (butlast (split-string
+                              (replace-regexp-in-string "\r" "" text)
+                              "\n\\(?:[ \t]*\n\\)+"))))
+    (dolist (paragraph paragraphs)
+      (let* ((line (car (split-string paragraph "\n")))
+             (line (string-trim
+                    (replace-regexp-in-string "\*\*" "" (or line "")))))
+        (unless (string-empty-p line)
+          (setq latest line))))
+    (when (and latest (> dsh-emacs-thinking-preview-max 0))
+      (truncate-string-to-width latest dsh-emacs-thinking-preview-max
+                                nil nil "..."))))
 
 (defun dsh-emacs-render--thinking-preview (text)
   "Return the collapse-time preview for reasoning TEXT.
@@ -626,6 +712,28 @@ row states its outcome instead of showing a bare title."
                 (equal (dsh-protocol-content-block-kind block) "reasoning"))
               content)
              "\n"))
+
+(defun dsh-emacs-render--reconcile-inline-thinking (step content)
+  "Update STEP's inline Think rows from final CONTENT in place.
+Returns non-nil when the streamed rows cover every final non-empty reasoning
+block one-to-one, so the rows can keep their positions; nil asks the caller to
+fall back to the single folded row (a block was added or removed by the
+correction)."
+  (let ((blocks (cl-loop for block in content
+                         for kind = (dsh-protocol-content-block-kind block)
+                         for text = (dsh-protocol-content-block-text block)
+                         when (and (equal kind "reasoning")
+                                   (stringp text) (not (string-empty-p text)))
+                         collect text))
+        (regions (reverse (plist-get step :thinking-regions))))
+    (when (and regions (= (length blocks) (length regions)))
+      (cl-loop for text in blocks
+               for region in regions
+               do (dsh-emacs-render--render-thinking-block
+                   (plist-get region :ns) (plist-get region :block-id)
+                   text nil t))
+      (plist-put step :reasoning (mapconcat #'identity blocks "\n"))
+      t)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Timestamps
@@ -1041,6 +1149,41 @@ Older pages can supply missing outcomes; trimming removes consumed turns.")
 Retain per-message usage and answer eligibility by seq for history merges,
 plus work boundary markers and the reader's disclosure overlay.")
 
+(defvar-local dsh-emacs-render--inbox-pending nil
+  "Pending inbox messages per target, as (ID . SOURCE-KIND) cells.
+Replayed from `agent/inbox/spliced' only to classify a notice that claims a
+turn: the renderer paints nothing and keeps no Agent or queue state.")
+
+(defvar-local dsh-emacs-render--inbox-claim nil
+  "Latest inbox claim per target, or nil.
+Each value is a plist of :seq, :entries (the claimed (ID . SOURCE-KIND)
+cells), :human (whether the batch claimed human input) and :truncated (the
+queue lost the inserted batch to a page cut).  dsh web's `InboxState'
+replaces a target's claim on every claim, and an insertion removes a
+requeued id again.")
+
+(defvar-local dsh-emacs-render--turn-start-seq nil
+  "Event seq of the current turn's `turn/start', or nil.
+dsh web's idle-steer test compares it with the latest inbox claims.")
+
+(defvar-local dsh-emacs-render--turn-step nil
+  "Current `step/start' step number, or nil.
+A non-human next-step claim only wakes a turn at step 1.")
+
+(defvar-local dsh-emacs-render--turn-opener-painted nil
+  "Non-nil once the current turn's opening input painted a row.
+A hidden injection does not set it: the opening claim batch decides whether a
+later notice may still use the opener fallback.  A visible opener ends
+attribution, and so does an exhausted batch below.")
+
+(defvar-local dsh-emacs-render--turn-claim-slots nil
+  "Opening claim messages still expected to render in the current turn.
+The host logs its claims after `turn/start' and before the first `step/start',
+so their non-canceled removals record the admitted batch even when a page cut
+lost the queue entries.  Every rendered `user/message' spends one slot; once
+they run out, a later notice belongs to a later step and cannot use the
+opener fallback.")
+
 (defvar dsh-emacs-render--footer-batch nil
   "Non-nil while collecting a bounded history batch before painting footers.")
 
@@ -1052,9 +1195,8 @@ plus work boundary markers and the reader's disclosure overlay.")
 Serverside slash commands are keyed by their `command/run' commandId;
 client-side `!command' rows (see `dsh-emacs-render-shell-start') use
 their own monotonic `shell-N' ids so the two never collide.  Both share
-the same row machinery — icon, `-\\|/' spinner, pending tint and
-success/error restyle — and both are cleared by
-`dsh-emacs-render--reset-tool-tracking'.")
+the same row machinery — icon, pending tint and success/error restyle —
+and both are cleared by `dsh-emacs-render--reset-tool-tracking'.")
 
 (defvar-local dsh-emacs--pending-command nil
   "When non-nil, an optimistic slash-command row rendered before the RPC round-trip.
@@ -1065,7 +1207,6 @@ miss the entry is cleaned up.")
 
 (defun dsh-emacs-render--reset-tool-tracking ()
   "Reset tool tracking state. Called on full transcript reload."
-  (dsh-emacs--command-spinner-clear-all)
   (dsh-emacs-render--flush-stream nil t)
   (dsh-emacs-render--cancel-markdown)
   (when dsh-emacs-render--reply-turns
@@ -1077,9 +1218,14 @@ miss the entry is cleaned up.")
         dsh-emacs--streamed-step nil
         dsh-emacs--tool-states (make-hash-table :test 'equal)
         dsh-emacs--command-blocks (make-hash-table :test 'equal)
-        dsh-emacs--command-spinners (make-hash-table :test 'equal)
         dsh-emacs--pending-command nil
         dsh-emacs-render--turn-deliverables nil
+        dsh-emacs-render--inbox-pending nil
+        dsh-emacs-render--inbox-claim nil
+        dsh-emacs-render--turn-start-seq nil
+        dsh-emacs-render--turn-step nil
+        dsh-emacs-render--turn-opener-painted nil
+        dsh-emacs-render--turn-claim-slots nil
         dsh-emacs-render--reply-turns nil
         dsh-emacs-render--attempt-turns nil)
   ;; Todo strip folds its snapshot from replayed `tool/call' events, so clear
@@ -1533,15 +1679,20 @@ rendered in full."
                   (timer (plist-get state :timer)))
         (cancel-timer timer)
         (setf (plist-get state :timer) nil)
-        (let ((windows (dsh-emacs-render--following-windows))
-              (text (apply #'concat (reverse (plist-get state :chunks))))
-              (inhibit-read-only t)
-              (buffer-undo-list t))
-          (save-excursion
-            (goto-char (plist-get state :end))
-            (dsh-emacs-render--insert-read-only
-             text 'dsh-emacs-thinking-body-face))
-          (setf (plist-get state :chunks) nil)
+        (let ((windows (dsh-emacs-render--following-windows)))
+          (if (plist-get state :inline)
+              (dsh-emacs-render--render-thinking-block
+               (plist-get state :ns) (plist-get state :block-id)
+               (apply #'concat (reverse (plist-get state :all)))
+               nil t t)
+            (let ((text (apply #'concat (reverse (plist-get state :chunks))))
+                  (inhibit-read-only t)
+                  (buffer-undo-list t))
+              (setf (plist-get state :chunks) nil)
+              (save-excursion
+                (goto-char (plist-get state :end))
+                (dsh-emacs-render--insert-read-only
+                 text 'dsh-emacs-thinking-body-face))))
           (dsh-emacs-render--follow-stream windows))))))
 
 (defun dsh-emacs-render--thinking-stream-alive-for-p (key)
@@ -1549,14 +1700,50 @@ rendered in full."
   (and dsh-emacs--streaming-thinking
        (equal key (plist-get dsh-emacs--streaming-thinking :key))))
 
+(defun dsh-emacs-render--inline-thinking-stream (event text key index state)
+  "Create or extend the inline Think row for TEXT and return its state.
+EVENT names the stream, KEY and INDEX identify the reasoning block, and STATE
+is the current live state or nil.  Mirrors dsh web: one collapsed row that
+advances its paragraph preview while the model thinks."
+  (when (and state
+             (or (not (equal key (plist-get state :key)))
+                 (and index (not (eql index (plist-get state :index))))))
+    (dsh-emacs-render--close-live-thinking-block)
+    (setq state nil))
+  (if state
+      (progn
+        (push text (plist-get state :all))
+        (unless (plist-get state :timer)
+          (setf (plist-get state :timer)
+                (run-at-time 0.1 nil #'dsh-emacs-render--flush-thinking
+                             (current-buffer))))
+        state)
+    ;; A reasoning block starts: close the text above it so the row lands at
+    ;; the block boundary, then render the collapsed disclosure in one edit.
+    (dsh-emacs-render--close-live-text-block)
+    (let* ((insert-point (dsh-emacs-render--input-insert-point))
+           (windows (dsh-emacs-render--following-windows))
+           (ns (dsh-emacs-render--make-namespace))
+           (block-id (dsh-emacs-render--make-block-id event)))
+      (dsh-emacs-render--render-thinking-block
+       ns block-id text insert-point nil t)
+      (setq state (list :key key :index index :inline t
+                        :all (list text) :timer nil
+                        :ns ns :block-id block-id))
+      (setq dsh-emacs--streaming-thinking state)
+      (dsh-emacs-render--follow-stream windows)
+      state)))
+
 (cl-defun dsh-emacs-render--start-thinking-stream (event text)
   "Create or extend the live Thinking stream with reasoning TEXT.
-The stream is a raw body under a dsh-web \"IconThink…\" header (see
-`dsh-emacs-render--think-icon') inserted at the transcript's input point, so
-`reasoning-delta' chunks stay cheap to append.  `dsh-emacs-render-assistant-message'
-swaps it for the collapsible Think fragment once the authoritative reasoning
-text arrives."
-  (when (and dsh-emacs-show-reasoning
+With `dsh-emacs-thinking-style' `expand' the stream is a raw body under a
+dsh-web \"IconThink…\" header (see `dsh-emacs-render--think-icon') inserted at
+the transcript's input point, so `reasoning-delta' chunks stay cheap to append;
+`dsh-emacs-render-assistant-message' folds it into the collapsible Think
+fragment once the authoritative reasoning text arrives.  With `inline' the
+first delta renders the collapsed fragment itself and later deltas refresh
+it."
+  (when (and dsh-emacs-show-thinking
              (stringp text) (not (string-empty-p text)))
     (let* ((key (dsh-protocol-stream-key--from-alist event))
            (index (dsh-protocol-chunk-index--from-alist event))
@@ -1574,13 +1761,22 @@ text arrives."
         (dsh-emacs-render--render-thinking-block
          (plist-get closed :ns) (plist-get closed :block-id)
          (apply #'concat (reverse (plist-get closed :all)))
-         (plist-get closed :timestamp) nil t)
+         nil t)
         (setf (plist-get step :reasoning)
               (mapconcat
                (lambda (entry)
                  (apply #'concat (reverse (plist-get entry :all))))
                (reverse (plist-get step :thinking-regions)) "\n"))
         (cl-return-from dsh-emacs-render--start-thinking-stream closed))
+      ;; An active stream keeps the shape it opened with: the option picks
+      ;; how a new stream starts.  Re-reading it here would send a mid-stream
+      ;; change into the other shape's accumulator and drop deltas.
+      (when (if state
+                (plist-get state :inline)
+              (eq dsh-emacs-thinking-style 'inline))
+        (cl-return-from dsh-emacs-render--start-thinking-stream
+          (dsh-emacs-render--inline-thinking-stream
+           event text key index state)))
       ;; Consecutive reasoning blocks have distinct indices even when no
       ;; text delta separates them. Keep their regions and separators apart.
       (when (and state
@@ -1608,8 +1804,13 @@ text arrives."
                (dsh-emacs-ui--blank-above-preserve))
               (setq start (point))
               (dsh-emacs-render--insert-read-only
-               (concat (dsh-emacs-render--think-icon) " Think\n")
-               'dsh-emacs-thinking-face)
+               (concat
+                (propertize (dsh-emacs-render--think-icon)
+                            'face 'dsh-emacs-thinking-face)
+                (propertize " Think\n"
+                            'face (dsh-emacs-render--row-label-face
+                                   'dsh-emacs-thinking-face)))
+               nil)
               (dsh-emacs-render--insert-read-only
                (concat text "\n") 'dsh-emacs-thinking-body-face)
               (setq end (copy-marker (- (point) 1) t))))
@@ -1617,7 +1818,6 @@ text arrives."
                             :start (copy-marker start nil)
                             :end end :chunks nil :timer nil
                             :all (list text)
-                            :timestamp (format-time-string "%H:%M:%S")
                             :ns (dsh-emacs-render--make-namespace)
                             :block-id (dsh-emacs-render--make-block-id event))
                 dsh-emacs--streaming-thinking state
@@ -1648,19 +1848,20 @@ when a live stream existed and was replaced."
             (delete-region start end)
             (setq dsh-emacs--streaming-thinking nil)
             (dsh-emacs-render--render-thinking-block
-             ns block-id final-text
-             (plist-get state :timestamp) start)))
+             ns block-id final-text start)))
         (set-marker (plist-get state :start) nil)
         (set-marker (plist-get state :end) nil)
         (setq dsh-emacs--streaming-thinking nil))
       t)))
 
 (defun dsh-emacs-render--close-live-thinking-block ()
-  "Fold the live Think body into its fragment above the next text block.
-The reasoning streamed so far stays on screen, collapsed behind its label, and
-is recorded on the step; a later reasoning block opens a new Think block below
-the text.  Without this the raw reasoning region would span the text that
-follows and be deleted when the stream is finalized."
+  "Close the live Think block at the next text boundary.
+The reasoning streamed so far stays on screen, behind its label, and is
+recorded on the step; a later reasoning block opens a new Think block below
+the text.  `expand' folds the raw body into its fragment here, while `inline'
+settles the preview of the row that already exists.  Without this a raw
+reasoning region would span the text that follows and be deleted when the
+stream is finalized."
   (when-let* ((state dsh-emacs--streaming-thinking))
     (dsh-emacs-render--flush-thinking)
     (let* ((step (dsh-emacs-render--step-record (plist-get state :key)))
@@ -1669,8 +1870,16 @@ follows and be deleted when the stream is finalized."
       (plist-put step :reasoning
                  (if (string-empty-p committed) streamed
                    (concat committed "\n" streamed)))
-      (dsh-emacs-render--replace-live-thinking-text
-       (plist-get state :ns) (plist-get state :block-id) streamed)
+      (if (plist-get state :inline)
+          ;; The row already exists; settle its preview in place instead of
+          ;; folding above the text that follows.
+          (progn
+            (dsh-emacs-render--render-thinking-block
+             (plist-get state :ns) (plist-get state :block-id)
+             streamed nil t)
+            (setq dsh-emacs--streaming-thinking nil))
+        (dsh-emacs-render--replace-live-thinking-text
+         (plist-get state :ns) (plist-get state :block-id) streamed))
       (push state (plist-get step :thinking-regions))
       (push (cons (plist-get state :ns) (plist-get state :block-id))
             (plist-get step :thinking-blocks)))))
@@ -1745,8 +1954,8 @@ or the display cannot render images (terminal Emacs keeps the placeholder)."
         (ignore-errors
           (create-image data type t :max-width box :max-height box))))))
 
-(defun dsh-emacs-render--open-image-data (data name)
-  "Show raw image DATA (unibyte string) in a dedicated image buffer."
+(defun dsh-emacs-render--open-image-data (data name &optional departure)
+  "Show raw image DATA in its buffer, with optional xref DEPARTURE marker."
   (let ((buffer (get-buffer-create
                  (format " *dsh image: %s*" (or name "image")))))
     (with-current-buffer buffer
@@ -1755,7 +1964,7 @@ or the display cannot render images (terminal Emacs keeps the placeholder)."
         (set-buffer-multibyte nil)
         (insert data))
       (image-mode))
-    (pop-to-buffer buffer)))
+    (dsh-emacs-ui-navigate (or departure (point-marker)) #'pop-to-buffer buffer)))
 
 (defun dsh-emacs-render--image-open ()
   "Open the image under point in its own buffer.
@@ -1764,16 +1973,17 @@ re-fetches them via `session/attachment'."
   (interactive)
   (let* ((data (get-text-property (point) 'dsh-emacs-image-data))
          (attachment-id (get-text-property (point) 'dsh-emacs-attachment-id))
-         (name (get-text-property (point) 'dsh-emacs-image-name)))
+         (name (get-text-property (point) 'dsh-emacs-image-name))
+         (departure (point-marker)))
     (cond
-     (data (dsh-emacs-render--open-image-data data name))
+     (data (dsh-emacs-render--open-image-data data name departure))
      (attachment-id
       (message "Fetching image…")
       (dsh-emacs-render--request-attachment
        (dsh-emacs--active-session-id) attachment-id
        (lambda (bytes)
          (if bytes
-             (dsh-emacs-render--open-image-data bytes name)
+             (dsh-emacs-render--open-image-data bytes name departure)
            (message "Image fetch failed")))))
      (t (message "Image bytes unavailable")))))
 
@@ -2031,40 +2241,228 @@ transcript shows the same notice."
          (dsh-protocol-message-source-kind
           (dsh-protocol-message--from-alist event))))
 
+(defun dsh-emacs-render--note-inbox-splice (event)
+  "Replay one `agent/inbox/spliced' EVENT for turn-trigger attribution.
+Only the inbox queues matter: dsh web paints a non-human message as a
+`turn-trigger' node when the latest claim admits it.  The next-turn claim
+wakes any target; a next-step claim wakes only step 1 (the idle-steer rule
+below).  A canceled removal admits nothing, and a requeued insertion leaves
+the claim again (see the web `InboxState').  This keeps display-only state
+and paints no row; returns EVENT's seq."
+  (let ((seq (dsh-protocol-event-sequence--from-alist event)))
+    (when-let* ((splice (dsh-protocol-inbox-splice--from-alist event))
+                (target (dsh-protocol-inbox-splice-target splice))
+                ((member target '("next-turn" "next-step"))))
+      (let* ((pending (alist-get target dsh-emacs-render--inbox-pending
+                                 nil nil #'equal))
+             (start (min (max 0 (or (dsh-protocol-inbox-splice-start
+                                     splice) 0))
+                         (length pending)))
+             (removed-count (max 0 (or (dsh-protocol-inbox-splice-removed-count
+                                        splice) 0)))
+             (end (min (length pending) (+ start removed-count)))
+             (removed (cl-subseq pending start end))
+             (kept (append (cl-subseq pending 0 start)
+                           (cl-subseq pending end)))
+             (at (min start (length kept)))
+             (inserted (dsh-protocol-inbox-splice-inserted splice)))
+        (setf (alist-get target dsh-emacs-render--inbox-pending nil nil #'equal)
+              (append (cl-subseq kept 0 at) inserted (cl-subseq kept at)))
+        ;; dsh web's `withoutInserted': a requeued id is not claimed.
+        (let ((claim (alist-get target dsh-emacs-render--inbox-claim
+                                nil nil #'equal)))
+          (when claim
+            (dolist (entry inserted)
+              (setf (plist-get claim :entries)
+                    (delete (assoc (car entry) (plist-get claim :entries))
+                            (plist-get claim :entries))))))
+        (when (and (> removed-count 0)
+                   (not (equal (dsh-protocol-inbox-splice-outcome splice)
+                               "canceled")))
+          ;; A page cut can drop the insertion but keep the claim; remember
+          ;; that the removed batch could not be materialized.
+          (setf (alist-get target dsh-emacs-render--inbox-claim
+                           nil nil #'equal)
+                (list :seq seq :entries removed
+                      :human (cl-some (lambda (entry)
+                                        (equal (cdr entry) "user"))
+                                      removed)
+                      :truncated (< (length pending)
+                                    (+ start removed-count))))
+          ;; The host claims before step 1 opens, so these removals are the
+          ;; turn's opening batch even when the page cut lost their entries.
+          (when (and dsh-emacs-render--turn-start-seq
+                     (null dsh-emacs-render--turn-step))
+            (setq dsh-emacs-render--turn-claim-slots
+                  (+ (or dsh-emacs-render--turn-claim-slots 0)
+                     removed-count))))))
+    seq))
+
+(defun dsh-emacs-render--claimed-p (target id)
+  "Whether ID is in TARGET's latest inbox claim."
+  (when-let* ((claim (alist-get target dsh-emacs-render--inbox-claim
+                                nil nil #'equal)))
+    (and (assoc id (plist-get claim :entries)) t)))
+
+(defun dsh-emacs-render--idle-steer-p (id)
+  "Whether ID is a non-human notice claimed into step 1 of this turn.
+dsh web's idle-steer rule: a step-1 claim after the turn started, no
+next-turn claim in that turn, and no human input in the same batch.  Without
+it a child message admitted while the parent is idle would wake a turn whose
+only attribution is hidden."
+  (when-let* ((turn-start dsh-emacs-render--turn-start-seq)
+              ((equal dsh-emacs-render--turn-step 1))
+              (claim (alist-get "next-step" dsh-emacs-render--inbox-claim
+                                nil nil #'equal))
+              (claim-seq (plist-get claim :seq))
+              ((integerp claim-seq))
+              ((> claim-seq turn-start))
+              ((not (plist-get claim :human))))
+    (let ((next-turn (alist-get "next-turn" dsh-emacs-render--inbox-claim
+                                nil nil #'equal)))
+      (and (or (null next-turn)
+               (let ((seq (plist-get next-turn :seq)))
+                 (or (not (integerp seq)) (< seq turn-start))))
+           (assoc id (plist-get claim :entries))
+           t))))
+
+(defconst dsh-emacs-render--waking-source-kinds
+  '("agent-message" "team-message" "subagent-settled" "webhook" "schedule"
+    "tool-jobs" "cordis-host-runner")
+  "Non-human sources known to wake a turn.
+The opener fallback uses this list so a truncated claim cannot turn a
+runtime-context or other injection into invented attribution.")
+
+(defun dsh-emacs-render--turn-opener-p ()
+  "Whether the current turn's opening input has not painted a row yet."
+  (and dsh-emacs-render--turn-start-seq
+       (not dsh-emacs-render--turn-opener-painted)))
+
+(defun dsh-emacs-render--truncated-claim-p ()
+  "Whether a claim made in this turn lost its queued messages.
+A history page can begin after the insertion that queued a notice; its claim
+then removes nothing and cannot name the admitted id.  Only a message in the
+turn's opening claim batch may use the fallback, and only for a known waking
+source."
+  (when-let* ((turn-start dsh-emacs-render--turn-start-seq))
+    (cl-some
+     (lambda (target)
+       (let ((claim (alist-get target dsh-emacs-render--inbox-claim
+                               nil nil #'equal)))
+         (and claim
+              (plist-get claim :truncated)
+              (let ((seq (plist-get claim :seq)))
+                (and (integerp seq) (> seq turn-start))))))
+     '("next-turn" "next-step"))))
+
+(defun dsh-emacs-render--turn-trigger-p (event)
+  "Whether EVENT is a non-human message claimed to open a turn.
+Mirrors dsh web's `turn-trigger' node: a `user/message' whose source is not
+`user' and whose id the latest next-turn claim admits, or the idle step-1
+next-step claim.  When a page cut kept the claim but lost the insertion, the
+turn's first known waking input within the opening claim batch still gets the
+row instead of reappearing as an orphan Completed summary.  The goal round
+keeps its own notice; every other injection that did not wake a turn stays
+hidden."
+  (when-let* ((message (dsh-protocol-message--from-alist event))
+              (id (dsh-protocol-message-id message))
+              (kind (dsh-protocol-message-source-kind message)))
+    (and (not (equal kind "user"))
+         (not (equal kind "goal"))
+         (or (dsh-emacs-render--claimed-p "next-turn" id)
+             (dsh-emacs-render--idle-steer-p id)
+             (and (member kind dsh-emacs-render--waking-source-kinds)
+                  (dsh-emacs-render--turn-opener-p)
+                  (> (or dsh-emacs-render--turn-claim-slots 0) 0)
+                  (dsh-emacs-render--truncated-claim-p))))))
+
+(defun dsh-emacs-render--turn-trigger-title (message)
+  "Return dsh web's trigger title for MESSAGE's recorded source.
+The source family is named, not inferred: an unknown or malformed source
+falls back to `Execution requested' without claiming an identity."
+  (pcase (dsh-protocol-message-source-kind message)
+    ("agent-message" "Task message received")
+    ("team-message" "Team message received")
+    ("subagent-settled" "Subtask status updated")
+    ("webhook" (if (equal (dsh-protocol-message-source-provider message)
+                          "github")
+                   "GitHub event received"
+                 "External event received"))
+    ("schedule" "Automation task")
+    ("tool-jobs" "Background task updated")
+    ("cordis-host-runner" "Plugin status updated")
+    (_ "Execution requested")))
+
+(defun dsh-emacs-render--trigger-body (event)
+  "Return EVENT's model-facing notice text, or nil.
+Adjacent text blocks join with no separator, as the provider flattens them
+\(matching dsh web's context body), so an injected `Agent … sent a message: '
+prefix stays on the sentence the child sent."
+  (let ((text (mapconcat
+               #'identity
+               (delq nil
+                     (mapcar #'dsh-protocol-content-block-text
+                             (cl-remove-if-not
+                              (lambda (block)
+                                (equal (dsh-protocol-content-block-kind block)
+                                       "text"))
+                              (dsh-protocol-message-content
+                               (dsh-protocol-message--from-alist event)))))
+               "")))
+    (unless (string-empty-p text) text)))
+
+(defun dsh-emacs-render--trigger-block (event label icon prefix status)
+  "Insert EVENT as a collapsed trigger notice named LABEL.
+ICON leads LABEL, PREFIX keys the fragment and STATUS separates the goal
+round from another turn trigger.  The model-facing body stays folded until
+inspected; an empty body leaves the row unfoldable."
+  (let ((body (dsh-emacs-render--trigger-body event))
+        (time (dsh-emacs-render--event-time event)))
+    (dsh-emacs-ui-update-fragment
+     (dsh-emacs-ui-make-fragment
+      :namespace-id (dsh-emacs-render--make-namespace)
+      :block-id (format "%s-%s" prefix (dsh-emacs-render--make-block-id event))
+      :label-left (concat icon " "
+                          (propertize label
+                                      'face (dsh-emacs-render--row-label-face
+                                             'dsh-emacs-meta-face)))
+      :label-right (and time
+                        (propertize time 'face 'dsh-emacs-timestamp-face))
+      :body body
+      :style 'minimal
+      :status status
+      :non-foldable (null body)
+      :padding t)
+     :create-new t :expanded nil
+     :insert-before (dsh-emacs-render--input-insert-point))))
+
 (defun dsh-emacs-render--goal-trigger-block (event)
   "Insert EVENT's goal round continuation as a collapsed trigger notice.
 Mirrors dsh web's `TurnTriggerNodeView': the goal dartboard, `Continuing
 goal' and the event clock over the injected round prompt, folded by default
 so the model-facing `<goal_round>' instruction stays out of the way until
 inspected.  An empty body leaves the row unfoldable."
-  (let* ((body (dsh-emacs-render--text-from-content
-                (dsh-protocol-message-content
-                 (dsh-protocol-message--from-alist event))))
-         (body (and (stringp body) (not (string-empty-p body)) body))
-         (time (dsh-emacs-render--event-time event)))
-    (dsh-emacs-ui-update-fragment
-     (dsh-emacs-ui-make-fragment
-      :namespace-id (dsh-emacs-render--make-namespace)
-      :block-id (format "goal-%s" (dsh-emacs-render--make-block-id event))
-      :label-left (concat
-                   (dsh-emacs-render--goal-trigger-icon)
-                   " "
-                   (propertize dsh-emacs-render--goal-trigger-label
-                               'face 'dsh-emacs-meta-face))
-      :label-right (and time
-                        (propertize time 'face 'dsh-emacs-timestamp-face))
-      :body body
-      :style 'minimal
-      :status 'goal-trigger
-      :non-foldable (null body)
-      :padding t)
-     :create-new t :expanded nil
-     :insert-before (dsh-emacs-render--input-insert-point))))
+  (dsh-emacs-render--trigger-block
+   event dsh-emacs-render--goal-trigger-label
+   (dsh-emacs-render--goal-trigger-icon) "goal" 'goal-trigger))
+
+(defun dsh-emacs-render--turn-trigger-block (event)
+  "Insert EVENT as dsh web's turn-trigger notice.
+A non-human message claimed to open a turn is attribution, not conversation:
+the row names the source family, carries the event clock and folds the
+recorded notice body until inspected.  Showing it keeps the turn's
+`Completed in …' summary from reading as an unprompted reply."
+  (dsh-emacs-render--trigger-block
+   event
+   (dsh-emacs-render--turn-trigger-title
+    (dsh-protocol-message--from-alist event))
+   (dsh-emacs-render--turn-trigger-icon) "trigger" 'turn-trigger))
 
 (defun dsh-emacs-render-user-message (event &optional references)
   "Render a `user/message' event with a left rail and the user block face.
 The block gets two blank lines before and one after (see
-`dsh-emacs-render--insert-chat-message' and `dsh-emacs-ui--blank-above-preserve').
+`dsh-emacs-render--insert-chat-message' and
+`dsh-emacs-ui--blank-above-preserve').
 Image content blocks render below the text like dsh web's message gallery:
 every image is a compact thumbnail in wrapping rows (four text lines tall by
 default), whether the message carries one image or several.
@@ -2073,15 +2471,30 @@ Inline base64 shows immediately, attachment refs fill in when
 RET or mouse-1 opens the original.  File content blocks render as
 display-only `[file: name · size]' lines (see
 `dsh-emacs-render--file-placeholder').
-A host-injected goal round continuation renders its trigger notice instead
-\(see `dsh-emacs-render--goal-trigger-block').  Optional REFERENCES (list of
+A host-injected goal round continuation renders its trigger notice; a
+non-human message an inbox claim woke renders dsh web's turn-trigger notice
+\(see `dsh-emacs-render--goal-trigger-block' and
+`dsh-emacs-render--turn-trigger-block').  Optional REFERENCES (list of
 \(LABEL . SESSION-ID)) from the immediately following `session-reference'
 recall event lets the readable `@label' session tokens the server persisted
 \(canonical id stripped) render as real session chips; see
 `dsh-emacs-reference-fontify'.  Returns the event seq."
-  (if (dsh-emacs-render--goal-continuation-p event)
-      (dsh-emacs-render--goal-trigger-block event)
-    (dsh-emacs-render--insert-user-block event references))
+  (let ((painted
+         (cond
+          ((dsh-emacs-render--goal-continuation-p event)
+           (dsh-emacs-render--goal-trigger-block event)
+           t)
+          ((dsh-emacs-render--turn-trigger-p event)
+           (dsh-emacs-render--turn-trigger-block event)
+           t)
+          (t (dsh-emacs-render--insert-user-block event references)))))
+    (when (and dsh-emacs-render--turn-start-seq painted)
+      (setq dsh-emacs-render--turn-opener-painted t))
+    (when (and dsh-emacs-render--turn-start-seq
+               (integerp dsh-emacs-render--turn-claim-slots)
+               (> dsh-emacs-render--turn-claim-slots 0))
+      (setq dsh-emacs-render--turn-claim-slots
+            (1- dsh-emacs-render--turn-claim-slots))))
   (dsh-protocol-event-sequence--from-alist event))
 
 (defun dsh-emacs-render-delete-user-message (start end)
@@ -2105,7 +2518,6 @@ submission was pending.  Reply text and per-turn facts remain unchanged."
          (content (dsh-protocol-message-content message))
          (text (dsh-emacs-render--text-from-content content))
          (reasoning (dsh-emacs-render--reasoning-from-content content))
-         (ts (dsh-emacs-render--event-time event))
          (key (dsh-protocol-stream-key--from-alist event))
          (ns (dsh-emacs-render--make-namespace))
          (block-id (dsh-emacs-render--make-block-id event))
@@ -2113,7 +2525,7 @@ submission was pending.  Reply text and per-turn facts remain unchanged."
          ;; If reasoning arrives only in the final message, reserve its
          ;; position before text is inserted or its live markers released.
          (reasoning-position
-          (when (and dsh-emacs-show-reasoning (not (string-empty-p reasoning)))
+          (when (and dsh-emacs-show-thinking (not (string-empty-p reasoning)))
             (copy-marker
              (or (plist-get (car (last (plist-get step :text-regions))) :start)
                  (and (equal key (plist-get dsh-emacs--streaming-assistant
@@ -2161,14 +2573,22 @@ submission was pending.  Reply text and per-turn facts remain unchanged."
     ;; Finish text before replacing earlier fragments: removing a Think row
     ;; can put the following text's start at the insertion boundary. Active
     ;; text repair must not mistake the replacement Think for its own body.
-    (unless (equal (plist-get step :reasoning) reasoning)
-      ;; A corrected or removed reasoning body replaces its old fragments
-      ;; where they first appeared, rather than being appended after text.
+    (cond
+     ;; Inline style: keep one row per streamed block where it appeared.  Only
+     ;; a block added or removed by the correction falls back to the folded
+     ;; row, which then still sits before the answer.
+     ((and (eq dsh-emacs-thinking-style 'inline)
+           dsh-emacs-show-thinking
+           (plist-get step :thinking-regions)
+           (dsh-emacs-render--reconcile-inline-thinking step content)))
+     ((not (equal (plist-get step :reasoning) reasoning))
+      ;; The `expand' style replaces the old fragments where they first
+      ;; appeared, rather than appending the corrected body after text.
       (let ((position (dsh-emacs-render--drop-committed-thinking step)))
-        (when (and dsh-emacs-show-reasoning (not (string-empty-p reasoning)))
+        (when (and dsh-emacs-show-thinking (not (string-empty-p reasoning)))
           (dsh-emacs-render--render-thinking-block
-           ns block-id reasoning ts
-           (or position reasoning-position)))))
+           ns block-id reasoning
+           (or position reasoning-position))))))
     (when reasoning-position (set-marker reasoning-position nil))
     ;; Deferred jobs retain their markers until their idle render completes.
     (dolist (state (plist-get step :text-regions))
@@ -2186,26 +2606,44 @@ submission was pending.  Reply text and per-turn facts remain unchanged."
     seq))
 
 (defun dsh-emacs-render--render-thinking-block
-    (namespace-id block-id text timestamp insert-point &optional update)
+    (namespace-id block-id text insert-point &optional update running)
   "Render a collapsible <details>-style thinking block.
-UPDATE refreshes the existing block while preserving its fold state."
+UPDATE refreshes the existing block while preserving its fold state.
+RUNNING selects the live preview (latest completed paragraph); otherwise the
+settled preview names the first sentence.  A new row starts collapsed."
   (dsh-emacs-ui-update-fragment
    (dsh-emacs-ui-make-fragment
     :namespace-id namespace-id
     :block-id block-id
-    :label-left (propertize (concat (dsh-emacs-render--think-icon) " " "Think")
-                            'face 'dsh-emacs-thinking-face)
-    :label-right (or (dsh-emacs-render--thinking-preview text)
-                     (or timestamp ""))
-    :body text
+    :label-left (concat
+                 ;; The completed fragment outlives the live stream.  In
+                 ;; `simple' its dot settles to the same muted grey as the
+                 ;; label; `full' keeps the thinking accent.
+                 (propertize (dsh-emacs-render--think-icon)
+                             'face (if (eq dsh-emacs-render-style 'simple)
+                                       'dsh-emacs-event-row-face
+                                     'dsh-emacs-thinking-face))
+                 (propertize " Think"
+                             'face (dsh-emacs-render--row-label-face
+                                    'dsh-emacs-thinking-face)))
+    ;; No clock fallback: dsh web's row is the label alone without a preview.
+    :label-right (if running
+                    (dsh-emacs-render--thinking-live-preview text)
+                  (dsh-emacs-render--thinking-preview text))
+    ;; A deferred body keeps a collapsed live row cheap: minimal fragments do
+    ;; not render a function body until the reader expands it.
+    :body (if running
+              (let ((running-text text))
+                (lambda () running-text))
+            text)
     :style 'minimal
     :status 'thinking
-    ;; Reasoning text is muted everywhere except the label: the header chrome
-    ;; (separator + preview) and the body share the body face.  The label's
-    ;; own face is embedded above, so it wins over the header face.
+    ;; Reasoning text is muted in both styles: the header chrome (separator +
+    ;; preview) and the body share the body face.  In `full' the label keeps
+    ;; the thinking accent above it; `simple' leaves it neutral.
     :header-face 'dsh-emacs-thinking-body-face
     :body-face 'dsh-emacs-thinking-body-face)
-   :create-new (not update) :expanded dsh-emacs-thinking-expand-by-default
+   :create-new (not update)
    :insert-before insert-point))
 
 ;;; ---------------------------------------------------------------------------
@@ -2292,15 +2730,15 @@ the transcript; a nil/empty LIST or `dsh-emacs-show-todos' nil renders nothing."
            (summary-only dsh-emacs-todo-summary-only)
            (sum (dsh-emacs-render--todo-summary list))
            (body (unless summary-only (dsh-emacs-render--todo-body list)))
-           ;; Title + summary in the todo green accent (`dsh-emacs-todo-text-face',
-           ;; non-italic); the leading checklist icon keeps the tool purple.
+           ;; Title + summary in the todo green accent in `full'; `simple'
+           ;; leaves them neutral so only the leading dot carries color.
            ;; Separator: one space each side.
+           (label-face (dsh-emacs-render--row-label-face
+                        'dsh-emacs-todo-text-face))
            (label (concat (dsh-emacs-render--todo-icon) " "
-                          (propertize dsh-emacs-todo-title
-                                      'face 'dsh-emacs-todo-text-face)
+                          (propertize dsh-emacs-todo-title 'face label-face)
                           " · "
-                          (propertize sum
-                                      'face 'dsh-emacs-todo-text-face))))
+                          (propertize sum 'face label-face))))
       (dsh-emacs-ui-update-fragment
        (dsh-emacs-ui-make-fragment
         :namespace-id dsh-emacs--todo-namespace
@@ -2341,7 +2779,7 @@ transcript; they are removed with the buffer on a session reset/replay."
 
 (defun dsh-emacs-render--open-plan (button)
   "Open the historical document carried by BUTTON."
-  (pop-to-buffer
+  (dsh-emacs-ui-navigate (point-marker) #'pop-to-buffer
    (dsh-emacs-plan--show
     (current-buffer) (button-get button 'dsh-emacs-plan--call-id)
     (button-get button 'dsh-emacs-plan--markdown))))
@@ -2419,7 +2857,9 @@ Todo snapshots still apply when ordinary tool cards are hidden."
              (insert-point (dsh-emacs-render--input-insert-point))
              (ts (dsh-emacs-render--event-time event))
              (label-left (concat icon " "
-                                 (propertize title 'face 'dsh-emacs-tool-title-face)))
+                                 (propertize title
+                                     'face (dsh-emacs-render--row-label-face
+                                            'dsh-emacs-tool-title-face))))
              (label-right (or summary ""))
              (block-id (dsh-emacs-render--tool-call-block-id call-id)))
         ;; Track state for later (tool/result will update this block).
@@ -2436,9 +2876,10 @@ Todo snapshots still apply when ordinary tool cards are hidden."
           :body display-body
           :style 'minimal
           :status 'tool-pending
-          ;; The state tint covers the header row only, never the body: the
-          ;; expanded card content must not inherit the row's accent.
-          :header-face 'dsh-emacs-tool-pending-face)
+          ;; In `full', the state tint covers the header row only, never the
+          ;; body; `simple' keeps the header neutral for the colored dot.
+          :header-face (dsh-emacs-render--row-chrome-face
+                        'dsh-emacs-tool-pending-face))
          :create-new t
          :expanded dsh-emacs-tool-expand-by-default
          :insert-before insert-point))
@@ -2451,11 +2892,22 @@ Todo snapshots still apply when ordinary tool cards are hidden."
 (defun dsh-emacs-render--tool-leading (icon state)
   "Leading glyph for a tool row, mirroring dsh web's `leadingFor`:
 ok/running keep the variant ICON; error/stopped are overridden by a
-colored status dot (red / warning-yellow)."
-  (pcase state
-    ('error  "● ")
-    ('stopped "◐ ")
-    (_ (concat icon " "))))
+colored status dot (red / warning-yellow).
+With `dsh-emacs-render-style' `simple', every state uses one dot:
+pending keeps the tool accent, success is green, error red, and stopped
+takes the interrupted face."
+  (if (eq dsh-emacs-render-style 'simple)
+      (concat (dsh-emacs-render--simple-icon
+               (pcase state
+                 ('success 'dsh-emacs-tool-success-face)
+                 ('error 'dsh-emacs-tool-error-face)
+                 ('stopped 'dsh-emacs-tool-stopped-face)
+                 (_ 'dsh-emacs-tool-icon-face)))
+              " ")
+    (pcase state
+      ('error  "● ")
+      ('stopped "◐ ")
+      (_ (concat icon " ")))))
 
 (defconst dsh-emacs-render--tool-io-label-width 3
   "Width of the generic ioCard's section-label column.
@@ -2990,7 +3442,7 @@ generic card."
 ;;; and the answer reader below consume.  The card records the decision
 ;;; instead of dumping the two JSON documents into an ioCard: every question
 ;;; with its numbered options and descriptions, the chosen options marked, and
-;;; `Not answered' where the batch settled empty.  A call whose arguments name
+;;; `Skipped' where the batch settled empty.  A call whose arguments name
 ;;; no usable question keeps the generic ioCard.
 
 (defun dsh-emacs-render--ask-summary (answers error-code settled &optional pending)
@@ -3020,16 +3472,20 @@ outcome, which the caller reports with its result preview."
 The question's own HEADER is the chip dsh web shows as its eyebrow and leads
 the row in the accent face; a batch of several questions prefixes the index as
 `Q2 · '.  Both parts are optional, so a bare question still renders as one
-clean row."
+clean row: empty TEXT falls back to the chip, then to \"Question\"."
   (let* ((number (and multi (concat "Q" (number-to-string index) " · ")))
          (chip (and (stringp header)
                     (not (string-empty-p header))
-                    (propertize header 'face 'dsh-emacs-accent-face))))
+                    (propertize header 'face 'dsh-emacs-accent-face)))
+         (text (and (stringp text)
+                    (not (string-empty-p text))
+                    text))
+         (label (or text (and (not chip) "Question"))))
     (concat "  "
             (and number (propertize number 'face 'dsh-emacs-tool-meta-face))
             chip
-            (and chip " — ")
-            text)))
+            (and chip label " — ")
+            label)))
 
 (defun dsh-emacs-render--ask-question-block (question index multi answer)
   "Return one ask QUESTION as a block of body rows, joined by newlines.
@@ -3039,7 +3495,7 @@ cell, or nil while the call runs.  Every option keeps the reader's own
 numbering, with the chosen ones checked and accented; an option's description
 hangs at the label column in `dsh-emacs-meta-face' (the transcript's note
 face), and a settled question closes with its free-text answer or
-`Not answered'."
+`Skipped'."
   (let* ((selected (nth 1 answer))
          (custom (nth 2 answer))
          (rows (list (dsh-emacs-render--ask-question-row
@@ -3073,7 +3529,7 @@ face), and a settled question closes with its free-text answer or
                                 (propertize "→ " 'face 'dsh-emacs-accent-face)
                                 custom))
                        ((and answer (null selected))
-                        (concat "  " (propertize "Not answered"
+                        (concat "  " (propertize "Skipped"
                                                  'face
                                                  'dsh-emacs-tool-meta-face))))))
       (mapconcat #'identity
@@ -3315,7 +3771,9 @@ tracking belongs to `dsh-emacs-render-tool-result'."
           :block-id block-id
           :label-left (concat
                        (dsh-emacs-render--tool-leading icon state)
-                       (propertize title 'face 'dsh-emacs-tool-title-face))
+                       (propertize title
+                       'face (dsh-emacs-render--row-label-face
+                              'dsh-emacs-tool-title-face)))
           :label-right (if (string-empty-p row-summary)
                            (dsh-emacs-render--tool-result-preview
                             full-text)
@@ -3324,9 +3782,10 @@ tracking belongs to `dsh-emacs-render-tool-result'."
           :style 'minimal
           ;; A cleared goal has no fields to unfold.
           :non-foldable goal-cleared
-          ;; State tint on the header row only: the ioCard body keeps its
-          ;; own neutral faces instead of inheriting the status accent.
-          :header-face face
+          ;; In `full', the state tint covers the header row only; the body
+          ;; keeps its own neutral faces.  `simple' leaves the header neutral
+          ;; for the colored dot.
+          :header-face (dsh-emacs-render--row-chrome-face face)
           :status (pcase state
                     ('success 'tool-success)
                     ('error 'tool-error)
@@ -3454,15 +3913,72 @@ unfold preserve the styling."
      (dsh-emacs-fork-session dsh-emacs--buffer-session
                              (button-get button 'dsh-emacs-reply-seq)))))
 
+(defun dsh-emacs-render--reply-footer-label (turn state items subagent)
+  "Return TURN's footer label from STATE and configured ITEMS, or nil.
+SUBAGENT suppresses Fork.  Buttons retain the reply text and sequence from
+STATE.  Build the propertized string without accessing transcript state."
+  (let ((seq (plist-get state :reply-seq))
+        (usage (list :input 0 :output 0 :cache-read 0 :cache-write 0))
+        (complete (plist-get state :start-seq))
+        reported parts)
+    (dolist (entry (plist-get state :messages))
+      (if (null (cdr entry))
+          (setq complete nil)
+        (setq reported t)
+        (dolist (key '(:input :output :cache-read :cache-write))
+          (cl-incf (plist-get usage key) (plist-get (cdr entry) key)))))
+    (dolist (item (delete-dups (copy-sequence items)))
+      (pcase item
+        ((or 'copy 'fork)
+         (unless (and (eq item 'fork) subagent)
+           (push (make-text-button
+                  (if (eq item 'copy) "Copy" "Fork") nil
+                  'follow-link t
+                  'mouse-face 'highlight 'action #'dsh-emacs-render--reply-action
+                  'help-echo (if (eq item 'copy) "Copy this reply as Markdown"
+                               "Branch through this reply")
+                  'dsh-emacs-reply-action item 'dsh-emacs-reply-seq seq
+                  'dsh-emacs-reply-text (plist-get state :text)) parts)))
+        ('usage
+         (push (propertize
+                (if reported
+                    (format "Tokens %s%s" (if complete "" "≥")
+                            (dsh-emacs-format-tokens
+                             (apply #'+ (cl-loop for (_key value) on usage by #'cddr
+                                                 collect value))))
+                  "Tokens —")
+                'help-echo
+                (format "Turn %s: input %d, output %d, cache read %d, cache write %d%s"
+                        turn (plist-get usage :input) (plist-get usage :output)
+                        (plist-get usage :cache-read) (plist-get usage :cache-write)
+                        (if (and complete reported) ""
+                          "; incomplete history or missing reported usage"))) parts))
+        ('duration
+         (let ((start (plist-get state :start-time))
+               (finish (plist-get state :end-time)))
+           (push (propertize
+                  (if (and (numberp start) (numberp finish) (>= finish start))
+                      (let ((seconds (/ (- finish start) 1000.0)))
+                        (if (< seconds 60) (format "Time %.1fs" seconds)
+                          (format "Time %dm%02ds" (/ (floor seconds) 60)
+                                  (% (floor seconds) 60))))
+                    "Time —")
+                  'help-echo "Turn elapsed time, including tools and waits; server timestamps")
+                 parts)))))
+    (when parts
+      (let ((label (mapconcat #'identity (nreverse parts) "  ·  ")))
+        ;; Prepend to the title face `dsh-emacs-ui--top-border' appends;
+        ;; its explicit normal weight keeps the row muted.
+        (add-face-text-property 0 (length label)
+                                'dsh-emacs-reply-meta-face t label)
+        label))))
+
 (defun dsh-emacs-render--reply-footer (turn state)
   "Paint TURN's footer from STATE, after its final transcript content."
   (when (and (plist-get state :end-seq) (plist-get state :reply-seq))
     (let ((pos (point-min))
           (seq (plist-get state :reply-seq))
-          (usage (list :input 0 :output 0 :cache-read 0 :cache-write 0))
-          (complete (plist-get state :start-seq))
-          (reported nil)
-          end parts)
+          end)
       ;; A reply may have several text segments separated by Think cards.
       ;; Find its final segment without treating the toolbar as reply text.
       (while (setq pos (text-property-any pos (point-max)
@@ -3521,86 +4037,38 @@ unfold preserve the styling."
                                                'dsh-emacs-event-block id #'equal)))
                              (prop-match-end match)))))))
           (setq end (max end tail)))
-        (dolist (entry (plist-get state :messages))
-          (if (null (cdr entry))
-              (setq complete nil)
-            (setq reported t)
-            (dolist (key '(:input :output :cache-read :cache-write))
-              (cl-incf (plist-get usage key) (plist-get (cdr entry) key)))))
-        (dolist (item (delete-dups (copy-sequence dsh-emacs-reply-footer-items)))
-          (pcase item
-            ((or 'copy 'fork)
-             (unless (and (eq item 'fork) (bound-and-true-p dsh-emacs--buffer-subagent))
-               (push (make-text-button
-                      (if (eq item 'copy) "Copy" "Fork") nil
-                      'follow-link t
-                      'mouse-face 'highlight 'action #'dsh-emacs-render--reply-action
-                      'help-echo (if (eq item 'copy) "Copy this reply as Markdown"
-                                   "Branch through this reply")
-                      'dsh-emacs-reply-action item 'dsh-emacs-reply-seq seq
-                      'dsh-emacs-reply-text (plist-get state :text)) parts)))
-            ('usage
-             (push (propertize
-                    (if reported
-                        (format "Tokens %s%s" (if complete "" "≥")
-                                (dsh-emacs-format-tokens
-                                 (apply #'+ (cl-loop for (_key value) on usage by #'cddr
-                                                     collect value))))
-                      "Tokens —")
-                    'help-echo
-                    (format "Turn %s: input %d, output %d, cache read %d, cache write %d%s"
-                            turn (plist-get usage :input) (plist-get usage :output)
-                            (plist-get usage :cache-read) (plist-get usage :cache-write)
-                            (if (and complete reported) ""
-                              "; incomplete history or missing reported usage"))) parts))
-            ('duration
-             (let ((start (plist-get state :start-time))
-                   (finish (plist-get state :end-time)))
-               (push (propertize
-                      (if (and (numberp start) (numberp finish) (>= finish start))
-                          (let ((seconds (/ (- finish start) 1000.0)))
-                            (if (< seconds 60) (format "Time %.1fs" seconds)
-                              (format "Time %dm%02ds" (/ (floor seconds) 60)
-                                      (% (floor seconds) 60))))
-                        "Time —")
-                      'help-echo "Turn elapsed time, including tools and waits; server timestamps")
-                     parts)))))
-        (when parts
-          (setq parts (nreverse parts))
-          (let ((label (mapconcat #'identity parts "  ·  ")))
-            ;; Prepend to the title face `dsh-emacs-ui--top-border' appends;
-            ;; its explicit normal weight keeps the row muted.
-            (add-face-text-property 0 (length label)
-                                    'dsh-emacs-reply-meta-face t label)
-            (let ((range
-                   (dsh-emacs-ui-update-fragment
-                    (dsh-emacs-ui-make-fragment
-                     :namespace-id (dsh-emacs-render--make-namespace)
-                     :block-id (format "reply-footer-%s" turn)
-                     :label-left label
-                     ;; Keep a trailing gap when history adds this row after
-                     ;; the next user message reserved its leading whitespace.
-                     :padding t
-                     :style 'minimal :status 'reply-footer :non-foldable t
-                     :header-face 'dsh-emacs-reply-meta-face)
-                    :insert-before (save-excursion
-                                     (goto-char end)
-                                     (unless (bolp) (forward-line 1))
-                                     (point)))))
-              ;; This padded row already ends with its own blank line.  When a
-              ;; following message reserved one before the row existed, drop
-              ;; the duplicate so the next question keeps a single blank line.
-              ;; Never touch an authored leading blank line or a fragment.
-              (when (and (eq (char-after (cdr range)) ?\n)
-                         (not (get-text-property
-                               (cdr range) 'dsh-emacs-ui-state))
-                         (not (get-text-property
-                               (cdr range) 'dsh-emacs-user-message))
-                         (not (get-text-property
-                               (cdr range) 'dsh-emacs-assistant-message)))
-                (let ((inhibit-read-only t)
-                      (buffer-undo-list t))
-                  (delete-region (cdr range) (1+ (cdr range))))))))))))
+        (when-let* ((label (dsh-emacs-render--reply-footer-label
+                            turn state dsh-emacs-reply-footer-items
+                            (bound-and-true-p dsh-emacs--buffer-subagent))))
+          (let ((range
+                 (dsh-emacs-ui-update-fragment
+                  (dsh-emacs-ui-make-fragment
+                   :namespace-id (dsh-emacs-render--make-namespace)
+                   :block-id (format "reply-footer-%s" turn)
+                   :label-left label
+                   ;; Keep a trailing gap when history adds this row after
+                   ;; the next user message reserved its leading whitespace.
+                   :padding t
+                   :style 'minimal :status 'reply-footer :non-foldable t
+                   :header-face 'dsh-emacs-reply-meta-face)
+                  :insert-before (save-excursion
+                                   (goto-char end)
+                                   (unless (bolp) (forward-line 1))
+                                   (point)))))
+            ;; This padded row already ends with its own blank line.  When a
+            ;; following message reserved one before the row existed, drop
+            ;; the duplicate so the next question keeps a single blank line.
+            ;; Never touch an authored leading blank line or a fragment.
+            (when (and (eq (char-after (cdr range)) ?\n)
+                       (not (get-text-property
+                             (cdr range) 'dsh-emacs-ui-state))
+                       (not (get-text-property
+                             (cdr range) 'dsh-emacs-user-message))
+                       (not (get-text-property
+                             (cdr range) 'dsh-emacs-assistant-message)))
+              (let ((inhibit-read-only t)
+                    (buffer-undo-list t))
+                (delete-region (cdr range) (1+ (cdr range)))))))))))
 
 (defun dsh-emacs-render--activity-summary (calls)
   "Summarize CALLS, an ordered list of (ID . NAME), as in Web's processTitle.
@@ -3751,7 +4219,8 @@ process.  Their final answer, if any, remains outside that outer fold."
                                     (point) 'dsh-emacs-user-message nil end)))
                        ((memq (map-elt (get-text-property
                                         (point) 'dsh-emacs-ui-state) :status)
-                              '(goal-trigger reply-footer work-details))
+                              '(goal-trigger turn-trigger reply-footer
+                                work-details))
                         (goto-char (next-single-property-change
                                     (point) 'dsh-emacs-ui-state nil end)))))))
         (let* ((start (copy-marker (line-beginning-position)))
@@ -3780,8 +4249,9 @@ process.  Their final answer, if any, remains outside that outer fold."
                       "Completed"))))))
           ;; Mid-turn automatic input has a visible trigger rather than a bubble.
           (while (and (not interleaved) (< (point) end))
-            (when (eq (map-elt (get-text-property (point) 'dsh-emacs-ui-state)
-                               :status) 'goal-trigger)
+            (when (memq (map-elt (get-text-property
+                                  (point) 'dsh-emacs-ui-state) :status)
+                        '(goal-trigger turn-trigger))
               (setq interleaved t))
             (goto-char (next-single-property-change
                         (point) 'dsh-emacs-ui-state nil end)))
@@ -3908,7 +4378,13 @@ or re-fetched history whose tail is a `turn/start' without a matching
 running spinner (idempotent — the send path already lit it, and a
 `turn/end' later clears it)."
   ;; A turn started (or a still-open turn was replayed after a reconnect /
-  ;; session reopen): light the mode-line running spinner.
+  ;; session reopen): light the mode-line running spinner.  The turn start
+  ;; also bounds dsh web's idle-steer inbox classification.
+  (setq dsh-emacs-render--turn-start-seq
+        (dsh-protocol-event-sequence--from-alist event)
+        dsh-emacs-render--turn-step nil
+        dsh-emacs-render--turn-opener-painted nil
+        dsh-emacs-render--turn-claim-slots nil)
   (unless (dsh-emacs-render--history-page-p)
     (dsh-emacs--ml-busy-set t))
   (dsh-protocol-event-sequence--from-alist event))
@@ -3923,22 +4399,53 @@ running spinner (idempotent — the send path already lit it, and a
              (eq t (frame-focus-state (window-frame window))))
            (get-buffer-window-list (or buffer (current-buffer)) nil t)))
 
+(defun dsh-emacs-notify--server-p ()
+  "Return non-nil when this Emacs is serving emacsclient."
+  (and (boundp 'server-process)
+       (processp server-process)
+       (process-live-p server-process)))
+
+(defun dsh-emacs-notify--macos-arguments (session-id title body)
+  "Return `terminal-notifier' arguments for SESSION-ID with TITLE and BODY.
+The click action evaluates `dsh-emacs-notify--open' in this Emacs through
+`emacsclient', then activates the Emacs bundle."
+  (let* ((client (executable-find "emacsclient"))
+         (form (format "(dsh-emacs-notify--open %S)" session-id)))
+    (list "-title" title
+          "-message" body
+          "-group" (concat "dsh-" session-id)
+          "-activate" "org.gnu.Emacs"
+          "-execute" (concat (shell-quote-argument client)
+                             " --eval " (shell-quote-argument form)))))
+
 (defun dsh-emacs-notify--post (session-id body &optional buffer)
   "Post BODY for SESSION-ID unless its chat is already visible.
 The visibility gate applies to BUFFER (default: the current buffer, which
 is the chat buffer when called from the render dispatch); SESSION-ID only
-identifies the chat for the notification title."
+identifies the chat for the notification title.  A click reopens that chat
+where the backend supports notification actions: D-Bus on GNU/Linux, or
+`terminal-notifier' plus a running emacsclient server on macOS."
   (when (and dsh-emacs-enable-notifications
              (not (dsh-emacs-notify--visible-p buffer)))
-    (let ((title (or (and (stringp session-id)
-                          (dsh-emacs--chat-title session-id))
-                     (buffer-name (or buffer (current-buffer))))))
+    (let* ((session (and (stringp session-id)
+                         (not (string-empty-p session-id))
+                         session-id))
+           (title (or (and session (dsh-emacs--chat-title session))
+                      (buffer-name (or buffer (current-buffer))))))
       (setq title (replace-regexp-in-string "[[:cntrl:]]" " " title)
             body (replace-regexp-in-string "[[:cntrl:]]" " " body))
       (condition-case err
           (cond
            ((fboundp 'w32-notification-notify)
             (w32-notification-notify :title title :body body))
+           ((and session
+                 (eq system-type 'darwin)
+                 (dsh-emacs-notify--server-p)
+                 (executable-find "terminal-notifier")
+                 (executable-find "emacsclient"))
+            (apply #'start-process "dsh-notification" nil
+                   (executable-find "terminal-notifier")
+                   (dsh-emacs-notify--macos-arguments session title body)))
            ((fboundp 'ns-do-applescript)
             (ns-do-applescript
              (format "display notification %S with title %S" body title)))
@@ -3949,8 +4456,15 @@ identifies the chat for the notification title."
            ((and (featurep 'dbusbind)
                  (ignore-errors (require 'notifications nil t))
                  (fboundp 'notifications-notify))
-            (notifications-notify :title title :body body
-                                  :app-name "dsh-emacs"))
+            (apply #'notifications-notify
+                   (append (list :title title :body body
+                                 :app-name "dsh-emacs")
+                           (when session
+                             (list :actions '("default" "Open session")
+                                   :on-action
+                                   (lambda (_id action)
+                                     (when (equal action "default")
+                                       (dsh-emacs-notify--open session))))))))
            ((executable-find "notify-send")
             (start-process "dsh-notification" nil "notify-send" title body))
            (t (message "dsh: %s — %s" title body)))
@@ -3970,7 +4484,12 @@ spinner."
   (let ((turn (dsh-protocol-turn--from-alist event)))
     (when (integerp turn)
       (dsh-emacs-render--flush-deliverables turn)))
-  ;; The turn finished: stop the mode-line running spinner.
+  ;; The turn finished: stop the mode-line running spinner and drop the
+  ;; attribution bounds (no message can belong to a closed turn).
+  (setq dsh-emacs-render--turn-start-seq nil
+        dsh-emacs-render--turn-step nil
+        dsh-emacs-render--turn-opener-painted nil
+        dsh-emacs-render--turn-claim-slots nil)
   (unless (dsh-emacs-render--history-page-p)
     (dsh-emacs--ml-busy-set nil))
   ;; A failed run must not be silently swallowed: dsh signals it as
@@ -4002,7 +4521,9 @@ BLOCK-ID identifies the fragment.  Keep the explanation expanded initially."
       :namespace-id ns
       :block-id bid
       :label-left (concat (dsh-emacs-render--event-icon 'error) " "
-                          (propertize label 'face 'dsh-emacs-tool-title-face))
+                          (propertize label
+                                      'face (dsh-emacs-render--row-label-face
+                                             'dsh-emacs-tool-title-face)))
       :label-right (when detail
                      (propertize detail 'face 'dsh-emacs-timestamp-face))
       :body text
@@ -4035,7 +4556,8 @@ their own error card.  Neither the old conversation nor input history changes."
         :label-left (concat
                      (dsh-emacs-render--tool-icon "bash") " "
                      (propertize "Automatic compaction"
-                                 'face 'dsh-emacs-tool-title-face))
+                                 'face (dsh-emacs-render--row-label-face
+                                        'dsh-emacs-tool-title-face)))
         :label-right
         (propertize
          (string-join
@@ -4089,7 +4611,7 @@ Returns the record-ordered content as one newline-joined string."
       (let ((type (dsh-protocol-assistant-record-type record)))
         (pcase type
           ((or "text-chunks" "reasoning-chunks")
-           (when (or dsh-emacs-show-reasoning
+           (when (or dsh-emacs-show-thinking
                      (equal type "text-chunks"))
              (let ((text (apply #'concat
                                 (dsh-protocol-assistant-record-texts record))))
@@ -4103,7 +4625,7 @@ Returns the record-ordered content as one newline-joined string."
                     (concat "→ " (or name "tool")
                             (unless (string-empty-p args)
                               (concat " " args)))
-                    dsh-emacs-tool-call-chars)
+                    dsh-emacs-max-tool-call-chars)
                    parts))))))
     (mapconcat #'identity (nreverse parts) "\n")))
 
@@ -4138,9 +4660,13 @@ when visible content was removed."
             (delq state dsh-emacs--markdown-pending))
       (when (plist-get state :markdown)
         (dsh-emacs-render--reset-markdown-state state))
-      (delete-region (plist-get state :start) (plist-get state :end))
-      (set-marker (plist-get state :start) nil)
-      (set-marker (plist-get state :end) nil)
+      (if (plist-get state :inline)
+          ;; A live inline row is a fragment, not a raw region.
+          (dsh-emacs-ui-delete-fragment (plist-get state :ns)
+                                        (plist-get state :block-id))
+        (delete-region (plist-get state :start) (plist-get state :end))
+        (set-marker (plist-get state :start) nil)
+        (set-marker (plist-get state :end) nil))
       (when (eq state dsh-emacs--streaming-assistant)
         (setq dsh-emacs--streaming-assistant nil))
       (when (eq state dsh-emacs--streaming-thinking)
@@ -4148,6 +4674,63 @@ when visible content was removed."
     (when (< (buffer-size) size)
       (dsh-emacs-render--follow-stream windows)
       t)))
+
+(defun dsh-emacs-render--attempt-cards (facts)
+  "Classify one turn's decoded FACTS without reading or changing buffer state.
+FACTS is a seq-ordered alist of (SEQ . EXECUTION-EVENT), already merged by
+`dsh-emacs-render--note-attempt-outcome'.  Return fresh card plists, newest
+attempt first, with :event, :label and :cause.  Event objects remain borrowed
+from FACTS; neither they nor the input alist are modified."
+  (let (pending waiting cards)
+    (dolist (entry facts)
+      (let* ((fact (cdr entry))
+             (type (dsh-protocol-execution-event-type fact)))
+        ;; Recovery plugins can retry directly without an llm/retry event.
+        ;; Another response in the same step proves the request resumed.
+        (when (and (member type '("assistant/attempt" "assistant/message"))
+                   (or pending waiting)
+                   (equal (dsh-protocol-execution-event-step fact)
+                          (dsh-protocol-execution-event-step
+                           (plist-get (or pending waiting) :event))))
+          (if pending
+              (setf (plist-get pending :cause) fact
+                    (plist-get pending :label) "Retried")
+            (setf (plist-get waiting :label) "started")))
+        (pcase type
+          ("assistant/attempt"
+           (setq pending (list :event fact :label "Incomplete reply"
+                               :cause nil)
+                 waiting nil)
+           (push pending cards))
+          ("assistant/message" (setq pending nil waiting nil))
+          ("llm/retry"
+           (when (and pending
+                      (equal (dsh-protocol-execution-event-step fact)
+                             (dsh-protocol-execution-event-step
+                              (plist-get pending :event))))
+             (setf (plist-get pending :cause) fact
+                   (plist-get pending :label) "scheduled")
+             (setq waiting pending pending nil)))
+          ("llm/retry-started"
+           (when-let* ((retry (plist-get waiting :cause)))
+             (when (and (equal (dsh-protocol-execution-event-id fact)
+                               (dsh-protocol-execution-event-id retry))
+                        (equal (dsh-protocol-execution-event-step fact)
+                               (dsh-protocol-execution-event-step retry))
+                        (equal (dsh-protocol-execution-event-attempt fact)
+                               (dsh-protocol-execution-event-attempt retry)))
+               (setf (plist-get waiting :label) "started")
+               (setq waiting nil))))
+          ("turn/end"
+           (let ((card (or pending waiting))
+                 (reason (dsh-protocol-execution-event-reason fact)))
+             (when (and card (member reason '("error" "aborted")))
+               (setf (plist-get card :cause) fact
+                     (plist-get card :label)
+                     (if (equal reason "error") "Failed reply"
+                       (if waiting "Retry cancelled" "Cancelled reply")))))
+           (setq pending nil waiting nil)))))
+    cards))
 
 (defun dsh-emacs-render--note-attempt-outcome (event)
   "Merge decoded EVENT and classify this turn's visible attempt cards.
@@ -4166,63 +4749,12 @@ settles the last unresolved attempt; it never relabels earlier started retries."
            (seq (dsh-protocol-execution-event-seq event))
            (state (or (gethash turn dsh-emacs-render--attempt-turns)
                       (list :facts nil :position (make-marker) :seq nil)))
-           (facts (plist-get state :facts))
-           (pending nil)
-           (waiting nil)
-           (cards nil))
+           (facts (plist-get state :facts)))
       (setf (alist-get seq facts) event)
       (setq facts (sort facts (lambda (a b) (< (car a) (car b)))))
       (setf (plist-get state :facts) facts)
       (puthash turn state dsh-emacs-render--attempt-turns)
-      (dolist (entry facts)
-        (let* ((fact (cdr entry))
-               (type (dsh-protocol-execution-event-type fact)))
-          ;; Recovery plugins can retry directly without an llm/retry event.
-          ;; Another response in the same step proves the request resumed.
-          (when (and (member type '("assistant/attempt" "assistant/message"))
-                     (or pending waiting)
-                     (equal (dsh-protocol-execution-event-step fact)
-                            (dsh-protocol-execution-event-step
-                             (plist-get (or pending waiting) :event))))
-            (if pending
-                (setf (plist-get pending :cause) fact
-                      (plist-get pending :label) "Retried")
-              (setf (plist-get waiting :label) "started")))
-          (pcase type
-            ("assistant/attempt"
-             (setq pending (list :event fact :label "Incomplete reply"
-                                 :cause nil)
-                   waiting nil)
-             (push pending cards))
-            ("assistant/message" (setq pending nil waiting nil))
-            ("llm/retry"
-             (when (and pending
-                        (equal (dsh-protocol-execution-event-step fact)
-                               (dsh-protocol-execution-event-step
-                                (plist-get pending :event))))
-               (setf (plist-get pending :cause) fact
-                     (plist-get pending :label) "scheduled")
-               (setq waiting pending pending nil)))
-            ("llm/retry-started"
-             (when-let* ((retry (plist-get waiting :cause)))
-               (when (and (equal (dsh-protocol-execution-event-id fact)
-                                 (dsh-protocol-execution-event-id retry))
-                          (equal (dsh-protocol-execution-event-step fact)
-                                 (dsh-protocol-execution-event-step retry))
-                          (equal (dsh-protocol-execution-event-attempt fact)
-                                 (dsh-protocol-execution-event-attempt retry)))
-                 (setf (plist-get waiting :label) "started")
-                 (setq waiting nil))))
-            ("turn/end"
-             (let ((card (or pending waiting))
-                   (reason (dsh-protocol-execution-event-reason fact)))
-               (when (and card (member reason '("error" "aborted")))
-                 (setf (plist-get card :cause) fact
-                       (plist-get card :label)
-                       (if (equal reason "error") "Failed reply"
-                         (if waiting "Retry cancelled" "Cancelled reply")))))
-             (setq pending nil waiting nil)))))
-      (dolist (card cards)
+      (dolist (card (dsh-emacs-render--attempt-cards facts))
         (let* ((attempt (plist-get card :event))
                (cause (plist-get card :cause))
                (label (plist-get card :label))
@@ -4263,7 +4795,9 @@ settles the last unresolved attempt; it never relabels earlier started retries."
                                                 "error"))
                                     'error)
                                    (t 'idle)))
-                            " " (propertize label 'face 'dsh-emacs-tool-title-face
+                            " " (propertize label
+                                            'face (dsh-emacs-render--row-label-face
+                                                   'dsh-emacs-tool-title-face)
                                             'help-echo (or detail "Outcome not available")))
                     (map-elt model :label-right)
                     (propertize
@@ -4302,7 +4836,8 @@ a visible live body, collapsed when replayed from history."
       :label-left
       (concat (dsh-emacs-render--event-icon 'idle) " "
               (propertize "Incomplete reply"
-                          'face 'dsh-emacs-tool-title-face
+                          'face (dsh-emacs-render--row-label-face
+                                 'dsh-emacs-tool-title-face)
                           'help-echo "Uncommitted output; may follow failure, retry or cancellation"))
       :label-right
       (propertize (format "turn %s · step %s"
@@ -4395,11 +4930,13 @@ indented line per file, with no body background."
                    (propertize
                     (format "Deliverables · %d file%s" count
                             (if (= count 1) "" "s"))
-                    'face 'dsh-emacs-deliverable-text-face))
+                    'face (dsh-emacs-render--row-label-face
+                           'dsh-emacs-deliverable-text-face)))
       :body (dsh-emacs-render--deliverables-body files)
       :style 'minimal
       :status 'deliverables
-      :header-face 'dsh-emacs-deliverable-text-face)
+      :header-face (dsh-emacs-render--row-chrome-face
+                    'dsh-emacs-deliverable-text-face))
      :create-new t :expanded nil
      :insert-before (dsh-emacs-render--input-insert-point))))
 
@@ -4429,6 +4966,17 @@ user's input text."
       (substring name 1)
     (or name "")))
 
+(defun dsh-emacs-render--command-label-left (icon label state)
+  "Return the left-hand label for a command row.
+ICON is the leading bash/tool icon (or nil), LABEL the command text, and
+STATE `pending', `success' or `error'.  This is the pure presentation seam:
+a future animation can replace the returned string without touching the
+row/fragment callers."
+  (concat (dsh-emacs-render--tool-leading icon state)
+          (propertize label
+                      'face (dsh-emacs-render--row-label-face
+                             'dsh-emacs-tool-title-face))))
+
 (defun dsh-emacs-render--command-status-text (state)
   "Short status suffix for a slash-command node STATE (success/error)."
   (pcase state
@@ -4437,101 +4985,8 @@ user's input text."
     (_ nil)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Slash-command row styling: bash terminal icon + running `-\|/' spinner
+;;; Slash-command row styling: bash terminal icon + pending tint
 ;;; ---------------------------------------------------------------------------
-
-(defconst dsh-emacs--command-spinner-frames
-  '("-" "\\" "|" "/")
-  "Frames of the running slash-command leading animation.
-The classic shell `-\\|/' spinner (the same frames as slash.sh), so the
-row animates with familiar 4-frame terminal rhythm.")
-
-(defconst dsh-emacs--command-spinner-interval 0.1
-  "Seconds between running-command animation frames (~10fps, like the
-classic shell spinner in slash.sh).")
-
-(defvar-local dsh-emacs--command-spinners (make-hash-table :test 'equal)
-  "Live running-command animations, keyed by COMMAND-ID.
-Each value is (BUFFER TIMER INDEX): BUFFER is the chat buffer the row lives
-in, TIMER the repeating `run-at-time' timer, INDEX the next frame index.
-
-Buffer-local: several chats may run commands concurrently, and the
-optimistic temp ids (`pending-<name>') collide across buffers — a global
-table would let one session's spinner overwrite/cancel another's.  Each
-chat buffer gets its own hash in `dsh-emacs-render--reset-tool-tracking'.")
-
-(defun dsh-emacs--command-spinner-start (command-id buffer)
-  "Start the running `-\\|/' animation for COMMAND-ID in BUFFER.
-Replaces any existing animation for the same command (idempotent)."
-  (dsh-emacs--command-spinner-stop command-id)
-  (let ((timer (run-at-time dsh-emacs--command-spinner-interval
-                            dsh-emacs--command-spinner-interval
-                            #'dsh-emacs--command-spinner-tick
-                            buffer command-id)))
-    (puthash command-id (list buffer timer 0)
-             dsh-emacs--command-spinners)))
-
-(defun dsh-emacs--command-spinner-tick (buffer command-id)
-  "Advance COMMAND-ID's animation in BUFFER, repainting visible rows only."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (when-let* ((rec (gethash command-id dsh-emacs--command-spinners)))
-        (if-let* ((entry (gethash command-id dsh-emacs--command-blocks)))
-            (let ((next-index (mod (1+ (nth 2 rec))
-                                   (length dsh-emacs--command-spinner-frames))))
-              (setcar (nthcdr 2 rec) next-index)
-              (when-let* ((windows (get-buffer-window-list buffer nil 'visible))
-                          (block (dsh-emacs-ui-find-block
-                                  (nth 0 entry) (nth 1 entry)))
-                          ((cl-some (lambda (window)
-                                      (pos-visible-in-window-p
-                                       (car block) window))
-                                    windows)))
-                (dsh-emacs-ui-update-fragment
-                 (dsh-emacs-ui-make-fragment
-                  :namespace-id (nth 0 entry)
-                  :block-id (nth 1 entry)
-                  :label-left (concat
-                               (dsh-emacs-render--tool-leading
-                                (or (nth 3 entry) "") 'pending)
-                               (propertize (nth 2 entry)
-                                           'face 'dsh-emacs-tool-title-face)
-                               " "
-                               (nth next-index dsh-emacs--command-spinner-frames))
-                  :style 'minimal
-                  :status 'tool-pending
-                  :header-face 'dsh-emacs-tool-pending-face))))
-          (dsh-emacs--command-spinner-stop command-id))))))
-
-(defun dsh-emacs--command-spinner-stop (command-id)
-  "Cancel COMMAND-ID's running animation and drop its state."
-  (let ((rec (gethash command-id dsh-emacs--command-spinners)))
-    (when rec
-      (let ((timer (nth 1 rec)))
-        (when (timerp timer)
-          (cancel-timer timer))))
-    (remhash command-id dsh-emacs--command-spinners)))
-
-(defun dsh-emacs--command-spinner-clear-all ()
-  "Cancel every running command spinner (event-stream teardown)."
-  (maphash (lambda (command-id _rec)
-             (dsh-emacs--command-spinner-stop command-id))
-           dsh-emacs--command-spinners))
-
-(defun dsh-emacs--command-spinner-revive ()
-  "Re-arm the running-command animation after a stream reconnect.
-`dsh-emacs-events-disconnect' cancels every spinner (so a detached
-conversation never keeps animating); when the same chat buffer reconnects
-mid-command, its rows are still on screen and still pending, so restart the
-animation for each such entry.  No-op when the command already settled
-(`command/done' restyled the row: status is no longer `tool-pending'),
-the row no longer exists, or there is nothing to revive."
-  (dolist (command-id (hash-table-keys dsh-emacs--command-blocks))
-    (when-let* ((entry (gethash command-id dsh-emacs--command-blocks))
-                (block (dsh-emacs-ui-find-block (nth 0 entry) (nth 1 entry)))
-                (state (get-text-property (car block) 'dsh-emacs-ui-state))
-                ((eq (map-elt state :status) 'tool-pending)))
-      (dsh-emacs--command-spinner-start command-id (current-buffer)))))
 
 (defun dsh-emacs-render-command-optimistic (line)
   "Render a slash-command row immediately for LINE (e.g. \"/compact\").
@@ -4556,26 +5011,21 @@ the real `command/run' event when it arrives."
         (dsh-emacs-ui-update-fragment
          (dsh-emacs-ui-make-fragment
           :namespace-id ns :block-id block-id
-          :label-left (concat
-                       (dsh-emacs-render--tool-leading icon 'pending)
-                       (propertize label 'face 'dsh-emacs-tool-title-face)
-                       " "
-                       (car dsh-emacs--command-spinner-frames))
+          :label-left (dsh-emacs-render--command-label-left
+                       icon label 'pending)
           :style 'minimal
           :status 'tool-pending
-          :header-face 'dsh-emacs-tool-pending-face)
+          :header-face (dsh-emacs-render--row-chrome-face
+                        'dsh-emacs-tool-pending-face))
          :create-new t :expanded t
-         :insert-before (dsh-emacs-render--input-insert-point))
-        (dsh-emacs--command-spinner-start temp-id
-                                          (current-buffer))))))
+         :insert-before (dsh-emacs-render--input-insert-point))))))
 
 (defun dsh-emacs-render-command-cleanup-optimistic ()
   "Remove the optimistic slash-command row (if any) on RPC error or miss.
-Stops the spinner, deletes the fragment, and clears `dsh-emacs--pending-command'."
+Deletes the fragment and clears `dsh-emacs--pending-command'."
   (when dsh-emacs--pending-command
     (let* ((temp-id (nth 0 dsh-emacs--pending-command))
            (entry (gethash temp-id dsh-emacs--command-blocks)))
-      (dsh-emacs--command-spinner-stop temp-id)
       (when entry
         (dsh-emacs-ui-delete-fragment (nth 0 entry) (nth 1 entry)))
       (remhash temp-id dsh-emacs--command-blocks))
@@ -4584,10 +5034,11 @@ Stops the spinner, deletes the fragment, and clears `dsh-emacs--pending-command'
 (defun dsh-emacs-render-command (event)
   "Render a `command/run' or `command/done' EVENT as one flow node,
 mirroring dsh web's command rows: a leading bash terminal icon (the same
-dsh-web SVG as bash tool rows, the `💻' emoji in terminal Emacs) followed
-by the command name and a classic `-\|/' spinner while running (see
-`dsh-emacs--command-spinner-frames');
-on completion the header shows only the command name + a short status
+dsh-web SVG as bash tool rows, or one tool-accent dot on displays without
+SVG) followed
+by the command name; a running row is marked by the pending
+tint and leading icon color, with no timer-driven animation.
+On completion the header shows only the command name + a short status
 (`✓ done' / `✗ failed', green on success, red on error), and the outcome
 text is folded into a collapsible body below, collapsed by default.
 
@@ -4614,49 +5065,41 @@ Returns the event seq."
                 (dsh-emacs-ui-update-fragment
                  (dsh-emacs-ui-make-fragment
                   :namespace-id ns :block-id block-id
-                  :label-left (concat
-                               (dsh-emacs-render--tool-leading icon 'pending)
-                               (propertize label 'face 'dsh-emacs-tool-title-face)
-                               " "
-                               (car dsh-emacs--command-spinner-frames))
+                  :label-left (dsh-emacs-render--command-label-left
+                               icon label 'pending)
                   :style 'minimal
                   :status 'tool-pending
-                  :header-face 'dsh-emacs-tool-pending-face)
+                  :header-face (dsh-emacs-render--row-chrome-face
+                                'dsh-emacs-tool-pending-face))
                  :create-new t :expanded nil
-                 :insert-before (dsh-emacs-render--input-insert-point))
-                (unless (dsh-emacs-render--history-page-p)
-                  (dsh-emacs--command-spinner-start command-id
-                                                    (current-buffer))))
+                 :insert-before (dsh-emacs-render--input-insert-point)))
             (when-let* ((entry (gethash command-id dsh-emacs--command-blocks)))
-              ;; Historical results leave live animations and submits alone.
-              (unless (dsh-emacs-render--history-page-p)
-                (dsh-emacs--command-spinner-stop command-id))
               (pcase-let* ((`(,ns ,block-id ,label ,icon) entry)
                            (ok (not (equal kind "error")))
                            (state (if ok 'success 'error))
+                           (face (if ok 'dsh-emacs-tool-success-face
+                                   'dsh-emacs-tool-error-face))
                            (entry-icon (or icon
                                            (dsh-emacs-render--tool-icon "bash"))))
                 (dsh-emacs-ui-update-fragment
                  (dsh-emacs-ui-make-fragment
                   :namespace-id ns :block-id block-id
-                  :label-left (concat
-                               (dsh-emacs-render--tool-leading entry-icon state)
-                               (propertize label 'face 'dsh-emacs-tool-title-face))
+                  :label-left (dsh-emacs-render--command-label-left
+                               entry-icon label state)
                   ;; Keep the run's label and a short status in the header;
                   ;; the possibly multi-line result belongs in the folded body.
                   :label-right (propertize
                                 (or (dsh-emacs-render--command-status-text state)
                                     "")
-                                'face (if ok
-                                          'dsh-emacs-tool-success-face
-                                        'dsh-emacs-tool-error-face))
+                                'face (if (eq dsh-emacs-render-style 'simple)
+                                          'dsh-emacs-timestamp-face
+                                        face))
                   :body (and (stringp text) (not (string-empty-p text)) text)
                   :style 'minimal
                   :status (if ok 'tool-success 'tool-error)
-                  ;; The result body does not inherit the header's accent.
-                  :header-face (if ok
-                                   'dsh-emacs-tool-success-face
-                                 'dsh-emacs-tool-error-face))
+                  ;; The body does not inherit a header accent; `simple'
+                  ;; keeps the whole header neutral for the colored dot.
+                  :header-face (dsh-emacs-render--row-chrome-face face))
                  :create-new nil)))))))
     seq))
 
@@ -4664,8 +5107,7 @@ Returns the event seq."
 ;; Renderer: local `!command' command lines (called by dsh-emacs-shell.el)
 ;; ---------------------------------------------------------------------------
 ;; `!<command>' runs locally rather than as a server slash command, but its row
-;; style is exactly that of `command/run': bash icon + `-\|/' spinner + pending
-;; coloring; when it finishes it shows the exit code and collects the output
+;; style is exactly that of `command/run': bash icon + pending coloring; when it finishes it shows the exit code and collects the output
 ;; into a collapsible body.  The two functions are uniquely associated across
 ;; buffers by the id returned from `dsh-emacs-render-shell-start'.
 
@@ -4676,7 +5118,7 @@ consecutive runs can not collide in `dsh-emacs--command-blocks'.")
 
 (defun dsh-emacs-render-shell-start (command)
   "Render the pending row of a local `!command' run; return its id.
-Inserts a row (bash icon + COMMAND + running spinner) above the input,
+Inserts a row (bash icon + COMMAND, pending tinted) above the input,
 exactly like a running slash-command row.  The caller passes the
 returned id back to `dsh-emacs-render-shell-done' once the process
 finishes."
@@ -4689,17 +5131,14 @@ finishes."
     (dsh-emacs-ui-update-fragment
      (dsh-emacs-ui-make-fragment
       :namespace-id ns :block-id block-id
-      :label-left (concat
-                   (dsh-emacs-render--tool-leading icon 'pending)
-                   (propertize command 'face 'dsh-emacs-tool-title-face)
-                   " "
-                   (car dsh-emacs--command-spinner-frames))
+      :label-left (dsh-emacs-render--command-label-left
+                   icon command 'pending)
       :style 'minimal
       :status 'tool-pending
-      :header-face 'dsh-emacs-tool-pending-face)
+      :header-face (dsh-emacs-render--row-chrome-face
+                    'dsh-emacs-tool-pending-face))
      :create-new t :expanded t
      :insert-before (dsh-emacs-render--input-insert-point))
-    (dsh-emacs--command-spinner-start id (current-buffer))
     id))
 
 (defun dsh-emacs-render-shell-done (id ok exit-code signal output)
@@ -4707,11 +5146,12 @@ finishes."
 OK / EXIT-CODE / SIGNAL classify the run (success on exit 0); OUTPUT is
 the merged stdout+stderr shown as the row body, expanded and tinted with
 the tool success/error faces — mirroring `command/done' rows.  No-op when
-the row no longer exists (buffer reloaded).  Drops the tracked entry, so
-a finished row never animates again."
+the row no longer exists (buffer reloaded).  Drops the tracked entry once the
+row is settled."
   (when-let* ((entry (gethash id dsh-emacs--command-blocks)))
-    (dsh-emacs--command-spinner-stop id)
     (let* ((state (if ok 'success 'error))
+           (face (if ok 'dsh-emacs-tool-success-face
+                   'dsh-emacs-tool-error-face))
            (entry-icon (or (nth 3 entry)
                            (dsh-emacs-render--tool-icon "bash")))
            (status (dsh-emacs-render--tool-status-text state exit-code signal))
@@ -4719,23 +5159,19 @@ a finished row never animates again."
       (dsh-emacs-ui-update-fragment
        (dsh-emacs-ui-make-fragment
         :namespace-id (nth 0 entry) :block-id (nth 1 entry)
-        :label-left (concat
-                     (dsh-emacs-render--tool-leading entry-icon state)
-                     (propertize (nth 2 entry)
-                                 'face 'dsh-emacs-tool-title-face))
+        :label-left (dsh-emacs-render--command-label-left
+                     entry-icon (nth 2 entry) state)
         :label-right (propertize
                       (or status "")
-                      'face (if ok
-                                'dsh-emacs-tool-success-face
-                              'dsh-emacs-tool-error-face))
+                      'face (if (eq dsh-emacs-render-style 'simple)
+                                'dsh-emacs-timestamp-face
+                              face))
         :body body
         :style 'minimal
         :status (if ok 'tool-success 'tool-error)
-        ;; The success/error accent covers the header row only; the command
-        ;; output body stays plain instead of inheriting the row's tint.
-        :header-face (if ok
-                         'dsh-emacs-tool-success-face
-                       'dsh-emacs-tool-error-face))
+        ;; In `full' the success/error accent covers the header row only;
+        ;; `simple' keeps it neutral for the colored dot.
+        :header-face (dsh-emacs-render--row-chrome-face face))
        :create-new nil :expanded t)
       (remhash id dsh-emacs--command-blocks))))
 
@@ -4814,12 +5250,20 @@ a finished row never animates again."
             ("turn/start" (setq seq (dsh-emacs-render-turn-start event)))
             ("turn/end" (setq seq (dsh-emacs-render-turn-end event)))
             ((or "step/start" "step/end")
+             (when (equal type "step/start")
+               (setq dsh-emacs-render--turn-step
+                     (dsh-protocol-turn-step-event-step
+                      (dsh-protocol-turn-step-event--from-alist event))))
              (setq seq (if (dsh-emacs-render--history-page-p)
                            (dsh-protocol-event-sequence--from-alist event)
                          (dsh-emacs-render-step-event event))))
             ("assistant/attempt"
              (setq seq (dsh-emacs-render-assistant-attempt event)))
             ("session/end-seed" (setq seq (dsh-protocol-event-sequence--from-alist event)))
+            ;; Display-only attribution state: no row, but the seq is durable
+            ;; and must advance the anchor like any other consumed record.
+            ("agent/inbox/spliced"
+             (setq seq (dsh-emacs-render--note-inbox-splice event)))
             ("deliverables/presented"
              (setq seq (dsh-emacs-render-deliverables event)))
             (_ nil))
@@ -5051,6 +5495,14 @@ re-delivered and the running animation had no later event to stop it."
                 (dsh-emacs--pending-command nil)
                 (dsh-emacs--todo-list nil)
                 (dsh-emacs-render--turn-deliverables nil)
+                ;; This page's claims are older than the live tail's; scope
+                ;; them so the tail's inbox attribution survives the prepend.
+                (dsh-emacs-render--inbox-pending nil)
+                (dsh-emacs-render--inbox-claim nil)
+                (dsh-emacs-render--turn-start-seq nil)
+                (dsh-emacs-render--turn-step nil)
+                (dsh-emacs-render--turn-opener-painted nil)
+                (dsh-emacs-render--turn-claim-slots nil)
                 (work-starts nil))
             ;; Existing turns at the page boundary belong AFTER the page.
             ;; New starts created by this batch still precede their own work.
@@ -5069,6 +5521,9 @@ re-delivered and the running animation had no later event to stop it."
                   (dsh-emacs-render--flush-deliverables))
               (dolist (marker work-starts)
                 (set-marker-insertion-type marker nil))))
+        ;; A snapshot is anchor-gated, so records already processed (and
+        ;; their claims) are not replayed here; keep the attribution state
+        ;; they built.  The full reload path clears it instead.
         (dolist (entry entries)
           (consume-entry entry)
           ;; Let timers and process input run between groups.  Redisplay is

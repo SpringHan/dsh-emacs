@@ -4,6 +4,174 @@
 
 (require 'dsh-test-support)
 
+(ert-deftest dsh-emacs-test-ui-navigation-records-only-successful-moves ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (insert "abcdef")
+    (goto-char 2)
+    (let (recorded)
+      (cl-letf (((symbol-function 'xref-push-marker-stack)
+                 (lambda (marker) (push marker recorded))))
+        (should (eq (dsh-emacs-ui-navigate (point-marker) #'identity 'unchanged)
+                    'unchanged))
+        (should-not recorded)
+        (should-error (dsh-emacs-ui-navigate (point-marker) #'error "Failed"))
+        (should-not recorded)
+        (should (eq (condition-case nil
+                        (dsh-emacs-ui-navigate
+                         (point-marker) (lambda () (signal 'quit nil)))
+                      (quit 'cancelled))
+                    'cancelled))
+        (should-not recorded)
+        (should (= (dsh-emacs-ui-navigate (point-marker) #'goto-char 5) 5))
+        (should (= (length recorded) 1))
+        (should (= (car recorded) 2))
+        (should (eq (marker-buffer (car recorded)) (current-buffer))))
+      (dolist (marker recorded) (set-marker marker nil)))))
+
+(ert-deftest dsh-emacs-test-ui-navigation-file-and-session-return ()
+  :tags '(dsh-unit)
+  (pcase-let ((`(,status . ,output)
+               (dsh-test--fresh-process
+                '(progn
+                   (require 'ert)
+                   (require 'dsh-emacs)
+                   (let* ((file (make-temp-file "dsh-xref-" nil ".txt"
+                                                "first line\nsecond line\n"))
+                          (origin (generate-new-buffer " *xref-origin*"))
+                          (target (generate-new-buffer " *xref-session*"))
+                          (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+                          (dsh-emacs--current-session "origin")
+                          (dsh-emacs--current-buffer origin)
+                          (dsh-emacs--sessions
+                           (list (dsh-protocol-session--from-alist
+                                  `((sessionId . "origin")
+                                    (cwd . ,(file-name-directory file)))))))
+                     (unwind-protect
+                         (progn
+                           (switch-to-buffer origin)
+                           (insert "source position")
+                           (goto-char 4)
+                           (dsh-emacs-reference--open-ref 'file file)
+                           (should (equal buffer-file-name file))
+                           (call-interactively (key-binding (kbd "M-,")))
+                           (should (eq (current-buffer) origin))
+                           (should (= (point) 4))
+                           ;; A local link into the same file still records
+                           ;; the departure before applying its line/column.
+                           (find-file file)
+                           (goto-char 3)
+                           (dsh-emacs-markdown--open-local-link
+                            (concat file "#L2C3"))
+                           (should (= (line-number-at-pos) 2))
+                           (should (= (current-column) 2))
+                           (call-interactively (key-binding (kbd "M-,")))
+                           (should (equal buffer-file-name file))
+                           (should (= (point) 3))
+                           (switch-to-buffer origin)
+                           (goto-char 6)
+                           (puthash "target" target dsh-emacs--chat-buffers)
+                           (dsh-emacs-reference--open-ref 'session "target")
+                           (should (eq (current-buffer) target))
+                           (call-interactively (key-binding (kbd "M-,")))
+                           (should (eq (current-buffer) origin))
+                           (should (= (point) 6)))
+                       (when-let* ((buffer (get-file-buffer file)))
+                         (kill-buffer buffer))
+                       (kill-buffer origin)
+                       (kill-buffer target)
+                       (delete-file file)))))))
+    (ert-info (output)
+      (should (equal status 0)))))
+
+(ert-deftest dsh-emacs-test-ui-navigation-child-records-once ()
+  :tags '(dsh-unit)
+  (let* ((origin (generate-new-buffer " *xref-parent*"))
+         (child nil)
+         (dsh-emacs--chat-buffers (make-hash-table :test #'equal))
+         (dsh-emacs--subagent-catalogs (make-hash-table :test #'equal))
+         (dsh-emacs--sessions nil)
+         (dsh-emacs--current-buffer nil)
+         (dsh-emacs--current-session nil)
+         (entry (dsh-protocol-subagent-entry--from-alist
+                 '((id . "child") (mode . "one-shot"))))
+         departures)
+    (save-window-excursion
+      (unwind-protect
+          (cl-letf (((symbol-function 'xref-push-marker-stack)
+                     (lambda (marker) (push marker departures)))
+                    ((symbol-function 'dsh-emacs-subagent--refresh-summaries) #'ignore)
+                    ((symbol-function 'dsh-emacs--activate-chat-buffer)
+                     (lambda (id buffer &optional address)
+                       (puthash id buffer dsh-emacs--chat-buffers)
+                       (with-current-buffer buffer
+                         (dsh-emacs-mode)
+                         (setq dsh-emacs--buffer-session id
+                               dsh-emacs--buffer-subagent address))))
+                    ((symbol-function 'dsh-emacs-server-ensure) #'ignore)
+                    ((symbol-function 'dsh-emacs--chat-buffer-name)
+                     (lambda (_id) " *xref-child*")))
+            (switch-to-buffer origin)
+            (insert "parent source")
+            (goto-char 4)
+            (puthash "parent" origin dsh-emacs--chat-buffers)
+            ;; Cold children record only when their follow snapshot succeeds.
+            (dsh-emacs-open-subagent "parent" entry)
+            (setq child dsh-emacs--current-buffer)
+            (should-not departures)
+            (should (marker-buffer dsh-emacs--subagent-departure))
+            (dsh-emacs-events--follow-snapshot
+             child '((cursor . 0) (records . []) (hasMore . :json-false)))
+            (should (= (length departures) 1))
+            (should (eq (marker-buffer (car departures)) origin))
+            (should (= (car departures) 4))
+            (should-not dsh-emacs--subagent-departure)
+            ;; Returning to the root uses the same session navigation owner.
+            (dsh-emacs-subagent-open-parent)
+            (should (eq (current-buffer) origin))
+            (should (= (length departures) 2))
+            ;; Reopening the live child has no new snapshot to wait for.
+            (dsh-emacs-open-subagent "parent" entry)
+            (should (eq (current-buffer) child))
+            (should (= (length departures) 3))
+            (should-not dsh-emacs--subagent-departure)
+            (dsh-emacs-open-subagent "parent" entry)
+            (should (= (length departures) 3)))
+        (dolist (marker departures) (set-marker marker nil))
+        (kill-buffer origin)
+        (when (buffer-live-p child) (kill-buffer child))))))
+
+(ert-deftest dsh-emacs-test-ui-navigation-image-keeps-asynchronous-origin ()
+  :tags '(dsh-unit)
+  (let ((origin (generate-new-buffer " *xref-image-source*"))
+        (other (generate-new-buffer " *xref-unrelated*"))
+        (dsh-emacs--current-session "image-session")
+        callback departure image)
+    (save-window-excursion
+      (unwind-protect
+          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                     (lambda (_method _args done) (setq callback done)))
+                    ((symbol-function 'image-mode) #'ignore)
+                    ((symbol-function 'xref-push-marker-stack)
+                     (lambda (marker) (setq departure marker))))
+            (switch-to-buffer origin)
+            (insert "image")
+            (put-text-property 1 6 'dsh-emacs-attachment-id "attachment")
+            (goto-char 3)
+            (dsh-emacs-render--image-open)
+            (should-not departure)
+            (should (functionp callback))
+            (switch-to-buffer other)
+            (funcall callback t '((data . "YWJj")))
+            (setq image (current-buffer))
+            (should (equal (buffer-string) "abc"))
+            (should (eq (marker-buffer departure) origin))
+            (should (= departure 3)))
+        (when departure (set-marker departure nil))
+        (kill-buffer origin)
+        (kill-buffer other)
+        (when (buffer-live-p image) (kill-buffer image))))))
+
 ;; Follow checks must stop after one screen plus slack, even in long history.
 (ert-deftest dsh-emacs-test-ui-follow-threshold-keeps-boundary ()
   :tags '(dsh-unit)
@@ -693,7 +861,7 @@ both followers' prompts above their viewports."
     (let ((frag (dsh-emacs-ui-make-fragment
                  :namespace-id "test"
                  :block-id "1"
-                 :label-left "👤 You"
+                 :label-left "You"
                  :label-right "12:00"
                  :body "hello"
                  :style 'rounded)))
@@ -1569,6 +1737,68 @@ both followers' prompts above their viewports."
             (should (= 1 (cl-count :body-cache state :key #'car))))
           (should (string-match-p (format "width %d" width) (buffer-string))))
         (should (= calls 2))))))
+
+(defvar dsh-emacs-ui--menu-context)
+(defvar vertico-sort-override-function)
+
+(ert-deftest dsh-emacs-test-ui-menu-action-uses-native-accept ()
+  :tags '(dsh-unit)
+  (let ((vertico-sort-override-function #'reverse)
+        (dsh-emacs-ui--menu-context
+         (list :action 'send :default-action 'send
+               :bindings '(("C-c d" . delete)))))
+    (with-temp-buffer
+      (use-local-map (make-sparse-keymap))
+      (local-set-key (kbd "RET")
+                     (lambda () (interactive) (throw 'accepted "delta")))
+      (let ((accept (key-binding (kbd "RET"))))
+        (dsh-emacs-ui--menu-setup)
+        (should (eq (key-binding (kbd "C-c d")) accept))
+        (should (eq (key-binding (kbd "d")) #'self-insert-command))
+        (should-not vertico-sort-override-function)
+        (cl-letf (((symbol-function 'this-command-keys-vector)
+                   (lambda () (kbd "C-c d"))))
+          (run-hooks 'pre-command-hook)
+          (should (equal (catch 'accepted
+                           (call-interactively (key-binding (kbd "C-c d"))))
+                         "delta"))))
+      (should (eq (plist-get dsh-emacs-ui--menu-context :action) 'delete)))
+    (should (eq vertico-sort-override-function #'reverse))))
+
+(ert-deftest dsh-emacs-test-ui-menu-incomplete-accept-keeps-default-action ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs-ui--menu-context
+         (list :action 'send :default-action 'send
+               :bindings '(("C-c d" . delete)))))
+    (cl-letf (((symbol-function 'this-command-keys-vector)
+               (lambda () (kbd "C-c d"))))
+      (dsh-emacs-ui--menu-record-action))
+    (should (eq (plist-get dsh-emacs-ui--menu-context :action) 'delete))
+    (cl-letf (((symbol-function 'this-command-keys-vector)
+               (lambda () (kbd "RET"))))
+      (dsh-emacs-ui--menu-record-action))
+    (should (eq (plist-get dsh-emacs-ui--menu-context :action) 'send))))
+
+(ert-deftest dsh-emacs-test-ui-menu-global-action-needs-no-selection ()
+  :tags '(dsh-unit)
+  (let ((dsh-emacs-ui--menu-context
+         (list :action 'show :default-action 'show
+               :bindings '(("C-c r" . refresh)) :global-actions '(refresh))))
+    (cl-letf (((symbol-function 'this-command-keys-vector)
+               (lambda () (kbd "C-c r"))))
+      (dsh-emacs-ui--menu-record-action)
+      (should (equal (catch 'dsh-emacs-ui-menu-result
+                       (dsh-emacs-ui--menu-global-action))
+                     '(refresh nil))))))
+
+(ert-deftest dsh-emacs-test-ui-menu-read-resolves-returned-label ()
+  :tags '(dsh-unit)
+  (cl-letf (((symbol-function 'completing-read)
+             (lambda (&rest _) "delta")))
+    (should (equal (dsh-emacs-ui-menu-read
+                    "Queue: " '(("alpha" . first) ("delta" . second)) 'send
+                    '(("C-c d" delete)))
+                   '(send second)))))
 
 (provide 'dsh-test-ui)
 ;;; dsh-test-ui.el ends here

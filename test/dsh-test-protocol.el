@@ -670,7 +670,7 @@
                     ("api-session/status" ("busy" t) "busy" t)
                     ("api-session/status" ("idle" :json-false) "idle")
                     ("api-session/status" ("absent") "absent")
-                    ("api-session/activity" ("recent" 123) "recent")
+                    ("api-session/activity" ("recent" 123) "recent" 123)
                     ("future-event" ("ignored" 456) nil)))
       (pcase-let* ((`(,name ,args ,id . ,rest) case)
                    (item (dsh-protocol-core-item--from-alist
@@ -723,6 +723,24 @@
                     `((questions . []) (wait . ,wait)))))
       (should-not (dsh-protocol-question-request-questions request))
       (should-not (dsh-protocol-question-request-wait request)))))
+
+;; Empty question text is presentational; the options still belong to the
+;; card.  Only a question with neither an id nor text is unusable.
+(ert-deftest dsh-emacs-test-protocol-ask-questions-keeps-empty-text-with-id ()
+  :tags '(dsh-unit)
+  (let* ((args (json-encode
+                '((questions
+                   . [((id . "q1") (question . "")
+                       (options . [((label . "A")) ((label . "B"))]))
+                      ((question . "")
+                       (options . [((label . "dropped"))]))]))))
+         (questions (dsh-protocol-ask-questions--from-alist args)))
+    (should (= 1 (length questions)))
+    (should (equal "q1" (dsh-protocol-question-id (car questions))))
+    (should (equal '("A" "B")
+                   (mapcar #'dsh-protocol-question-option-label
+                           (dsh-protocol-question-options
+                            (car questions)))))))
 
 ;; --- Test 57: protocol layer workspace baseline / workspace-result
 ;; / model-selection-result ---
@@ -947,6 +965,28 @@
                  '(nil . "upload error")))
   (should (equal (dsh-protocol-rpc-result--from-alist
                   '((message . "not an upload error")) :direct-p t) '(nil))))
+
+(ert-deftest dsh-emacs-test-protocol-rpc-error-accessors ()
+  :tags '(dsh-unit)
+  (let* ((value '((code . "agent-preset/not-found")
+                  (message . "Unknown agent preset: focused-investigation")
+                  (details . ((agentPreset . "focused-investigation")
+                              (available . ["standard" "tiny"])))))
+         (error (dsh-protocol-rpc-error--from-alist value)))
+    (should (equal "agent-preset/not-found"
+                   (dsh-protocol-rpc-error-code error)))
+    (should (equal "Unknown agent preset: focused-investigation"
+                   (dsh-protocol-rpc-error-message error)))
+    (should (equal '((agentPreset . "focused-investigation")
+                     (available . ["standard" "tiny"]))
+                   (dsh-protocol-rpc-error-details error)))
+    (should (equal '("focused-investigation" "standard" "tiny")
+                   (dsh-protocol-agent-preset-error--from-alist value))))
+  (should-not (dsh-protocol-rpc-error-code
+               (dsh-protocol-rpc-error--from-alist "boom")))
+  (should-not (dsh-protocol-agent-preset-error--from-alist nil))
+  (should-not (dsh-protocol-agent-preset-error--from-alist
+               '((code . "gateway/internal") (message . "boom")))))
 
 (ert-deftest dsh-emacs-test-protocol-plan-json-boundary ()
   :tags '(dsh-unit)
@@ -1509,6 +1549,77 @@
   :tags '(dsh-unit)
   (should (equal (dsh-protocol-write-json '((a . 1)) nil) "{\"a\":1}"))
   (should (string-match-p "\n" (dsh-protocol-write-json '((a . 1)) t))))
+
+(ert-deftest dsh-emacs-test-protocol-inbox-splice ()
+  :tags '(dsh-unit)
+  (let ((splice (dsh-protocol-inbox-splice--from-alist
+                 '((type . "agent/inbox/spliced") (seq . 4)
+                   (data . ((target . "next-turn") (start . 0)
+                            (removedCount . 1) (outcome . "canceled")
+                            (inserted . [((id . "a")
+                                          (source . ((kind . "agent-message"))))
+                                         ((id . "b")
+                                          (source . ((kind . "user"))))
+                                         ((source . ((kind . "user"))))])))))))
+    (should (equal (dsh-protocol-inbox-splice-target splice) "next-turn"))
+    (should (equal (dsh-protocol-inbox-splice-start splice) 0))
+    (should (equal (dsh-protocol-inbox-splice-removed-count splice) 1))
+    (should (equal (dsh-protocol-inbox-splice-outcome splice) "canceled"))
+    ;; An entry without an id is not a claimable occurrence.
+    (should (equal (dsh-protocol-inbox-splice-inserted splice)
+                   '(("a" . "agent-message") ("b" . "user")))))
+  (should-not (dsh-protocol-inbox-splice-target
+               (dsh-protocol-inbox-splice--from-alist
+                '((type . "user/message") (data . ((content . []))))))))
+
+(ert-deftest dsh-emacs-test-protocol-message-trigger-fields ()
+  :tags '(dsh-unit)
+  (let ((message (dsh-protocol-message--from-alist
+                  '((type . "user/message")
+                    (data . ((id . "m1")
+                             (source . ((kind . "webhook")
+                                        (provider . "github")))
+                             (content . [])))))))
+    (should (equal (dsh-protocol-message-id message) "m1"))
+    (should (equal (dsh-protocol-message-source-kind message) "webhook"))
+    (should (equal (dsh-protocol-message-source-provider message) "github")))
+  ;; An optimistic echo has neither identity nor provider.
+  (let ((message (dsh-protocol-message--from-alist
+                  '((type . "user/message")
+                    (data . ((content . [])))))))
+    (should-not (dsh-protocol-message-id message))
+    (should-not (dsh-protocol-message-source-provider message))))
+
+(ert-deftest dsh-emacs-test-protocol-history-human-rounds ()
+  :tags '(dsh-unit)
+  (cl-labels ((record (type seq data)
+                (list (cons 'type "event")
+                      (cons 'event (list (cons 'type type)
+                                         (cons 'seq seq)
+                                         (cons 'data data))))))
+    (let* ((records
+            (list (record "turn/start" 1 '((turn . 1)))
+                  (record "user/message" 2
+                          '((content . [])
+                            (source . ((kind . "agent-message")))))
+                  (record "turn/start" 3 '((turn . 2)))
+                  (record "user/message" 4
+                          '((content . [])
+                            (source . ((kind . "user")))))
+                  (record "turn/start" 5 '((turn . 3)))
+                  (record "user/message" 6 '((content . [])))))
+           (snapshot (dsh-protocol-follow-snapshot--from-alist
+                      `((records . ,(vconcat records))
+                        (hasMore . :json-false)))))
+      ;; Only turns with a user-authored message are rounds; a source-less
+      ;; message remains author text for fixtures and optimistic echoes.
+      (should (equal '(2 3)
+                     (mapcar #'car
+                             (dsh-protocol-history-human-rounds records))))
+      (should (= 2 (dsh-protocol-follow-snapshot-human-round-count
+                    snapshot)))
+      (should (equal 3 (nth 1 (car (dsh-protocol-history-human-rounds
+                                    records))))))))
 
 (provide 'dsh-test-protocol)
 ;;; dsh-test-protocol.el ends here

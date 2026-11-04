@@ -59,7 +59,7 @@ rows without elapsed time. Mid-turn input also prevents whole-turn folding.
 In these cases all replies remain visible, while contiguous thinking/tool cards
 between replies still fold into separate activity summaries. Even one card can
 form a group. Summaries count distinct calls by category, not files or steps;
-reasoning-only groups say **Analysis completed**.
+thinking-only groups say **Analysis completed**.
 Successful turns can fold their process even without a final answer. A turn
 with no process content has only a non-foldable completion row. Active and
 unknown-ending tasks do not receive a whole-turn disclosure.
@@ -102,8 +102,9 @@ The most commonly used options, straight in your config:
 (setq dsh-emacs-base-url "http://127.0.0.1:3080")  ; dsh service URL; a `?token=...` query (the URL dsh prints) is read for auth and stripped before paths are appended
 (setq dsh-emacs-server-auth-token nil)         ; launch token for dsh web 0.1.2-rc.1+; nil = auto-captured from a server dsh-emacs starts itself.  Set it for a server YOU run externally (a fresh random value every server restart).  When pointing at an external auth-requiring server with no token set, dsh-emacs asks you for it; a token that successfully authenticates is remembered here automatically (saved), so the next session reuses it — only a stale token (validation fails after a server restart) re-prompts, pre-filled for editing.  Successful authentication also caches the cookie instead of showing a Basic username/password prompt
 (setq dsh-emacs-history-window 30)                  ; maximum messages per opening or older-history network batch
-(setq dsh-emacs-history-rounds 3)                  ; complete earlier rounds per C-c C-o; opening always completes only one
-(setq dsh-emacs-show-reasoning t)                  ; show reasoning content (on by default; nil = hide, unlike dsh web)
+(setq dsh-emacs-history-rounds 3)                  ; complete earlier user+assistant rounds per C-c C-o; opening always completes only one
+(setq dsh-emacs-show-thinking t)                   ; show thinking content in the Think rows (on by default; nil = hide, unlike dsh web)
+(setq dsh-emacs-thinking-style 'expand)            ; live thinking: expand = stream the body then fold (default); inline = dsh web's compact collapsed row with a running paragraph preview
 (setq dsh-emacs-show-tool-calls t)                 ; show tool calls
 (setq dsh-emacs-stream-markdown-limit 8192)        ; pending characters before idle formatting; nil = synchronous
 (setq dsh-emacs-default-cwd default-directory)     ; fallback working directory for new sessions (interactive ones use the current buffer's default-directory first)
@@ -113,15 +114,20 @@ The most commonly used options, straight in your config:
 (setq dsh-emacs-model-group-format #(" %s " 0 4 (face vertico-group-title))) ; provider group-header format inside the model picker (nil = hide group titles)
 (setq dsh-emacs-input-history-length 50)           ; prompts kept for M-p / M-n recall
 (setq dsh-emacs-input-history-cross-session nil)   ; M-p / M-n recall only the current session's prompts (nil, default); t = recall prompts from every session
+(setq dsh-emacs-composer-typing-commands (append dsh-emacs-composer-typing-commands '(my-insert-command))) ; extra commands that jump to the composer when invoked from the transcript
 (setq dsh-emacs-word-completion-limit 100000)      ; how many characters above the input TAB searches when completing an ordinary word from the draft/transcript (nil = whole buffer)
 (setq dsh-emacs-busy-enter-behavior 'queue)          ; what C-c C-c does while a turn runs: `queue` lines input up as the next turn (default), `steer` wakes the running agent before its next step, `stop` interrupts like before; `C-u C-c C-c` explicitly sends a nonempty message with steer mode regardless of this setting or the local busy indicator, a blank input with no staged attachments interrupts a running turn, and `C-c C-b` interrupts explicitly (C-c C-q manages the queue)
 (setq dsh-emacs-question-skip-key "C-c C-s") ; key that skips the current ask question inside the reader (nil = no shortcut; empty input also skips)
 (setq dsh-emacs-ui-label-separator "·")            ; separator between Think/Tool title and its right-side summary ("" = plain gap)
-(setq dsh-emacs-tool-titles '(("pwsh" . "PowerShell"))) ; tool name -> display title overrides (icons stay per variant; unnamed tools get a humanized name, e.g. grep -> "Grep")
+(setq dsh-emacs-render-style 'full)             ; transcript event icons: full = dsh-web SVG icons (text/dot fallback without a graphical display or SVG), simple = one state-colored dot and muted row text
+(setq dsh-emacs-tool-titles '(("pwsh" . "PowerShell"))) ; tool name -> display title overrides (icons follow `dsh-emacs-render-style`; unnamed tools get a humanized name, e.g. grep -> "Grep")
 (setq dsh-emacs-attach-media-types '("image/png" "image/jpeg" "image/webp" "image/gif")) ; image types sent inline (`C-c C-a' file attach, `C-c C-v' clipboard paste, `M-x yank-media'); every other file is uploaded at submit time
 (setq dsh-emacs-attach-max-file-size (* 32 1024 1024)) ; largest staged file, in bytes; checked again at upload (nil = no limit; inline images are not governed by it)
 (setq dsh-emacs-render-image-thumbnail-lines 4)     ; height of one transcript image thumbnail, in text lines (dsh web uses 64px tiles); a lone image uses the same gallery style
 (setq dsh-emacs-session-auto-refresh-interval nil) ; seconds between automatic session-list refreshes (nil = off)
+(setq dsh-emacs-session-jump-target 'recents)      ; recents (default) or workspace: chat-to-list jump destination
+(setq dsh-emacs-session-recents-limit 15)          ; latest updated sessions in the leading Recents group (0 = hide)
+(setq dsh-emacs-session-recents-show-workspace t)  ; prefix Recents titles with [workspace] (nil = hide)
 (setq dsh-emacs-workspaces-collapsed-by-default nil) ; workspace and Ungrouped groups start expanded (t = collapsed); TAB/RET overrides a group in the current list buffer
 (setq dsh-emacs-composer-goal-actions t)             ; show pause/resume/edit/clear buttons on the Goal Row (nil = hide them; C-c C-g keys still work; C-c C-g a / dsh-emacs-goal-actions-toggle toggles the current buffer)
 (setq dsh-emacs-reference-auto-complete t)          ; typing "@" in the input pops the file/directory/session reference menu (TAB and M-x dsh-emacs-reference always work; see docs/reference.md)
@@ -138,7 +144,7 @@ The most commonly used options, straight in your config:
 (setq dsh-emacs-shell-max-output 50000)             ; cap on a `!` command's captured output shown in the transcript
 (setq dsh-emacs-shell-null-stdin t)                 ; close `!` commands' input pipe immediately (EOF, independent of shell syntax)
 (setq dsh-emacs-shell-timeout nil)                  ; nil = no limit; positive integer seconds only (surviving background children are untracked)
-(setq dsh-emacs-jobs-kill-arm-seconds 3)           ; how long the `k' press in the `C-c C-j' background-job menu stays armed before a second press stops the job (matches dsh web's two-press stop)
+(setq dsh-emacs-jobs-kill-arm-seconds 3)           ; how long the stop confirmation after C-c k waits for a confirming k
 (setq dsh-emacs-plugin-bridge-token "…")           ; dsh-plugins-bridge bearer token (nil = use DSH_BRIDGE_TOKEN); see docs/plugins.md
 (setq dsh-emacs-plugin-bridge-base-url nil)        ; nil = <dsh-emacs-base-url>/plugins-bridge/v1
 (setq dsh-emacs-plugin-bridge-timeout 10)          ; seconds for bridge catalog/detail/route-list GETs and synchronous route calls
@@ -146,11 +152,37 @@ The most commonly used options, straight in your config:
 (setq dsh-emacs-plugin-route-forward-dsh-auth t)   ; forward the same-origin DSH session Cookie on route calls so target routes' requestRejection accepts them
 ```
 
+## Render style
+
+`dsh-emacs-render-style` chooses what leads each transcript event row.
+`full` (the default) draws dsh-web's own SVG icons: per-tool variant icons,
+the Think sparkle, todo checklist, goal dartboard and turn-trigger paper
+plane. On non-graphical frames and in Emacs builds without SVG support there is
+no emoji fallback: ordinary tool rows use one dot in the tool accent, while
+goal tools and the Think, todo and turn-trigger rows keep their `◎`, `✶`, `▤`
+and `➤` text glyphs.
+
+- `simple` leads every event row with one dot and mutes the rest of the row:
+  titles and summaries use `dsh-emacs-event-row-face` (readable grey; labels
+  add bold) and status text uses the muted metadata face, so color is reserved
+  for the leading dot. Tool dots follow state (purple
+  `dsh-emacs-tool-icon-face` pending, green `dsh-emacs-tool-success-face`
+  success, red `dsh-emacs-tool-error-face` error,
+  `dsh-emacs-tool-stopped-face` stopped); the live Think dot uses
+  `dsh-emacs-thinking-face` and the completed fragment's dot joins the muted
+  row (its title text is muted too); todo `dsh-emacs-tool-icon-face`, goal
+  `dsh-emacs-composer-goal-face`, and turn-trigger `dsh-emacs-meta-face`.
+- The option restyles newly rendered rows only; reopen a session or wait for
+  new rows to update an existing transcript. The `⏸ interrupted` body line and
+  execution-status dots are unchanged; `simple` renders the interrupted tool
+  leading mark as a stopped-face dot instead of `◐`. Expanded card bodies keep
+  their own content colors (for example an error footer or a todo checkbox).
+
 ## Reading history
 
 | Key | Command | Behavior |
 |---|---|---|
-| `C-c C-o` | `dsh-emacs-load-older-history` | Load 3 complete earlier rounds; invoke again while loading to cancel |
+| `C-c C-o` | `dsh-emacs-load-older-history` | Load 3 complete earlier user+assistant rounds; invoke again while loading to cancel |
 | `C-u 1 C-c C-o` | Same, with prefix | Load one complete earlier round |
 | `C-u 5 C-c C-o` | Same, with prefix | Load five complete earlier rounds |
 | `C-c >` | `dsh-emacs-goto-latest` | End of draft, following new output in this window |
@@ -160,18 +192,23 @@ Imenu frontend; the chat buffer installs its user-message index and rescans it
 automatically.
 
 `dsh-emacs-history-rounds` defaults to 3 and controls manual `C-c C-o` loads.
-Opening a fresh chat completes only the latest round, independently of this
-option: the initial snapshot appears first, then additional pages fetch that
-round's start if needed without moving your draft cursor. No extra pages are
-requested when the snapshot already contains a round start. Switching to an
-already-open chat reuses its existing transcript. Reconnects do not restart a
-canceled load. The active round counts too: completeness means including its
-start and all available events, not waiting for the assistant to finish.
+Opening a fresh chat completes only the latest human round, independently of
+this option: the initial snapshot appears first, then additional pages fetch
+that round's start if needed without moving your draft cursor. A snapshot that
+starts at a host-woken turn also backs up to the preceding human round. No
+extra pages are requested when the snapshot already contains a human round.
+Switching to an already-open chat reuses its existing transcript. Reconnects do
+not restart a canceled load. The active human round counts too: completeness
+means including its user message and all available following turns, not
+waiting for the assistant to finish.
 
-A round is a server `turn/start` boundary and all its following events up to
-the next round; a partially visible oldest round is completed first and counts
-toward the requested number. Automatic goal continuations count too. Rounds
-refer to the original server numbers, not a count of visible user questions.
+A **human round** is a turn containing a user-authored message. Child messages,
+settled subagents and goal continuations wake turns without a user prompt; they
+belong to the human round that preceded them. Child- and goal-woken turns
+therefore load with that earlier human round, and a loaded page starts at the
+oldest kept human round's turn. The numbers in `Loaded rounds X–Y` are turn
+numbers, so a run of host-woken turns inside the range is not counted in the
+round total.
 
 `dsh-emacs-history-window` limits messages per network batch, including the
 opening snapshot. Long rounds may take multiple requests: the smaller the
@@ -301,11 +338,11 @@ These default keys apply in the session list opened by `M-x dsh-emacs`:
 | `u` | Restore an archived session (pick from the archive set) |
 | `/` | Search |
 | `g` | Refresh |
-| `TAB` | Toggle a workspace header or a session's direct subagents |
+| `TAB` | Toggle a group header or a session's direct subagents |
 | `W` | Create a workspace |
 | `R` | Rename the workspace under point |
 | `D` | Delete the workspace under point |
-| `M` | Move the session under point to another workspace |
+| `M` | Reorder the workspace under point |
 | `w` | Filter by workspace; empty input clears the filter |
 
 ### Forking conversations
@@ -333,10 +370,24 @@ The same `session/rename` RPC is available without leaving a chat buffer:
 picker), prefilled with its current title; outside a chat buffer it asks for
 the session with completion.
 
+`Recents` leads the list with the 15 most recently updated visible sessions,
+newest first. `dsh-emacs-session-recents-limit` changes the count; zero hides
+the group. Each recent row prefixes its title with `[workspace]`; workspaces
+without a title use their directory basename, and unassigned sessions show
+`Ungrouped`. The same sessions remain in their workspace or `Ungrouped` group.
+Set `dsh-emacs-session-recents-show-workspace` to nil to hide the prefix
+(default: t). Changes take effect on the next list redraw; `g` refreshes it.
+The `w` workspace filter hides Recents entirely; clearing the filter restores
+it. Recents excludes archived sessions,
+sessions of subagent origin and blank sessions other than the current one. Its rows
+retain their actual workspace context for commands such as `c`, `R` and `M`.
+Subagent expansion is shared between both occurrences of a session.
+
 Workspace and `Ungrouped` groups start expanded by default. Set
-`dsh-emacs-workspaces-collapsed-by-default` to non-nil to start with all
-groups collapsed. `M-x dsh-emacs-collapse-workspaces` and
-`M-x dsh-emacs-expand-workspaces` fold or unfold every group in the list.
+`dsh-emacs-workspaces-collapsed-by-default` to non-nil to start those groups
+collapsed; Recents initially stays expanded. `TAB` or `RET` on any group
+header overrides its fold state. `M-x dsh-emacs-collapse-workspaces` and
+`M-x dsh-emacs-expand-workspaces` fold or unfold every group, including Recents.
 
 Subagents start collapsed beneath their parent session. `TAB` on a session
 row expands its direct children; repeat on a child to reveal nested children.
@@ -370,11 +421,20 @@ which controls new-session creation only.
 
 Opening the list from a chat (`M-x dsh-emacs`, `C-c C-l`) puts the cursor on
 that chat's session row, even after switching back from a more recently
-opened chat, and scrolls it into view; for a subagent, its
-ancestors and workspace are expanded. When a session sits in a folded group, the group
+opened chat, and scrolls it into view. `dsh-emacs-session-jump-target` chooses
+the occurrence: `recents` (default) preserves the preference for Recents when
+present, falling back to the canonical workspace or `Ungrouped` session row
+when absent (including when Recents is disabled); `workspace` always selects
+that canonical session row, not the workspace header. For example, set
+`(setq dsh-emacs-session-jump-target 'workspace)` to return to project context
+even when the session also appears in Recents. This option does not change
+explicit project-root workspace navigation described above. For a subagent,
+its ancestors and the containing group are expanded.
+When a session sits in a folded group, the group
 is unfolded to show it, and a `w` workspace filter that
 would hide the row is cleared. Refreshing the list in place (`g`, events,
-auto-refresh) instead keeps the row you are on. If archiving or deleting removes
+auto-refresh) instead preserves point on the row you are on, without applying
+the jump-target preference. If archiving or deleting removes
 that row, focus moves to the next surviving row in the previous list order,
 or the preceding row when none follows. Opening a list that is
 already live reuses the cached rows — the server's event stream keeps them
@@ -403,6 +463,30 @@ Set `dsh-emacs-modeline-permission-style` to `text` to show the full preset
 name instead, or remove `permission` from `dsh-emacs-modeline-format-spec`
 like any other segment (see [Mode-line Status](modeline.md)).
 
+## Typing from the transcript
+
+The transcript is read-only; typing or editing from it moves point to the
+composer first. `dsh-emacs-composer-typing-commands` lists the common editing
+commands that get this pre-command jump and the automatic scroll to the input.
+The default list includes `insert-register` and the chat paste command. Routing
+runs before the command reads interactive arguments, so a register is selected
+once. Commands outside the list retain their standard read-only behavior;
+return to the input before using them, or explicitly add a command that edits
+at point:
+
+```elisp
+(add-to-list 'dsh-emacs-composer-typing-commands 'my-insert-command)
+```
+
+Mouse commands that choose their own insertion location still use that
+location; click in the editable input to paste with the mouse. See
+[decision 168](../postmortem/168-composer-command-boundaries.md) for the routing
+boundary and the rejected generic interception approach.
+
+Model-bound messages trim leading and trailing whitespace for the sent text,
+transcript echo and prompt history. A failed submit restores the original
+draft, including its whitespace, unless a newer draft has taken its place.
+
 ## Goal actions
 
 The composer shows the session's current goal above the input; when a message
@@ -419,16 +503,35 @@ chat buffer, `C-c C-g` opens the goal-action prefix:
 | `C-c C-g ?` | Show the full objective and blocked reason |
 
 `dsh-emacs-composer-goal-actions` controls whether inline action buttons are
-shown by default. Hiding them leaves the keyboard commands available.
+shown by default. Hiding them leaves the keyboard commands available. When
+Emacs cannot draw SVG, the inline cells use text fallbacks: `||` pause, `▶`
+resume, `✎` edit and `✕` clear.
 Steering items take priority in the separate Next Message preview; hover for
 the full text, and click or press RET on the cells just after the preview: the
-up arrow sends that message now (steering the running turn, or re-submitting
-a text-only item while idle — the same verb RET runs in `C-c C-q`), `✎` edits its text
-in the minibuffer (text-only messages; the manager's `e`), and `🗑` deletes it
-\(the manager's `d`). Before the server confirms a newly queued item, its
-preview has no action cells. Sending an item with attachments while idle
-reports an error and leaves the original item queued. `C-c C-q` manages the
-whole queue and applies the same send-now restriction.
+up arrow sends that message now (steering the running turn, or submitting a
+text-only item literally while idle). In `C-c C-q`, select the entry and
+press RET for the same action. Queued text is never re-parsed and the draft
+stays in the input. `✎` edits its text in the minibuffer (text-only messages;
+the manager's `C-c e`), and `✕` deletes it (the manager's `C-c d`). Before the
+server confirms a newly queued item, its preview has no action cells. Sending
+an item with attachments while idle reports an error and leaves it queued.
+`C-c C-q` manages the whole queue and applies the same send-now restriction.
+
+## Queue and job menus
+
+`C-c C-q` opens the pending-message list. Type to filter it or use your
+completion frontend's normal navigation. `RET` or `C-c s` sends the selected
+entry now, `C-c e` edits it, `C-c d` deletes it, and `C-c x` deletes the whole
+queue after confirmation. The last action needs no matching entry.
+
+An entry that carries an image or file cannot be edited: the edit replaces its
+content with a single text block, so `C-c e` reports that and leaves it queued.
+
+`C-c C-j` opens the background-job list, with live jobs first. `RET` shows
+the selected job's output. `C-c k` stops it after a confirming `k` within
+`dsh-emacs-jobs-kill-arm-seconds`; `C-c r` refreshes the roster without
+selecting a job. `C-g` cancels a picker or confirmation. Plain letters never
+trigger menu actions.
 
 ## Markdown responsiveness
 
@@ -450,6 +553,34 @@ result, property installation, GC and redisplay still take synchronous work.
 An interrupted attempt may repeat computation; a formatting error is reported
 and leaves the raw reply visible. See
 [decision record 036](../postmortem/036-bounded-stream-markdown.md).
+
+## Desktop notifications
+
+`dsh-emacs-enable-notifications` (default **t**) posts a desktop notification
+when a submitted run finishes, or when an ask-question or approval request
+arrives, and its chat is not visible on a focused frame. Replayed host frames
+do not notify again; set the option to **nil** to keep quiet.
+
+Clicking the notification returns to that session when the backend supports an
+action:
+
+- **GNU/Linux (D-Bus)**: dsh-emacs registers an `Open session` action through
+  `notifications-notify`. The desktop notification service must advertise
+  action support; otherwise the banner still appears but has no action.
+- **macOS**: install
+  [terminal-notifier](https://github.com/julienXX/terminal-notifier)
+  (`brew install terminal-notifier`) and keep an Emacs daemon/server running
+  with `M-x server-start` (this is the Emacs server, separate from the dsh
+  server). The click runs `emacsclient` to select the chat and activates the
+  Emacs bundle (`org.gnu.Emacs`). Without terminal-notifier, or without the
+  Emacs server, the banner still appears through Emacs itself but clicking
+  only activates the application.
+
+The action reopens the chat even after its buffer was killed, using the
+session cache for ordinary sessions and the direct parent's catalog for child
+conversations. A child needs no session summary, but must still have a cached
+catalog entry to recover its address. If that entry or the ordinary session
+is no longer available, the click reports that the session is unavailable.
 
 ## Approval prompts
 
@@ -537,7 +668,7 @@ If the window does close before an answer — for example because the question
 was queued behind another session's prompt — the question becomes **pending**
 instead of lost:
 
-- the transcript's ask row reads `❓ Ask question · pending`, and its expanded
+- the transcript's ask row reads `Ask question · pending`, and its expanded
   body keeps the questionnaire and names the recovery command;
 - `M-x dsh-emacs-answer-question` (`C-c C-p`) lists the session's pending
   questions (one call is answered directly; several are chosen by their first

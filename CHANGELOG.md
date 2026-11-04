@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 sections carry the planned next version (pre-1.0: `fix` → patch, features →
 minor) and stay undated until the release is cut.
 
-## 0.8.0 - Unreleased
+## 0.9.0 - Unreleased
 
 ### Added
 
@@ -19,7 +19,7 @@ minor) and stay undated until the release is cut.
   JSON object. New options `dsh-emacs-plugin-bridge-token`,
   `dsh-emacs-plugin-bridge-base-url` and `dsh-emacs-plugin-bridge-timeout`
   configure the bridge; the token also falls back to `DSH_BRIDGE_TOKEN`.
-  (rationale: postmortem/154)
+  (rationale: postmortem/182)
 - **Call plugin HTTP routes through dsh-plugins-bridge**:
   `M-x dsh-emacs-plugin-routes` lists the bridge's discovered route groups,
   lets you choose a target path, method, optional body and Content-Type, then
@@ -39,7 +39,7 @@ minor) and stay undated until the release is cut.
   `M-x dsh-emacs-plugin-insert-route-call` walks the same selection, reads a
   nonempty body for body-bearing methods and inserts the corresponding
   `dsh-emacs-plugin-routes` call at point.
-  (rationale: postmortem/155, postmortem/156)
+  (rationale: postmortem/183, postmortem/184)
 
 ### Fixed
 
@@ -47,6 +47,393 @@ minor) and stay undated until the release is cut.
   opt out of awesome-tray's global mode-line face shrink with a buffer-local
   face remapping, so the DSH status line renders at its normal height and
   colors while every other buffer keeps the thin tray line.
+
+## 0.8.0 - 2026-11-04
+
+### Breaking Changes
+
+- **Thinking rows start collapsed**: `dsh-emacs-thinking-expand-by-default` is
+  removed. The `expand` style still streams the reasoning body visibly, but the
+  folded Think row now always starts collapsed; open it in place to read the
+  body, and that fold state persists. `inline` already started collapsed.
+  (rationale: [postmortem/164](postmortem/164-thinking-inline-style.md))
+
+- **Rename the thinking visibility option**: `dsh-emacs-show-reasoning` is now
+  `dsh-emacs-show-thinking`, matching the Think row and the other `thinking-*`
+  options. Update any `setq` in your configuration; the wire content kind stays
+  `reasoning`. (rationale: [postmortem/166](postmortem/166-show-thinking-rename.md))
+
+- **Remove inert transcript options**: `dsh-emacs-tool-preview-lines` and the
+  eight unused `-bg` palette options (`dsh-emacs-color-tool-{pending,success,error}-bg`,
+  `dsh-emacs-color-thinking-bg` and their `-dark` forms) never affected
+  rendering; remove them from configurations.
+  (rationale: [postmortem/167](postmortem/167-inert-surface-cleanup.md))
+
+- **Rename the tool-call preview cap**: `dsh-emacs-tool-call-chars` is now
+  `dsh-emacs-max-tool-call-chars`, matching `dsh-emacs-max-tool-result-chars`.
+  (rationale: [postmortem/167](postmortem/167-inert-surface-cleanup.md))
+
+- **Remove unused Markdown faces**: the thirteen `dsh-emacs-markdown-*-face`
+  definitions in `dsh-emacs-faces.el` never rendered transcript Markdown; the
+  converter uses the `dsh-emacs-markdown-*` faces in `dsh-emacs-markdown.el`.
+  Remove any `custom-set-faces` entries for the `-face` names.
+  (rationale: [postmortem/167](postmortem/167-inert-surface-cleanup.md))
+
+### Added
+
+- **Return from navigation with `M-,`**: file and session references, local
+  Markdown links, session-list visits, new chats, skills/configuration files,
+  plans, images and job output now record their departure in Emacs's xref
+  history. Live child visits record immediately; first child visits still
+  wait for their follow snapshot. Failed and no-op visits add no entry.
+  (rationale: [postmortem/181](postmortem/181-navigation-return-history.md))
+
+- **Show workspace names in Recents**: recent session rows display their
+  workspace before the title, using the directory basename when untitled or
+  `Ungrouped` for unassigned sessions. Enabled by default; set
+  `dsh-emacs-session-recents-show-workspace` to nil to hide the prefix.
+
+- **Click notifications to reopen their chat**: a run-finished, question or
+  approval notification now switches back to that session when clicked.
+  Closed child conversations reopen through their direct parent's catalog,
+  including children without a session summary.
+  GNU/Linux D-Bus notifications carry an `Open session` action; on macOS the
+  click works with `terminal-notifier` and a running Emacs server, while the
+  built-in notification still only activates Emacs.
+  (rationale: [postmortem/169](postmortem/169-notification-click.md))
+
+- **Extend the commands that jump to the composer**:
+  `dsh-emacs-composer-typing-commands` lists the editing commands that park
+  point at the input when invoked from the read-only transcript, including
+  register insertion and chat paste. Append other commands that edit at point;
+  unlisted commands retain their standard read-only behavior.
+  (rationale: [postmortem/168](postmortem/168-composer-command-boundaries.md))
+
+- **Copy session id**: `M-x dsh-emacs-copy-session-id` copies the current
+  chat's session id, or the session-list row at point, to the kill ring.
+  Subagent rows copy the child session id.
+
+- **Inline Think rows**: `dsh-emacs-thinking-style` chooses how live reasoning
+  appears. The default `expand` keeps the existing behavior (body streams
+  visibly, then folds); `inline` renders dsh web's compact collapsed Think row
+  from the first delta, with a preview that follows the latest completed
+  paragraph and stays at its position when the answer settles. Inline rows are
+  expandable in place and start collapsed; open a row to read the body.
+  (rationale: [postmortem/164](postmortem/164-thinking-inline-style.md))
+
+- **Choose transcript event icons**: `dsh-emacs-render-style` defaults to
+  `full` (dsh-web SVG icons) and offers `simple`, where every event row leads
+  with one state-colored dot and the rest of the row uses the muted
+  `dsh-emacs-event-row-face`. The Think title is muted; its live dot keeps the
+  thinking accent and settles to grey when the fragment completes. Emoji
+  fallbacks are removed: on displays that cannot draw SVG, `full` uses one dot
+  for ordinary tool rows while goal tools and the Think, todo and turn-trigger
+  rows keep their text glyphs. Composer pause/clear and queued-message delete
+  use `||` and `✕` when Emacs cannot draw SVG; typed emoji still render.
+  (rationale: [postmortem/161](postmortem/161-event-icon-style.md))
+
+- **Hide Recents while filtering workspaces**: `w` shows only the selected
+  workspace; clearing the filter restores Recents. (rationale: [postmortem/158](postmortem/158-filter-hides-recents.md))
+
+- **Choose the session-list jump target**: `dsh-emacs-session-jump-target`
+  makes chat-to-list navigation (`C-c C-l` or `M-x dsh-emacs`) prefer `recents`
+  by default, falling back to the canonical workspace or `Ungrouped` session
+  row when absent, or always select that canonical row with `workspace`.
+  Explicit project-root workspace navigation and point-preserving refreshes
+  are unchanged. (rationale: [postmortem/157](postmortem/157-session-jump-target.md))
+
+- **Recents at the top of the session list**: an initially expanded group
+  shows the 15 most recently updated visible sessions across workspaces,
+  while retaining their original workspace rows. Set
+  `dsh-emacs-session-recents-limit` to change the count or use zero to hide
+  it. Workspace filtering, group folding and session commands also work in
+  Recents. (rationale: postmortem/154)
+
+### Fixed
+
+- **Restore pending messages when reopening a chat**: the queue preview and
+  `C-c C-q` retain the latest server queue state when the shared connection
+  stays open, including changes received while the chat was closed.
+  Reconnecting an open chat preserves pending queue edits and deletions.
+
+- **Highlight only the attachment remove glyph**: surrounding spaces stay
+  outside the hover and click target; clicking the cross or RET removes that
+  file.
+  (rationale: [postmortem/176](postmortem/176-attachment-state-owner.md))
+
+- **Model commands initialize the package on first use**: autoloading
+  `dsh-emacs-select-model` or `dsh-emacs-select-effort` loads the session
+  coordinator before running the command, preserving startup behavior after
+  the model module extraction.
+  (rationale: [postmortem/174](postmortem/174-model-selection-owner.md))
+
+- **Queue edit refuses attachment items**: `C-c e` on a queued message that
+  carries an image or file now reports that and leaves it queued, instead of
+  replacing its content with one text block and dropping the attachment.
+
+- **Model picker keeps duplicate ids distinct without group titles**: when
+  `vertico-group-format` is nil the picker falls back to provider header rows
+  and `id (Provider)` suffixes instead of drawing identical rows.
+
+- **Render Markdown across text fields**: resource scanning no longer stalls
+  when adjacent text has different `field` properties, and links spanning
+  those fields keep their full target.
+
+- **Scan resources without testing every character**: a long reply no longer
+  pays a per-character resource lookup, so link-free text and long
+  non-wrapping paragraphs stream faster. Rendering output is unchanged.
+  (rationale: [postmortem/172](postmortem/172-resource-scan-prefilter.md))
+
+- **Long link-heavy replies render faster**: resolved links release their
+  parse markers before emphasis edits, so formatting a reply with many links
+  no longer moves markers that text properties already replace. Other replies
+  are unaffected, and bold, italic and link output is unchanged.
+  (rationale: [postmortem/171](postmortem/171-markdown-marker-lifetime.md))
+
+- **Bold follows CommonMark's flanking rules**: assistant replies now format
+  `这是**重点**内容`, `（**重点**）` and `word**bold**tail` without leaving
+  literal stars, including when delimiters arrive in separate streaming chunks.
+  Space-padded and escaped delimiters stay literal, as do code spans; italics
+  and strikethrough keep their existing boundary rules.
+
+- **Broken event JSON is diagnosed**: malformed JSON on chat and core
+  sockets reports the failing decode layer; valid unrelated frames remain
+  silent. (rationale: [postmortem/170](postmortem/170-event-and-menu-boundaries.md))
+
+- **RET and C-j from the transcript keep the prompt intact**: a composer
+  guard clamps `delete-horizontal-space` to the editable input, so
+  electric-indent, `newline-and-indent` and the C-j entry
+  (`electric-newline-and-maybe-indent`) can no longer try to delete the
+  read-only `❯ ` space; both keys open a new line after reading history.
+  Supported commands route before reading interactive arguments, so a
+  register selection is consumed once.
+
+- **Routing from history re-protects reference chips**: the reference-chip
+  guard runs again after the cursor hops to the composer, so overwrite and
+  insertion commands cannot replace a leading chip's first character; `C-q`
+  in `binary-overwrite-mode` no longer turns `@file.txt` into `Xfile.txt`.
+
+- **Sent text is trimmed**: submitting a message strips leading and trailing
+  whitespace from the model-bound text and its transcript echo, matching the
+  web composer. Command routing still reads the raw line, so a leading space
+  cannot change which kind of submit it is. An attachment-only caption may
+  therefore be empty. Failed submissions restore the original untrimmed draft.
+
+- **The sessions list shows the DSH icon**: the `*dsh-sessions*` mode line no
+  longer falls back to the generic Emacs file icon; it carries the whale like
+  a chat buffer and stays fileless.
+
+- **Typing from more chat places reaches the input**: RET, TAB, insert-char,
+  completion and the other common insert commands now jump to the composer
+  from the transcript; a cursor below the input continues at the draft end
+  instead of editing the separator.
+
+- **Live reload keeps ask and approval prompts**: reloading into a build
+  that shares one core connection now adopts the previous socket (or closes
+  leftovers and rebuilds it), so questions, approvals and live session
+  updates keep arriving after `M-x dsh-emacs-reload`; losing a socket the
+  reload left unowned still arms a reconnect.
+
+- **`C-q` in overwrite mode keeps an `@` reference**: the chip delete advice
+  now promotes only a user-level delete to whole-chip removal; the internal
+  `delete-char` that `quoted-insert` uses in overwrite mode replaces one
+  character after the chip instead of swallowing the whole reference.
+
+- **Text can be typed before an `@` reference**: the composer chip guard no
+  longer hops past a session/file chip when an insertion starts at its
+  leading edge, so typing or yanking immediately before a completed
+  reference works; edits starting inside the chip still hop out and cannot
+  split it. In `overwrite-mode` the guard keeps hopping, so overwriting
+  cannot replace the chip's first character and silently drop the
+  reference.
+
+- **A stale plan decision cannot retire a re-issued request**: the approval
+  callback is bound to the event id it was sent for, so when the host
+  re-issues the same plan under a new waterfall, a late success or failure
+  response is ignored and the new request stays answerable.
+
+- **The latest session-list refresh wins**: overlapping `session/list`
+  requests now carry a generation, so an older response that arrives after a
+  newer one no longer rolls the cache back; superseded responses still
+  balance the refresh replay but do not install, sync or re-baseline.
+
+- **Job menu labels stay unique**: a job whose description already looks like
+  a generated suffix no longer collides with another job's label, so a menu
+  action always resolves to the job it names.
+
+- **Killing a job output buffer cancels its stream**: closing the buffer with
+  `kill-buffer` now retires its `job/follow` handler like `q` does, instead
+  of leaving the subscription on the chat socket until the job ends.
+
+- **Re-opening a job from another chat moves the output subscription**: the
+  previous chat's `job/follow` stream is cancelled on the socket that opened
+  it, and closing that chat no longer kills a view the new chat still owns.
+
+- **`M-x dsh-emacs-reference` inserts the picked reference**: the menu used to
+  insert its display row (a bare path or session label), so a file pick lost
+  its `@` and a session pick had no canonical mention. The display row now
+  maps back to the mention behind it.
+
+- **`@` file and session rows stay distinct**: a file path and a session label
+  that spell the same text no longer collapse into one row (the session row
+  gains a ` #n` suffix), so picking the file references the file instead of
+  the session.
+
+- **`@` session-reference rows stay unique**: a session label that already
+  looks like a generated suffix no longer aliases another session, so
+  completing the row references the session it names.
+
+- **A synchronous command-list read keeps the newest catalog**: it supersedes
+  a prefetch already in flight, and if a newer prefetch lands while the sync
+  read waits, that catalog is kept instead of being overwritten by the older
+  synchronous result.
+
+- **Closing a plan document keeps its decision alive**: the approval
+  request is now owned by the chat buffer instead of the closable document,
+  so a response arriving after the document is closed still settles the
+  review; a failure clears "Sending decision…" and the reopened document can
+  retry.
+
+- **A late session-list refresh no longer rolls back live state**: the lazy
+  `session/list` fetch behind a missing agent preset now uses the
+  replay-protected refresh, so running status and titles delivered while the
+  response was in flight survive the stale snapshot. The cache update no
+  longer belongs to the caller's chat buffer, and a response that outlives
+  the last list/chat owner updates the cache without re-creating an
+  unsupervised core connection.
+
+- **Queue menu labels stay unique**: an item whose text already looks like a
+  generated suffix (e.g. `same [2]`) no longer collides with another item's
+  suffix, so a menu action always resolves to the message it names.
+
+- **Chats opened without the list get core events**: the host-wide
+  `session/control` + `$events` connection is now kept alive by the session
+  list or any live chat, not by the list alone. Opening a session directly
+  (`M-x dsh-emacs-new-session` or `dsh-emacs-open-session`) without the list
+  now receives queue projections, questions and approvals, and closing the
+  list no longer cuts them off while a chat stays open. A temporary connect
+  error no longer aborts the chat's activation (the follow stream still
+  starts and the core connection retries), and leaving chat mode releases
+  the chat's ownership so the connection closes with the real last owner.
+
+- **Send-now keeps queued text literal**: sending a queued item while idle
+  submits its text as an ordinary message instead of routing it back through
+  the composer. A queued `!command` no longer runs locally, a queued `/name`
+  no longer executes as a command, and the draft being edited in the input
+  area is no longer cleared.
+
+- **Empty question text shows its options**: an `ask_user_question` call whose
+  question text is empty but carries an id and options now renders the
+  questionnaire, using "Question" as the placeholder, instead of falling back
+  to the raw argument JSON and hiding every option.
+
+- **Question options survive deletion**: completion candidates are the plain
+  option labels with the ordinal shown as a display affix, so completing an
+  option and then deleting it restores every candidate instead of leaving the
+  numbered prefix behind; typed numbers still resolve to their option.
+  Whitespace-only answers are treated as skip.
+
+- **Skipped questions read Skipped**: an empty answer (empty input or the Skip
+  key) now closes its card row as `Skipped` instead of `Not answered`, and still
+  does not count toward the answered total.
+
+- **Keep elapsed time across stream reconnects**: a running chat preserves its
+  original activity start time when the WebSocket reconnects, including failed
+  retries, instead of restarting the mode-line clock from zero.
+
+- **Keep streaming chats responsive**: WebSocket business messages now dispatch
+  in short, ordered batches while Ping/Pong controls are serviced before
+  rendering. Large bash-output bursts no longer hold modeline timers behind
+  the entire batch. Disconnects cancel pending dispatch work.
+  (rationale: [postmortem/163](postmortem/163-bounded-websocket-dispatch.md))
+
+- **Running subagent keeps the mode-line animation alive**: when a parent turn
+  ends while one of its direct children is still running, the parent chat's
+  whale and elapsed activity clock keep going until the last child settles.
+  The session itself stays non-busy, so submission, steering and stop keep
+  their normal turn semantics. Opening or reconnecting a chat restores this
+  activity from cached child state; disconnecting clears it and prevents
+  host updates from restarting it in the detached chat.
+
+- **Quiet socket-loss teardown**: a buffered frame whose dispatch tried to
+  write after the peer closed the connection (a pong or a follow rebaseline)
+  no longer reports `dsh WebSocket frame error: ... no longer connected to
+  pipe`; the disconnect path cleans up and reconnects as before.
+
+- **Session list honours `dsh-emacs-server-auto-start'**: opening a cold
+  session list now refuses with startup instructions when the option is nil
+  and the server is unreachable, instead of offering to install the CLI or
+  launching a local server behind the user's back.  An explicit
+  `M-x dsh-emacs-server-start` is unchanged.
+
+- **Attribute subagent- and event-driven turns**: a host-injected notice that
+  the inbox claim wakes (a child `send_message`, a settled subagent, or a
+  team, webhook, schedule, job or plugin event) now renders dsh web's
+  collapsed turn-trigger row above the turn's **Completed in …** summary
+  instead of disappearing. The row names its source, folds the recorded body
+  behind RET and stays visible when the turn folds; the idle step-1 case is
+  recognized too, so child-driven turns no longer read as unprompted replies.
+  Mid-turn, canceled and requeued injections stay hidden.
+  (rationale: [postmortem/159](postmortem/159-turn-trigger-notices.md))
+
+- **History rounds follow user+assistant**: `C-c C-o` counts and starts a
+  loaded page at a turn with a user-authored message, so a child- or
+  goal-woken turn is loaded with the human round it belongs to instead of
+  topping the range as an orphan trigger and answer.  Opening a snapshot that
+  starts on such a turn backs up to the preceding user prompt.
+  (rationale: [postmortem/160](postmortem/160-history-human-rounds.md))
+
+- **Older-history exhaustion at the start**: pressing `C-c C-o` when only
+  non-round seed records remain now reports "Beginning of history" instead of
+  claiming to load history events with no round boundaries.
+
+- **Live session activity ordering**: sending a message now updates the
+  session's cached activity time, so Recents and workspace rows reorder
+  immediately. Activity received during a list refresh survives its snapshot,
+  and older events cannot roll back newer timestamps. (rationale: postmortem/154)
+
+- **Readable RPC errors**: failed requests now report the server's message and
+  error code instead of the raw error alist. A fork refused because the source
+  session's preset no longer exists also lists the presets the server provides.
+
+- **Drafts survive a missing preset**: when `session/create` reports
+  `agent-preset/not-found` or `agent-preset/invalid`, the draft keeps its text
+  and retries once without the preset, continuing under the host default,
+  including when `dsh-emacs-default-preset` names a preset the server no
+  longer has. (rationale: postmortem/156)
+
+- **Approval and question prompts close when another client answers**: the
+  readers now start outside the WebSocket dispatcher, so the host's `cancel`
+  frame is dispatched while the prompt waits; approval prompts also stay in
+  the minibuffer instead of a native dialog that a remote cancel cannot
+  dismiss. (rationale: [postmortem/165](postmortem/165-prompt-dispatcher.md))
+
+### Changed
+
+- **Queue and job menus keep typing separate from actions**: `C-c C-q` and
+  `C-c C-j` open one normal completion list. `RET` sends a queued message or
+  shows job output; `C-c` action keys edit, delete, stop or refresh. Actions
+  use the frontend's confirmed selection, so ordinary letters remain input.
+  (rationale: [postmortem/173](postmortem/173-native-menu-selection.md))
+
+- **Group render options with the renderer**: `dsh-emacs-stream-markdown-limit`
+  and `dsh-emacs-reply-footer-items` now appear in the `dsh-emacs-render` Custom
+  group; their names, defaults and behavior are unchanged.
+
+- **Static command-row status**: slash-command and local `!` command rows no
+  longer run the `-\|/` timer animation.  The leading dot/icon and pending
+  header tint carry the running state, matching the session list's color
+  language and removing per-command timers, reconnect revival and their
+  redraw paths. (rationale: [postmortem/162](postmortem/162-static-command-rows.md))
+
+- **Preset picker uses server labels**: new-session preset choices show a
+  preset's published `name` and fall back to its id. The client-side English
+  names for the shipped presets (`Standard mode` …), which the server does not
+  publish, are removed, so those choices read `standard`, `minimal`, `ptc` and
+  `cordis`. Choices that would render identically append the preset id. When
+  the roster is not cached yet, the picker ensures the server is ready and
+  fetches it before prompting; a failed fetch reports an error instead of
+  creating the session with an unchosen preset. (rationale: postmortem/155)
 
 ## 0.7.0 - 2026-10-23
 

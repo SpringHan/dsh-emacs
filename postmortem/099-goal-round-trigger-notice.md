@@ -1,5 +1,9 @@
 # 099 — Goal round trigger notice in the transcript
 
+_Status: partly superseded by [159](159-turn-trigger-notices.md) — the
+transcript now replays inbox claims for non-goal wake notices; the goal
+round keeps this unconditional notice._
+
 ## Background
 
 A goal that stays active continues itself: `goal-round-driver` appends one

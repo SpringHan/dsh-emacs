@@ -1,5 +1,7 @@
 # 130 — Decode host events at their application boundaries
 
+Activity timestamp policy superseded by [154](154-session-recents.md).
+
 ## Background
 
 At `3c4f069`, core event dispatch reads `$events` fields through the renderer,

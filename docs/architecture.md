@@ -4,9 +4,9 @@ Module ownership:
 
 ```
 dsh-emacs/
-├── dsh-emacs.el              # Main entry point, session management, mode definition
+├── dsh-emacs.el              # Entry point, chat mode and session/submit coordination
 ├── dsh-emacs-protocol.el     # Typed views of dsh RPC payloads (cl-defstruct)
-├── dsh-emacs-ui.el           # Fragment snapshots, borders, folding, fragment faces
+├── dsh-emacs-ui.el           # Fragment snapshots, folding, faces, completion frontend and xref return navigation
 ├── dsh-emacs-faces.el        # Shared faces and palette defaults
 ├── dsh-emacs-tokens.el       # Token tracking and formatting
 ├── dsh-emacs-markdown.el     # Markdown syntax highlighting
@@ -20,11 +20,15 @@ dsh-emacs/
 ├── dsh-emacs-plan.el         # Plan documents, asynchronous review and decisions
 ├── dsh-emacs-server.el       # HTTP/RPC client, server bootstrap, authentication, configuration entry
 ├── dsh-emacs-provider.el     # Minibuffer provider setup through settings and credential RPCs
+├── dsh-emacs-model.el        # Model/effort catalog readers, picker options and selection RPCs
+├── dsh-emacs-interaction.el  # Question/approval readers, prompt slot, waits and late answers
+├── dsh-emacs-attachments.el  # Acquisition, staged attachment state, media setup and file uploads
 ├── dsh-emacs-command.el      # Slash surface: commands/list + commands/execute, "/" completion and menu
 ├── dsh-emacs-skill.el        # Skill catalog (skills/list) and /name gestures
 ├── dsh-emacs-plugin.el       # dsh-plugins-bridge API and HTTP route proxy
 ├── dsh-emacs-shell.el        # Client-side `!command` shell commands (local execution)
 ├── dsh-emacs-reference.el    # @ reference completion, chips and navigation
+├── dsh-emacs-input.el        # Input geometry, editing/undo, completion and prompt history
 ├── dsh-emacs-composer.el     # Composer chrome: Next Message and Goal rows above the input
 ├── dsh-emacs-reload.el       # Local source reload and bounded presentation refresh
 └── dsh-emacs-session.el      # Session list card view
@@ -46,10 +50,12 @@ order; unreadable forms and cycles reject the reload before evaluation.
 Explicit `.el` paths bypass stale bytecode. External dependencies remain owned
 by ordinary `require`; this does not reload third-party packages.
 
-This is definition and presentation reload, not an unload or session migration.
-It does not re-enter modes, reconnect transports, restart the server, send RPCs
-or submit a prompt. Existing buffers, draft text, attachments, stream state,
-processes and timers remain live. Current `defvar` and Custom option values
+Reload preserves existing buffers, draft text, attachments, stream state and
+owned transports without re-entering modes or restarting the server. A core
+socket stranded by an ownership-variable rename is adopted when it is the
+single fully opened candidate; ambiguous or unfinished leftovers are closed
+and the core connection is rebuilt for its live owners. No prompt is submitted.
+Current `defvar` and Custom option values
 remain intact, with two intentional presentation exceptions:
 
 - Existing keymaps declared by `defvar` take their source initializer's contents
@@ -59,9 +65,13 @@ remain intact, with two intentional presentation exceptions:
 - Face default specs refresh while Custom/theme overrides retain precedence.
   This is not a reset of user options or saved face customizations.
 
-After loading, the command invalidates visual image caches and refreshes
-Composer rows, session-list rows and mode-line presentation. It neither replays
-nor reformats the existing transcript. Stable named `eval-after-load` callbacks
+After loading, one completion step restores core ownership, updates composer
+guards and refreshes Composer and session-list rows. The modeline module owns
+image-cache invalidation and optional Doom icon refresh. An older loader still
+executing its previous body reaches that same completion through one deferred
+callback; the current loader cancels the callback and completes synchronously.
+See [decision 168](../postmortem/168-composer-command-boundaries.md).
+The transcript is preserved. Stable named `eval-after-load` callbacks
 register optional icon integrations without retaining a new anonymous callback
 body on each source revision.
 
@@ -104,6 +114,32 @@ into the chat composer, including recovery if a mode hook fails. Closing a draft
 does not roll back a session already accepted by the host. See
 [decision record 111](../postmortem/111-asynchronous-session-drafts.md).
 
+## Model and effort selection (`dsh-emacs-model.el`)
+
+The model module owns the live catalog's candidate presentation, provider
+grouping, model and effort readers, selection RPCs, model options and optional
+completion-icon registration. Provider configuration stays in the provider
+module. The entry point still owns session identity and cached session
+projections, and supplies the current selection to the model module.
+The model and effort command autoload cookies explicitly load `dsh-emacs`,
+so invoking either command before requiring the package still initializes the
+session coordinator. Loading the model module itself remains independent.
+
+The catalog callback decodes once and prefers the session's cached selection
+over the catalog default. Readers consume decoded data and return a choice
+without submitting RPCs or changing the modeline. An empty reader result keeps
+the current selection; unknown input and provider headers do not select a
+model. A completion frontend may accept its highlighted candidate on RET
+even when the minibuffer text is empty. Effort defaults retain the current
+effort when reselecting the model, otherwise the catalog default or first
+available effort. Callback boundaries catch quit and apply successful choices,
+then refresh the session cache; internal reader errors still propagate.
+
+The input module owns editing and undo. The entry point owns send transactions.
+This extraction does not expand Composer's
+read-only-row responsibility. See
+[decision 174](../postmortem/174-model-selection-owner.md).
+
 ## Provider setup (`dsh-emacs-provider.el`)
 
 `dsh-emacs-add-provider` reads `settings/describe`, the configurable provider
@@ -139,6 +175,31 @@ validation and activation remain owned by dsh; there is no save hook or
 settings RPC path. See [decision record 079](../postmortem/079-config-file-entry.md).
 
 ## Transcript fragments (`dsh-emacs-ui.el`)
+
+The UI module also owns optional completion-frontend integration, so the
+ordered-read helper (`dsh-emacs-ui--completing-read-ordered`) lives here and
+feature modules do not depend back on the entry point. Queue and job menus
+use one `completing-read` list with modified action keys.
+`dsh-emacs-ui-menu-entries` assigns unique labels and
+`dsh-emacs-ui-menu-read` returns `(ACTION ITEM)` after selection. Item action
+keys bind directly to the frontend's original RET command, keeping its
+command preparation hooks. A buffer-local pre-command hook records the action
+in a dynamically bound context owned by that read; each command resets it to
+its own action or the default. Global actions exit without accepting a
+candidate (ITEM is nil). One action spec per menu carries the keys, their
+actions and the global flag, so keymap, recorder and dispatch cannot drift;
+the queue/job owner executes the result after the read returns.
+Candidate order is declared through collection metadata
+(`display-sort-function`, via `dsh-emacs-ui--completing-read-ordered`) rather
+than by poking a frontend's sort variables, so stock completion, Vertico and
+Ivy all keep the menu's order (Ivy through its public
+`ivy-sort-functions-alist`, bound inside
+`dsh-emacs-ui--completing-read-ordered`).  Vertico's
+`vertico-sort-override-function` outranks that metadata, so the menu setup
+binds it away buffer-locally (`dsh-emacs-ui--menu-keep-order`).  No frontend
+internal state is read, and the selected label comes from
+`completing-read`'s return value. Each menu retains its labels, ordering,
+key table and actions.
 
 The renderer supplies a complete alist snapshot: identity, labels, body,
 border style, optional header/body faces, and the non-foldable flag. Optional
@@ -297,6 +358,13 @@ independent of the mode-line accumulator, survives reconnects and merges
 older pages; full reload clears it and transcript trimming discards summaries
 whose completed replies are gone.
 
+`dsh-emacs-render--reply-footer-label` builds the propertized label from a
+turn summary, the configured item list and the subagent flag. Its data tests
+cover usage completeness, elapsed time, item order and button payloads.
+`dsh-emacs-render--reply-footer` owns transcript boundaries, visibility
+reconciliation, tail resolution, fragment insertion and spacing. See
+[decision record 178](../postmortem/178-reply-footer-label-boundary.md).
+
 Visibility is a renderer policy, separate from those per-turn facts. Between
 rendered human messages, only the latest completed turn with a nonempty text
 reply keeps its footer. Replacing earlier footer chrome leaves reply text
@@ -325,6 +393,24 @@ configured item order without stretch spaces. See
 [decision record 084](../postmortem/084-reply-footer.md) and the placement
 correction in [086](../postmortem/086-reply-footer-turn-tail.md).
 
+## Input (`dsh-emacs-input.el`)
+
+The input module owns the editable region marker, boundary guards, consumed
+text and undo reconstruction, local path/word CAPFs and prompt history.
+Chat mode calls its completion and editing setup at their existing positions
+so reference-chip protection and undo hooks retain their execution order.
+Layout setup creates the input marker. The coordinator applies subagent
+availability, chooses send timing and decides whether failed input can be
+restored through the input operations.
+
+History state and its mutation live together, including per-session seeding
+from decoded transcript events. Slash and reference modules own their token
+semantics and frontend adapters. Input installs them alongside its local
+CAPFs. Loading input alone registers definitions and completion categories.
+Mode setup installs editing hooks and boundary advice. Interactive history
+navigation uses the assembled package's session identity. See
+[180](../postmortem/180-input-state-owner.md).
+
 ## Composer (`dsh-emacs-composer.el`)
 
 The bottom of a chat buffer is a **Composer**: a persistent, non-transcript UI
@@ -333,13 +419,17 @@ region with optional read-only **Next Message**, **Goal Row** and
 input geometry (the `❯ ` prompt,
 `dsh-emacs--input-marker` /
 `dsh-emacs--input-end`, cursor clamps, delete guards) is owned by
-`dsh-emacs.el`; `dsh-emacs-composer.el` owns all three chrome rows and the seam
-that keeps streamed transcript above them. The queue module supplies the
+`dsh-emacs-input.el`; `dsh-emacs-composer.el` owns all three chrome rows and
+the seam that keeps streamed transcript above them. The queue module supplies the
 visible next item directly from its mirror; Composer keeps no second queue.
-Staged attachments stay in `dsh-emacs.el` (file/drop acquisition, clipboard
-paste and the submit path own them); Composer reads them, exactly as it reads
-the queue mirror, and a row's per-file remove cell only calls back into
-`dsh-emacs--remove-attachment`.
+`dsh-emacs-attachments.el` owns the single buffer-local staged attachment
+list, file/drop and clipboard acquisition, validation and uploads. Composer
+requires that owner and reads the list, as it reads the queue mirror; a row's
+remove cell calls `dsh-emacs--remove-attachment`. The input module owns text
+consumption and undo. The entry point owns send timing and rollback
+eligibility. It changes staging through
+`dsh-emacs--set-pending-attachments`, which owns the state update and repaint.
+No second Composer list or attachment-specific input state is introduced.
 
 Word and region kills are clipped to both editable input boundaries while
 preserving their direction. Backward word motion over punctuation such as
@@ -349,14 +439,15 @@ the kill ring. Forward kills also preserve the structural separator newline.
 
 The Goal Row shows the session's current goal as one read-only line (a leading
 dartboard goal SVG icon mirroring dsh web — the `◎ ` text is a fallback when
-Emacs lacks SVG support — tinted with the tool purple shared by the
-transcript goal round notice and the goal tool cards), followed by a prominent
-status label (`Ongoing Goal`, `Paused Goal` or `Blocked Goal`), a muted,
-upright objective (folded to one line, with a canonical session mention
+Emacs cannot draw SVG (a non-graphical frame or no SVG support) — tinted with
+the tool purple shared by the
+transcript goal round notice and the goal tool cards), followed by a
+prominent status label (`Ongoing Goal`, `Paused Goal` or `Blocked Goal`), a
+muted, upright objective (folded to one line, with a canonical session mention
 collapsed to its clickable `@label` chip as in the transcript message that
 named the goal) and compact dsh-web pause/resume/edit/clear **SVG**
-action icons (unicode fallback), one space after the objective and between
-icons. The row uses the buffer background and
+action icons (text fallbacks `||`, `▶`, `✎`, `✕`), one space after the
+objective and between icons. The row uses the buffer background and
 appears only when an unfinished goal exists, fed
 **passively** from the server `goal` session projection (`rpc.md §9`):
 `session/control` projection frames and the `session/follow` snapshot route to
@@ -398,7 +489,7 @@ it uses the buffer background. One
 space after the preview text carries a compact action cluster, one space apart,
 whose text-region keymaps run the queue's own item verbs on the previewed
 message: the up arrow (`IconSendOutlineRegular`) → `dsh-emacs-queue--send-now`
-\(steer into the running turn, or re-submit text-only items while idle), `IconEditOutline16` →
+\(steer into the running turn, or submit text-only items literally while idle), `IconEditOutline16` →
 `dsh-emacs-queue--edit` after a `read-string` (present only while
 `dsh-protocol-queue-item-text-only`, since the edit RPC answers with text
 blocks), and `IconTrashOutline16` → `dsh-emacs-queue--delete`. The queue owner
@@ -419,15 +510,22 @@ the SVG Repo `attachment' icon (tinted from the attachment face; a text glyph
 when Emacs lacks SVG) and each staged attachment's name followed by its own
 clickable `✕` (`dsh-emacs--remove-attachment`, which drops only that entry;
 `C-c C-d`, `dsh-emacs-clear-attachments`, clears the whole list).
-Staging is owned by `dsh-emacs.el`: `dsh-emacs-attach-file` takes only `file`;
-its interactive `C-c C-a` entry calls standard `read-file-name` once with
-`mustmatch` t, then appends one attachment through
+Staging is owned by `dsh-emacs-attachments.el`. `dsh-emacs-attach-file` takes
+only `file`; its interactive `C-c C-a` entry calls standard `read-file-name`
+once with `mustmatch` t, then appends one attachment through
 `dsh-emacs--stage-attachments`. Repeating it adds more files without a caption
 prompt or server/network activity. Drag-and-drop retains its `y-or-n-p`
 confirmation and existing filtering, then appends all valid files in their
 existing order through the same staging function. Neither entry submits.
 There is no new selector or command; see
 [decision record 094](../postmortem/094-staged-file-attachments.md).
+[176](../postmortem/176-attachment-state-owner.md) supersedes only its file
+placement: the send transaction stays in the coordinator. Per-buffer media
+registration is installed by `dsh-emacs--setup-attachments` from chat-mode
+initialization, never when the attachment module is loaded. Public command
+autoloads still target `dsh-emacs`; interactive acquisition, row updates and
+sending use the assembled package, while file/image data preparation can be
+loaded independently.
 `C-c C-v` (`dsh-emacs-attach-clipboard-image`) reads the system
 clipboard, `s-v` (`dsh-emacs-paste`) does the same but falls back to
 `yank` when the clipboard holds no image, and
@@ -549,10 +647,13 @@ commands and spawn Emacs's `shell-file-name` with `-c`
 asynchronously (`make-process`) with the chat buffer's `default-directory` —
 the session workspace — as working directory.  The result row is rendered by
 `dsh-emacs-render-shell-start` / `dsh-emacs-render-shell-done` in
-`dsh-emacs-render.el`, reusing the slash-command row machinery (bash icon,
-`-\|/` spinner, pending tint, success/error restyle): a `!` row rides the
-same `dsh-emacs--command-blocks` / spinner tables under its own monotonic
-`shell-N` id.  Process tracking is buffer-local (`dsh-emacs--shell-procs`).
+`dsh-emacs-render.el`, reusing the slash-command row machinery (bash icon in
+`full`, one dot in `simple` or on a display that cannot draw SVG, and state
+color carried by the dot and, in `full`, the header tint):
+a `!` row rides the same `dsh-emacs--command-blocks` table under its
+own monotonic `shell-N` id.  A running row is marked by that color, with no
+timer-driven spinner.  Process tracking is buffer-local
+\(`dsh-emacs--shell-procs`).
 Killing the chat buffer or resetting its major mode kills the tracked shell
 before its tracking is discarded. `C-c C-!`
 (`dsh-emacs-shell-process-kill`) interrupts a running one, rendered as
@@ -637,11 +738,11 @@ origin, route requests also carry the current signed DSH session Cookie
 call `connection.requestRejection` see the session Emacs already holds. A
 bridge on another origin receives only the bridge token, and a missing Emacs
 session still yields 401. See
-[decision record 155](../postmortem/155-http-route-proxy.md) and
-[156](../postmortem/156-route-programmatic-calls.md).
+[decision record 183](../postmortem/183-http-route-proxy.md) and
+[184](../postmortem/184-route-programmatic-calls.md).
 
 The bridge's agent-tool surface remains separate and is not exposed by these
-commands. See [decision record 154](../postmortem/154-plugin-bridge-client.md).
+commands. See [decision record 182](../postmortem/182-plugin-bridge-client.md).
 
 ## Protocol layer (`dsh-emacs-protocol.el`)
 
@@ -726,7 +827,9 @@ protocol field changes stay in the decoder. Covered payloads:
   See [129](../postmortem/129-core-workspace-boundary.md).
 - `$events` ready/cancel payloads become ids; session emits become
   `dsh-protocol-session-notice` (name, session-id, value). Running flags are
-  decoded booleans. Added summaries stay raw until cache application so the
+  decoded booleans; activity values retain the host timestamp, which events
+  applies monotonically to cached session times and records for refresh replay.
+  Added summaries stay raw until cache application so the
   refresh record cannot share a mutable session object with the cache.
   Waterfalls become `dsh-protocol-waterfall` (name, event-id, agent-id, request).
   Only a request routed to a live chat is decoded: approvals use their existing
@@ -895,9 +998,9 @@ Durable event payloads still reach their event-specific consumers as raw data.
 Control and follow projection consumers read decoded values; Composer receives
 a goal struct or nil directly.
 
-The question reader in `dsh-emacs.el` answers each ordinary `ask` question in one
-minibuffer read. The question text and a hint are the prompt, the numbered
-options are the completion candidates, and each
+The question reader in `dsh-emacs-interaction.el` answers each ordinary `ask`
+question in one minibuffer read. The question text and a hint are the prompt,
+the numbered options are the completion candidates, and each
 candidate's description is delivered as a completion annotation through
 `completion-extra-properties`, so descriptions appear in whatever list UI the
 user has — no tooltip, geometry inspection, or frontend state is involved.
@@ -933,6 +1036,27 @@ Remote cancellation must match both kind and event id before closing a
 minibuffer. Plan documents bypass this slot. See
 [decision record 124](../postmortem/124-shared-interaction-owner.md).
 
+`dsh-emacs-interaction.el` owns those queues and the slot, reader options,
+cancellation, foreground wait claims, late answers and the buffer-local
+question projection mirror. Events requires this owner directly and supplies
+decoded data; transport stream operations and transcript updates remain lazy
+declared seams to avoid require cycles. Plan review retains its document
+workflow. Both public command autoloads still target `dsh-emacs` so they keep
+their initialized session context. Loading the interaction module alone stays
+silent and does not load the coordinator, events or renderer. Standalone events
+use is limited to cancellation handling. Actual question/approval requests and
+settled projections require the full entry point's session context,
+notification handler and renderer. Session labels can use the raw session id
+when the coordinator's name formatter is not loaded. See
+[decision record 175](../postmortem/175-interaction-module-owner.md).
+
+Prompts are scheduled outside the WebSocket dispatcher: while a message batch
+is dispatching, `dsh-emacs--interaction-run` starts the reader from a
+zero-delay timer so a host `cancel` frame (another client answered) can still
+be consumed. Approval prompts also bind `use-dialog-box` nil, because a native
+dialog cannot be aborted by that frame. See
+[decision record 165](../postmortem/165-prompt-dispatcher.md).
+
 dsh 0.2.0's **timed** form adds two rules on top of that reader, without
 changing it. While a timed question owns the answer slot, its handler claims the
 host's foreground wait with `userQuestions/attachWait` (a stream on the chat
@@ -946,8 +1070,9 @@ the `userQuestions` projection — is answered later by
 `userQuestions/answer`. The picker and reader reserve the same global prompt
 slot as foreground questions and approvals, draining queued work on exit.
 Only a true answer response reports acceptance. The questions come from the
-projection, which `dsh-emacs-events.el` keeps buffer-local per chat (the `session/control`
-increment, the control baseline, and the follow snapshot all feed it).
+projection, which the interaction module keeps buffer-local per chat. Events
+feeds it from the `session/control` increment, control baseline and follow
+snapshot.
 The decoded sequence orders these updates, including absent capabilities;
 a new host generation resets the watermark. The late answer is steered as a
 `user-question-reply` user message, which the transcript
@@ -1065,8 +1190,14 @@ this source works against 0.1.5+ servers.  The wire cell (`next-turn` /
 `dsh-protocol-queue-item` (`id`, `placement` =
 `queued`/`steering`/`context`, `text`, `kind`) by
 `dsh-protocol-queue-items-from-inbox` in `dsh-emacs-protocol.el`; an
-`inbox` cell for a session with no live chat buffer is dropped rather than
-applied to whatever buffer is current.  The baseline's `projections` record
+`inbox` cell is retained on the core connection even when its chat is closed.
+Opening a chat seeds its mirror silently from that connection's latest cell;
+closed-chat updates and explicit empty cells replace the retained value.
+A follow-only reconnect preserves a mirror already seeded by the same core
+connection, including local queue actions awaiting their confirming projection.
+Session removal releases its cached cell; a replacement connection starts
+with no retained cells. Only the matching live chat is repainted.
+The baseline's `projections` record
 is keyed by session id, and JSON decoding interns object keys as symbols,
 so `dsh-protocol-control-session--from-alist` normalizes each record key to a
 string before the chat-buffer and projection lookups — the same identity the
@@ -1085,10 +1216,10 @@ fitting and buffer geometry.
 Our steer/delete/edit RPCs still update the mirror optimistically on success,
 so Composer refreshes immediately. Queue-triggered repaints
 are coalesced per frame burst with the existing zero-delay timer, preserving
-transient suppression. The manager's minibuffer keys `e`/`s`/`d`/`RET` act on the
-highlighted item; `x` deletes the whole queue. `context`
-items (host-injected next-step content) are mirrored but never counted,
-previewed, or listed; `steering` items count and list, and — as the
+transient suppression. The manager uses one list: RET or `C-c s` sends now,
+`C-c e` edits, `C-c d` deletes, and `C-c x` deletes all after confirmation.
+`context` items (host-injected next-step content) are mirrored but never
+counted, previewed, or listed; `steering` items count and list, and — as the
 next thing the host injects — head the preview.
 
 The echo feedback is silenced for the client's OWN empty-queue submit:
@@ -1171,11 +1302,11 @@ clearing would temporarily empty the job chooser.
 The wire views are normalized in `dsh-emacs-protocol.el`
 (`dsh-protocol-job` with symbol `status`, `dsh-protocol-job-list`,
 `dsh-protocol-job-frame`/`-chunk`), and the namespace's CLI surface is
-Emacs-native: `C-c C-j` opens the roster as a
-minibuffer menu whose single keys show output (`RET`), stop a job (`k`,
-two presses within `dsh-emacs-jobs-kill-arm-seconds`) and re-subscribe
-(`r`).  A kill is a human action: the host records `cancelled by the
-user` and the owning agent still receives its completion notice.
+Emacs-native: `C-c C-j` opens one list. RET shows output, `C-c k` stops the
+selected job after a confirming `k` within
+`dsh-emacs-jobs-kill-arm-seconds`, and `C-c r` re-subscribes. A kill is a
+human action: the host records `cancelled by the user` and the owning agent
+still receives its completion notice.
 
 Job status stays in transcript tool rows. The mode line does not consume the
 job roster, and roster updates do not request a mode-line redraw.
@@ -1190,7 +1321,7 @@ for a chat — when it drops, the health-check / watchdog / reconnect
 machinery below restores it, and until then replies appear only via manual
 refresh (`C-c C-r`):
 
-1. **user/message** → `dsh-emacs-render-user-message`: rendered as a card background. Image attachments follow the text like dsh web's message gallery: every image becomes a compact thumbnail in wrapping rows (`dsh-emacs-render-image-thumbnail-lines`), one image or several; inline base64 fills immediately and an attachment ref fills when `session/attachment` settles, with `RET` / `mouse-1` opening the original. File attachments stay display-only chips. A host-injected goal round continuation (`source.kind = "goal"`, appended by dsh-goal-round-driver) draws dsh web's collapsed **Continuing goal** trigger notice, expandable to the injected `<goal_round>` prompt; every other host injection stays hidden (`dsh-emacs-render--user-authored-p`).
+1. **user/message** → `dsh-emacs-render-user-message`: rendered as a card background. Image attachments follow the text like dsh web's message gallery: every image becomes a compact thumbnail in wrapping rows (`dsh-emacs-render-image-thumbnail-lines`), one image or several; inline base64 fills immediately and an attachment ref fills when `session/attachment` settles, with `RET` / `mouse-1` opening the original. File attachments stay display-only chips. A host-injected goal round continuation (`source.kind = "goal"`, appended by dsh-goal-round-driver) draws dsh web's collapsed **Continuing goal** trigger notice, expandable to the injected `<goal_round>` prompt. A non-human message admitted by an inbox claim (a child `send_message`, a settled subagent, or a team, webhook, schedule, job or plugin event) also draws a collapsed turn-trigger notice — source-family title, event clock and the recorded body — above the turn's own **Completed in …** summary; it stays outside that fold. Every other host injection stays hidden (`dsh-emacs-render--user-authored-p`).
 2. **assistant/chunk** → `dsh-emacs-render-assistant-chunk`: the first text chunk appears immediately; subsequent insertion, Markdown and viewport following coalesce on a 50ms one-shot timer. Event boundaries, finalization, stream changes and disconnect flush pending text.
 3. **assistant/message** → `dsh-emacs-render-assistant-message`: the final snapshot is used to correct the streamed body, avoiding duplicate display
 4. **tool/call** → `dsh-emacs-render-tool-call`: a nonempty `exit_plan_mode`
@@ -1201,7 +1332,9 @@ refresh (`C-c C-r`):
 5. **tool/result** → `dsh-emacs-render-tool-result`: updates the existing tool card (success/error state). `create_goal` / `get_goal` / `update_goal` settle into dsh web's goal card (`dsh-emacs-render--goal-card-body`): objective summary, State / Rounds, and the blocker message while blocked.
 6. **turn/start** / **turn/end** → `dsh-emacs-render-turn-start/end`: rendered as a divider
 
-`dsh-emacs-protocol.el` decodes retry, compaction and turn-ending facts.
+`dsh-emacs-protocol.el` decodes retry, compaction, turn-ending and
+`agent/inbox/spliced` facts.  The renderer replays the latter's queue/claim
+state only for turn-trigger attribution; it paints no row.
 `dsh-emacs-modeline.el` owns only compaction state, its matching boundaries,
 and `dsh-emacs-describe-status` for compaction/Plan details. Compaction matches
 its own id and may run between turns. Retry has no mode-line state.
@@ -1218,6 +1351,15 @@ retry labels. The existing attempt fragment is updated in place with explicit
 retry/failure/cancellation labels, tool-row styling and failure hover details.
 Unknown outcomes retain **Incomplete reply**. Live output is taken over once,
 with expanded-live/folded-history behavior and user folding preserved.
+
+`dsh-emacs-render--attempt-cards` classifies one turn's decoded, seq-ordered
+facts into fresh card plists, newest attempt first, without accessing buffer
+state or modifying its input. `dsh-emacs-render--note-attempt-outcome` owns
+merging and sorting those facts, updating the existing fragments and retaining
+the marker boundary. This keeps the correlation rules directly testable as
+data while preserving the rendering and trimming lifecycle. See
+[177](../postmortem/177-attempt-card-classification.md).
+
 Model errors and automatic compaction failures use `dsh-emacs-render-info`:
 the same status dot, title face and compact spacing, with muted
 metadata and an initially expanded explanation.
@@ -1377,13 +1519,18 @@ See [decision record 031](../postmortem/031-stream-frontier-and-screen-rows.md)
 and [032](../postmortem/032-partial-line-styling-and-burst-follow.md), and the
 [performance audit](streaming-performance.md).
 
-Partial-line emphasis passes narrow to the first delimiter plus its preceding
-character, preserving the existing whitespace/line-start grammar. Other
-Markdown passes retain the full ready range. The renderer supplies its assistant
-base face to Markdown's final face pass, which keeps one copy at the lowest
-priority and mirrors the complete result to `font-lock-face` in one traversal.
-The renderer
-then applies read-only, stickiness and event identity properties together.
+Partial-line emphasis passes narrow to the first delimiter and back over the
+backslash run that escapes it, plus one more character for left context.
+Bold delimiters then apply CommonMark's Unicode flanking rules: stars may sit
+inside a word, and Chinese punctuation counts as punctuation. Each check
+computes only the requested opening or closing eligibility, without allocating
+a pair, and scans escape runs only after a backslash. Italics and
+strikethrough keep the whitespace/line-start grammar, so arithmetic such as
+`5*3 and 6*4` stays literal. Other Markdown passes retain the full ready range.
+The renderer supplies its assistant base face to Markdown's final face pass,
+which keeps one copy at the lowest priority and mirrors the complete result to
+`font-lock-face` in one traversal. The renderer then applies read-only,
+stickiness and event identity properties together.
 Repeated tail formatting cannot grow the face list. A stable named yank handler
 keeps repeated formatting from rewriting an otherwise identical property.
 See [033](../postmortem/033-final-face-pass-and-pixel-probes.md).
@@ -1430,9 +1577,15 @@ or an alternate parser. See [036](../postmortem/036-bounded-stream-markdown.md).
 `dsh-emacs-markdown.el` owns inline link/image syntax, independently of
 filesystem resolution. Resource scanning captures destinations before prose
 styling can consume their punctuation. Rendered resources retain their click
-identity instead of reparsing label text. Single-line and code-span boundaries
-apply equally to full and streamed rendering; a bare image cannot freeze on
-an unfinished path fragment.
+identity in text properties; after images and links are stripped, their parse
+markers are detached before emphasis edits. Raw destinations retain their
+markers for protection. The scanner skips runs that cannot begin a resource in
+one call, so only line starts and `[`, `!`, a backtick or a backslash get
+per-position work. Line scans ignore `field` properties, which cannot end a
+Markdown line. Single-line and code-span boundaries apply equally to full
+and streamed rendering; a bare image cannot freeze on an unfinished path
+fragment. See [171](../postmortem/171-markdown-marker-lifetime.md) and
+[172](../postmortem/172-resource-scan-prefilter.md).
 
 The shared local-path decoder rejects remote authorities and unsafe input,
 then links validate existing targets and optional one-based line/column
@@ -1445,6 +1598,20 @@ that path. Web's authenticated server-file endpoint is not used by Emacs.
 See [the user-facing file/image contract](reference.md#assistant-markdown-file-links)
 and [decision 150](../postmortem/150-markdown-resource-boundaries.md), including
 the intentionally bounded syntax and differences from the Web renderer.
+
+## Navigation return history (`dsh-emacs-ui.el`)
+
+`dsh-emacs-ui-navigate` owns explicit navigation that changes the current
+buffer or point: file/session references, local Markdown links, session-list
+and new-chat visits, plans, images, job output, skills and configuration
+files. Callers capture the departure marker before the operation; the helper
+pushes it to Emacs's xref history only after the operation succeeds and the
+buffer or point changed. Errors, cancellation and no-ops discard it. Async
+callers retain the marker across the fetch or plan decision and pass it to
+the same entry after success. Session opening records ordinary and live
+chats directly; a first-time child visit keeps the follow-snapshot success
+gate in `dsh-emacs-events.el`. See
+[181](../postmortem/181-navigation-return-history.md).
 
 ## Event-stream reliability
 
@@ -1469,9 +1636,11 @@ the intentionally bounded syntax and differences from the Web renderer.
   [147](../postmortem/147-open-session-buffer-reuse.md)).  The snapshot carries
   a `cursor` plus message-aligned `records`: `turnWindow` requests
   one round start, bounded by `dsh-emacs-history-window` messages per response.
-  The protocol decoder counts starts in the snapshot; on first open, Events
-  asks the history controller to complete one round only if no start is
-  present, after applying the snapshot and projections. The manual
+  The protocol decoder counts human rounds (turns with a user-authored
+  message) in the snapshot; on first open, Events asks the history controller
+  to complete one human round only if no human round is present, after
+  applying the snapshot and projections. A snapshot that starts at a child or
+  goal wake therefore backs up to the preceding user turn. The manual
   `dsh-emacs-history-rounds` target does not affect opening. The live follow
   stream stays gapless. Reconnects do not start another automatic history load.
 - **Reconnect is self-healing**: the reconnect socket pins `no-conversion` — on
@@ -1518,16 +1687,19 @@ the intentionally bounded syntax and differences from the Web renderer.
   HTTP callback dynamically raises the GC threshold for page decoding and
   rendering. Bounded network batches do not bound the total cost of the
   requested round range; staged pages still publish in one synchronous render.
-- **Core connection (list side)**: the session list keeps a separate
-  `/api/remote.mux` connection that opens `session/control` + `workspace/follow`
-  + `$events`.  `session/control` delivers whole-host projection baselines and
-  increments (since dsh 0.1.7 that record carries the `inbox` cell the queue
-  mirror is derived from; the 0.1.6 `queues`/`jobs` records are gone);
-  `workspace/follow` seeds and then upserts/removes/
-  reorders the workspace caches; `$events` carries the session list's live
-  changes (`api-session/added|removed|status|activity` emits) and the
-  approval/question waterfalls.  This connection is scoped to the list buffer's
-  lifecycle and is also self-healing (reconnect + re-baseline).
+- **Core connection**: a client-wide `/api/remote.mux` connection opens
+  `session/control` + `workspace/follow` + `$events`.  `session/control`
+  delivers whole-host projection baselines and increments (since dsh 0.1.7
+  that record carries the `inbox` cell the queue mirror is derived from; the
+  0.1.6 `queues`/`jobs` records are gone); `workspace/follow` seeds and then
+  upserts/removes/reorders the workspace caches; `$events` carries the
+  session list's live changes (`api-session/added|removed|status|activity`
+  emits) and the approval/question waterfalls.  The session list or any live
+  chat keeps this connection alive, so a chat opened directly (without the
+  list) still receives queue projections and question/approval waterfalls;
+  it closes when the last owner goes away and is self-healing: synchronous
+  connect failures are reported and retried without aborting chat
+  activation, and dropping out of chat mode releases the chat's ownership.
 
 ## History browsing (`dsh-emacs-history.el`)
 
@@ -1536,17 +1708,26 @@ It uses user-message text properties rather than maintaining another message
 index. Imenu targets are advancing markers and auto-rescan refreshes loaded
 questions. Previous/next question commands are not added.
 
-`C-c C-o` requests `dsh-emacs-history-rounds` complete rounds (default 3),
-overridable by a numeric prefix. The protocol constructor decodes records,
-oldest/newest sequence numbers, `hasMore`, and `(ROUND SEQ RECORD)` boundaries.
-`session/page` receives `turnWindow` with `minMessages: 1` and the remaining
-round count. `maxMessages` stays bounded by `dsh-emacs-history-window`.
-A partial oldest round counts as the first round to complete. This uses
-original server round numbers, including autonomous continuations. Opening
-uses the same request builder and loop to complete only the latest round,
-with no initiating window to visit; manual loads retain their jump behavior.
+`C-c C-o` requests `dsh-emacs-history-rounds` complete human rounds (default
+3), overridable by a numeric prefix. A human round is a turn containing a
+user-authored message; child, goal and other host-woken turns are grouped with
+the human round that preceded them. The protocol constructor decodes records,
+oldest/newest sequence numbers and `hasMore`; the loader derives human rounds
+from the accumulated records, so a message-aligned page boundary cannot split
+a turn's start from its user message. `session/page` receives `turnWindow` with
+`minMessages: 1` and the remaining human-round count; because the server counts
+turns, the loop repeats until enough human rounds are staged. `maxMessages`
+stays bounded by `dsh-emacs-history-window`. A loaded page starts at the oldest
+kept human round's `turn/start`; a leading child or goal turn is deferred to
+the previous round's page instead of topping the range. A partial oldest human
+round counts as the first round to complete. This uses original server round
+numbers, including autonomous continuations. Opening uses the same request
+builder and loop to complete only the latest human round, with no initiating
+window to visit; manual loads retain their jump behavior.
 See [152](../postmortem/152-open-single-round.md), which narrows the automatic
-target introduced by [148](../postmortem/148-open-complete-rounds.md).
+target introduced by [148](../postmortem/148-open-complete-rounds.md), and
+[160](../postmortem/160-history-human-rounds.md), which defines the human
+round used by both.
 
 One buffer-local request plist stages records across bounded RPCs. Before
 publishing, the loader checks request identity, session/address, the original
@@ -1645,6 +1826,19 @@ follows the viewport once. Per-event follow calls skip a pending burst.
 Non-reasoning events, step changes and stream teardown flush pending text
 before continuing. This keeps transport delivery immediate while limiting
 reasoning-driven buffer invalidation. See [027](../postmortem/027-thinking-refresh.md).
+
+`dsh-emacs-thinking-style` selects the streamed shape. `expand` (the default)
+appends the reasoning body raw under the Think header and folds it into a
+fragment when the following text block starts. `inline` renders dsh web's
+compact disclosure from the first delta: a collapsed minimal fragment whose
+body is a deferred closure (so a collapsed row never lays out the growing
+text), and whose right-hand preview is the first line of the latest completed
+paragraph (`dsh-emacs-render--thinking-live-preview`), settling to the first
+sentence when the block closes. Inline rows keep the block id from their first
+delta, so later deltas and the authoritative message update the same row
+instead of moving it; the final repair reconciles one row per streamed block
+in place (`dsh-emacs-render--reconcile-inline-thinking`) and falls back to the
+folded row only when the correction adds or removes a block.
 
 ## GUI display regression tests
 
@@ -1771,7 +1965,13 @@ If the focused row disappears, both buffer and window focus use the previous
 row order to find the next surviving row, then the preceding row. Only a list
 with no surviving candidate falls back to its first new row. See
 [082](../postmortem/082-session-list-focus.md).
-The list renders into a temporary buffer, deletes rows that are no longer visible,
+`dsh-emacs-session--build-rows` builds the temporary list and its fresh visual
+cache using the target buffer's fold, expansion and pending-jump state.
+`dsh-emacs-session--update-rows` installs its text and fresh properties, then
+publishes that cache after installation succeeds. The render coordinator
+prepares jumps and restores buffer focus, window positions and highlighting.
+See [decision record 179](../postmortem/179-session-row-build-boundary.md).
+The list updater deletes rows that are no longer visible,
 moves surviving rows by identity with
 `transpose-regions`, and diffs only individual changed lines. This preserves
 xref departure markers even when workspaces reorder, without a whole-list diff.

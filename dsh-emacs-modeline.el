@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -37,7 +37,7 @@
 
 ;;; Code:
 (declare-function dsh-emacs-subagent-indicator "dsh-emacs-subagent" (&optional phase))
-(defvar dsh-emacs-subagent--animation-slot)
+(declare-function dsh-emacs-subagent-animation-text "dsh-emacs-subagent" ())
 
 (require 'cl-lib)
 (require 'color)
@@ -53,11 +53,45 @@
 (declare-function motion-line-string "motion-line" (slot))
 (defvar motion-line-redisplay-function)
 
+;; Public animation facade: the only place this package touches motion-line.
+;; Presentation code asks these helpers instead of featurep/playing checks, so
+;; another backend (or no animation at all) changes one layer.
+(defun dsh-emacs-modeline-animation-available-p ()
+  "Whether the optional motion-line animation engine is installed."
+  (featurep 'motion-line))
+
+(defun dsh-emacs-modeline-animation-playing-p (slot)
+  "Whether SLOT is playing in this buffer."
+  (and (dsh-emacs-modeline-animation-available-p)
+       (motion-line-playing-p slot)))
+
+(defun dsh-emacs-modeline-animation-clip (duration renderer)
+  "Build a DURATION clip rendered by RENDERER, or nil without a backend.
+Callers build the clip lazily, so an absent backend must not signal."
+  (when (dsh-emacs-modeline-animation-available-p)
+    (motion-line-clip duration renderer)))
+
+(defun dsh-emacs-modeline-animation-play (slot clip)
+  "Play CLIP in SLOT when the animation engine is installed."
+  (when (dsh-emacs-modeline-animation-available-p)
+    (motion-line-play slot clip)))
+
+(defun dsh-emacs-modeline-animation-stop (slot)
+  "Stop SLOT when the animation engine is installed."
+  (when (dsh-emacs-modeline-animation-available-p)
+    (motion-line-stop slot)))
+
+(defun dsh-emacs-modeline-animation-text (slot)
+  "Return SLOT's cached animated text, or nil when it is not playing."
+  (when (dsh-emacs-modeline-animation-playing-p slot)
+    (motion-line-string slot)))
+
 ;; doom-modeline integration references it without depending on it: when
 ;; present, the official API splices the stats segment into its layout (right
 ;; after the major-mode segment); otherwise it falls back to the native
 ;; mode-line-format splice.
 (declare-function doom-modeline-def-segment "doom-modeline-core" (name &rest body))
+(defvar doom-modeline-major-mode-icon)
 (declare-function doom-modeline-add-segment "doom-modeline-core" (segment anchor &optional position modeline))
 (defvar nerd-icons-mode-icon-alist)
 
@@ -811,9 +845,16 @@ PERMISSION is the `permissions' projection's `currentValue'."
 (defvar-local dsh-emacs--ml-busy nil
   "Non-nil while this chat buffer's dsh session is executing a prompt.")
 
+(defvar-local dsh-emacs--modeline-subagent-active nil
+  "Non-nil while a direct child of this chat buffer's session is running.
+This drives the activity animation only; it deliberately does not mark the
+session busy, so input submission and stop commands keep their turn
+semantics.")
+
 (defvar-local dsh-emacs--modeline-run-start nil
   "Local time when this buffer last entered the running state.
-Cleared on turn completion or disconnect; never inferred from old history.")
+Kept while a turn or a direct child is active; cleared when both are idle or
+on disconnect.  Never inferred from old history.")
 
 (defvar-local dsh-emacs--modeline-compaction-start nil
   "Local time when this buffer first observed the active compaction.
@@ -827,10 +868,38 @@ Independent of the turn clock; repeated snapshots preserve this interval.")
                         :timer))
     (force-mode-line-update)))
 
+(defun dsh-emacs-modeline--activity-p ()
+  "Non-nil when this buffer should show the running activity.
+The current turn, standalone compaction, or a running direct child."
+  (or dsh-emacs--ml-busy
+      dsh-emacs--modeline-compaction
+      dsh-emacs--modeline-subagent-active))
+
+(defun dsh-emacs-modeline--sync-run-clock ()
+  "Start or clear the local turn clock for the current activity state.
+Standalone compaction keeps its own clock, so only a turn or a running
+direct child owns this one."
+  (if (or dsh-emacs--ml-busy dsh-emacs--modeline-subagent-active)
+      (unless dsh-emacs--modeline-run-start
+        (setq dsh-emacs--modeline-run-start (float-time)))
+    (setq dsh-emacs--modeline-run-start nil)))
+
+(defun dsh-emacs-modeline-set-subagent-activity (active)
+  "Track ACTIVE direct-child execution for the running animation.
+Called by the subagent owner whenever the child running count changes.  A
+running child keeps the whale and its clock alive after the parent turn
+ends, but leaves `dsh-emacs--ml-busy' alone so `C-c C-c' does not mistake
+the idle parent for a running turn."
+  (setq dsh-emacs--modeline-subagent-active (and active t))
+  (dsh-emacs-modeline--sync-animation dsh-emacs--modeline-compaction))
+
 (defun dsh-emacs-modeline--sync-animation (previous-compaction)
   "Update the shared activity slot after PREVIOUS-COMPACTION changes.
 Turns and standalone compaction share one animation.  A new compaction phase
-restarts its caption sweep and local clock without changing the turn clock."
+restarts its caption sweep and local clock without changing the turn clock.
+The activity clock follows whichever activity is still live, so a parent turn
+ending under a running child keeps it."
+  (dsh-emacs-modeline--sync-run-clock)
   (let ((changed
          (not (equal
                (and previous-compaction
@@ -841,15 +910,17 @@ restarts its caption sweep and local clock without changing the turn clock."
     (when changed
       (setq dsh-emacs--modeline-compaction-start
             (and dsh-emacs--modeline-compaction (float-time))))
-    (when (featurep 'motion-line)
-      (if (or dsh-emacs--ml-busy dsh-emacs--modeline-compaction)
-          (when (or changed (not (motion-line-playing-p 'dsh-running)))
+    (when (dsh-emacs-modeline-animation-available-p)
+      (if (dsh-emacs-modeline--activity-p)
+          (when (or changed
+                    (not (dsh-emacs-modeline-animation-playing-p 'dsh-running)))
             (setq-local motion-line-redisplay-function
                         #'dsh-emacs-modeline--animation-redisplay)
-            (motion-line-play
+            (dsh-emacs-modeline-animation-play
              'dsh-running
-             (motion-line-clip 3 #'dsh-emacs-modeline--running-status)))
-        (motion-line-stop 'dsh-running)))
+             (dsh-emacs-modeline-animation-clip
+              3 #'dsh-emacs-modeline--running-status)))
+        (dsh-emacs-modeline-animation-stop 'dsh-running)))
     (force-mode-line-update)))
 
 (defun dsh-emacs--ml-busy-set (flag)
@@ -857,28 +928,25 @@ restarts its caption sweep and local clock without changing the turn clock."
 Repeated running snapshots preserve playback position.  Clearing the flag
 also drops the finished turn's step badge."
   (setq dsh-emacs--ml-busy (and flag t))
-  (if dsh-emacs--ml-busy
-      (unless dsh-emacs--modeline-run-start
-        (setq dsh-emacs--modeline-run-start (float-time)))
-    (setq dsh-emacs--modeline-step nil
-          dsh-emacs--modeline-run-start nil))
+  (unless dsh-emacs--ml-busy
+    (setq dsh-emacs--modeline-step nil))
   (dsh-emacs-modeline--sync-animation dsh-emacs--modeline-compaction))
 
 (defun dsh-emacs--ml-busy-clear ()
   "Clear execution status and release this buffer's running animation."
+  (setq dsh-emacs--modeline-subagent-active nil)
   (dsh-emacs--ml-busy-set nil)
   (dsh-emacs-modeline-reset-execution))
 
 (defun dsh-emacs--ml-busy-indicator ()
-  "Return the running or compacting activity, empty when both are idle."
-  (if (not (or dsh-emacs--ml-busy dsh-emacs--modeline-compaction))
+  "Return the running, compacting or child activity, empty when all are idle."
+  (if (not (dsh-emacs-modeline--activity-p))
       ""
     (propertize
-     (if (featurep 'motion-line)
-         (motion-line-string 'dsh-running)
-       (if dsh-emacs--modeline-compaction
-           (propertize "Compacting" 'face 'dsh-emacs-modeline-compacting-face)
-         (propertize "Deep diving" 'face 'dsh-emacs-modeline-running-face)))
+     (or (dsh-emacs-modeline-animation-text 'dsh-running)
+         (if dsh-emacs--modeline-compaction
+             (propertize "Compacting" 'face 'dsh-emacs-modeline-compacting-face)
+           (propertize "Deep diving" 'face 'dsh-emacs-modeline-running-face)))
      'help-echo (if dsh-emacs--modeline-compaction
                     (concat (dsh-emacs-modeline--status-detail)
                             "\n\nClick or M-x dsh-emacs-describe-status")
@@ -1362,7 +1430,7 @@ caption and clock while preserving the enclosing turn's running interval."
 (defun dsh-emacs-modeline--whale-tail-label ()
   "Return the running or idle tail, using a centered 18-pixel display box."
   (cond
-   ((or dsh-emacs--ml-busy dsh-emacs--modeline-compaction)
+   ((dsh-emacs-modeline--activity-p)
     (dsh-emacs--ml-busy-indicator))
    ((and (display-graphic-p) (image-type-available-p 'svg))
     (let ((color (dsh-emacs-modeline--logo-color)))
@@ -1385,9 +1453,25 @@ caption and clock while preserving the enclosing turn's running interval."
   "Return the DSH whale for Nerd Icons' major-mode lookup."
   (dsh-emacs-modeline--whale-label))
 
+(defun dsh-emacs-modeline-refresh ()
+  "Discard image caches and refresh live chat and session-list mode lines.
+Reload uses this instead of resetting modeline-owned caches or calling a
+third-party icon backend itself.  Buffer contents and running state stay live."
+  (setq dsh-emacs-modeline--logo-labels nil
+        dsh-emacs-modeline--whale-tail-labels nil
+        dsh-emacs-modeline--whale-tail-frames nil
+        dsh-emacs-modeline--whale-tail-gif-data nil)
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'dsh-emacs-mode 'dsh-emacs-session-mode)
+        (when (fboundp 'doom-modeline-update-buffer-file-icon)
+          (doom-modeline-update-buffer-file-icon))
+        (dsh-emacs-modeline-update))))
+  (force-mode-line-update t))
+
 (defun dsh-emacs-modeline--nerd-icon-for-mode (orig-fn mode &rest args)
-  "Return the DSH whale for MODE, otherwise call ORIG-FN with ARGS."
-  (if (eq mode 'dsh-emacs-mode)
+  "Return the DSH whale for a DSH MODE, otherwise call ORIG-FN with ARGS."
+  (if (memq mode '(dsh-emacs-mode dsh-emacs-session-mode))
       (dsh-emacs-modeline--whale-label)
     (apply orig-fn mode args)))
 
@@ -1398,7 +1482,9 @@ caption and clock while preserving the enclosing turn's running interval."
   (advice-add 'nerd-icons-icon-for-mode :around
               #'dsh-emacs-modeline--nerd-icon-for-mode)
   (add-to-list 'nerd-icons-mode-icon-alist
-               '(dsh-emacs-mode dsh-emacs-modeline--nerd-icon "DSH")))
+               '(dsh-emacs-mode dsh-emacs-modeline--nerd-icon "DSH"))
+  (add-to-list 'nerd-icons-mode-icon-alist
+               '(dsh-emacs-session-mode dsh-emacs-modeline--nerd-icon "DSH")))
 
 (eval-after-load 'nerd-icons #'dsh-emacs-modeline--install-nerd-icon)
 
@@ -1434,13 +1520,11 @@ width-filling renderer.  BASE is the pre-existing mode-line-format list."
       segments))))
 
 (defun dsh-emacs-modeline--subagent-text ()
-  "Return the subagent segment, animated through motion-line while playing.
-`motion-line-string' already escapes percent signs for mode-line expansion;
+  "Return the subagent segment, animated while its pulse is playing.
+The animated string already escapes percent signs for mode-line expansion;
 the static indicator still needs `dsh-emacs-modeline--escape-percent'."
-  (if (and (featurep 'motion-line)
-           (motion-line-playing-p dsh-emacs-subagent--animation-slot))
-      (motion-line-string dsh-emacs-subagent--animation-slot)
-    (dsh-emacs-modeline--escape-percent (dsh-emacs-subagent-indicator))))
+  (or (dsh-emacs-subagent-animation-text)
+      (dsh-emacs-modeline--escape-percent (dsh-emacs-subagent-indicator))))
 
 (defun dsh-emacs-modeline--doom-segment ()
   "Compose dsh status for both Doom and the native mode-line splice.
@@ -1470,14 +1554,35 @@ Both presentations preserve Doom's segment styling."
                       'local-map mode-line-major-mode-keymap)))
     text))
 
+(defun dsh-emacs-modeline--dsh-file-icon ()
+  "Return the DSH whale as a Doom file icon.
+Doom's icon propertizer needs a plist face on the icon string, otherwise it
+discards the string and its SVG display spec."
+  (let ((icon (copy-sequence (dsh-emacs-modeline--whale-label))))
+    (put-text-property 0 (length icon) 'face '(:inherit doom-modeline) icon)
+    icon))
+
+(defun dsh-emacs-modeline--doom-icon-for-buffer (orig-fn &rest args)
+  "Choose the whale for a fileless session list through Doom's icon API."
+  (if (and (derived-mode-p 'dsh-emacs-session-mode)
+           (null buffer-file-name))
+      (dsh-emacs-modeline--dsh-file-icon)
+    (apply orig-fn args)))
+
 (defun dsh-emacs-modeline--doom-buffer-file-icon (orig-fn &rest args)
-  "Skip Doom's file-icon refresh for a fileless DSH chat buffer."
+  "Let Doom refresh its own cache, suppressing duplicate chat icons.
+Chats already carry a whale segment.  Use Doom's public icon option for this
+refresh so it clears the redundant file icon without exposing its cache."
   (if (and (derived-mode-p 'dsh-emacs-mode) (null buffer-file-name))
-      nil
+      (let ((doom-modeline-major-mode-icon nil))
+        (apply orig-fn args))
     (apply orig-fn args)))
 
 (defun dsh-emacs-modeline--install-doom-icon ()
   "Register the DSH buffer icon with Doom Modeline."
+  (when (fboundp 'doom-modeline-icon-for-buffer)
+    (advice-add 'doom-modeline-icon-for-buffer :around
+                #'dsh-emacs-modeline--doom-icon-for-buffer))
   (when (fboundp 'doom-modeline-update-buffer-file-icon)
     (advice-add 'doom-modeline-update-buffer-file-icon :around
                 #'dsh-emacs-modeline--doom-buffer-file-icon)))

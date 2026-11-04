@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; URL: https://github.com/vritser/dsh-emacs
 ;; License: GPL-3.0-or-later
@@ -16,7 +16,7 @@
 ;;
 ;; Main features:
 ;; - Session list (card view)
-;; - Chat buffer (with tool-call and reasoning folding)
+;; - Chat buffer (with tool-call and thinking folding)
 ;; - Mode-line stats (cwd, git branch, model, tokens, ctx%, cost)
 ;; - Markdown rendering
 ;; - dsh plugin invocation through dsh-plugins-bridge
@@ -51,19 +51,6 @@
 (require 'json)
 (require 'url)
 (require 'cl-lib)
-(require 'crm)
-
-;; `yank-media-preferred-types' is Emacs 31+ and is not declared here: a
-;; load-time `defvar' would shadow the package's default.  Its one use site
-;; guards on `boundp' and suppresses the byte-compiler warning instead.
-;; Emacs 31-only; the 28.1 baseline falls back to
-;; `dsh-emacs--completion-table-with-metadata'.  The declaration only keeps
-;; byte-compile on Emacs <=30 from warning about an unknown function.
-(declare-function completion-table-with-metadata "minibuffer" (table metadata))
-(declare-function dsh-emacs-command--completion-prefix-p "dsh-emacs-command"
-                  (text))
-(declare-function dsh-emacs-reference--at-token "dsh-emacs-reference"
-                  (start end))
 
 ;; Protocol and HTTP/RPC transport precede their feature consumers.
 (require 'dsh-emacs-protocol)
@@ -82,13 +69,16 @@
 (declare-function dsh-emacs-render--cancel-markdown "dsh-emacs-render" ())
 (declare-function dsh-emacs-render--insert-user-block "dsh-emacs-render"
                   (event references))
-(declare-function dsh-emacs-render--user-authored-p "dsh-emacs-render" (event))
+(require 'dsh-emacs-input)
+(require 'dsh-emacs-attachments)
 (require 'dsh-emacs-composer)
+(require 'dsh-emacs-interaction)
 (require 'dsh-emacs-events)
 (require 'dsh-emacs-modeline)
 (require 'dsh-emacs-queue)
 (require 'dsh-emacs-jobs)
 (require 'dsh-emacs-provider)
+(require 'dsh-emacs-model)
 (require 'dsh-emacs-command)
 (require 'dsh-emacs-skill)
 (require 'dsh-emacs-plugin)
@@ -98,6 +88,8 @@
 (require 'dsh-emacs-reload)
 (declare-function dsh-emacs-session--ancestors "dsh-emacs-session" (id))
 (declare-function dsh-emacs-subagent--cell "dsh-emacs-subagent" (id key))
+(declare-function dsh-emacs-subagent--value "dsh-emacs-subagent" (id key))
+(defvar dsh-emacs--subagent-catalogs)
 
 ;;; ---------------------------------------------------------------------------
 ;;;  Customization options
@@ -107,19 +99,6 @@
   "Emacs UI for DeepSeek Harness (dsh)."
   :group 'applications
   :prefix "dsh-emacs-")
-
-(defcustom dsh-emacs-model-group-format
-  #(" %s " 0 4 (face vertico-group-title))
-  "Format string for provider group titles in the model selector.
-`%s' is replaced with the provider name.
-Inside the model selector's minibuffer this overrides vertico's global
-`vertico-group-format' (buffer-locally, other completions are untouched):
-vertico's stock format draws a long strike-through separator line across
-the whole group header (\"----...\"), which is noisy; the default here
-paints just the provider name.  Set to nil to hide group titles entirely
-inside the picker."
-  :type '(choice (const :tag "No group titles" nil) string)
-  :group 'dsh-emacs)
 
 (defcustom dsh-emacs-switch-max-candidates 200
   "Max candidates offered to the completion UI per keystroke by switch-session.
@@ -137,26 +116,6 @@ snappier keys."
 (defcustom dsh-emacs-base-url "http://127.0.0.1:3080"
   "Address of the running dsh web service."
   :type 'string
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-history-window 30
-  "Maximum messages per history request, including the opening snapshot.
-Opening a fresh chat completes only the latest round;
-`dsh-emacs-history-rounds' controls manual older-history loads.  Long rounds
-are completed with additional bounded requests.  A smaller batch reduces
-per-response parsing work but requires more network round trips."
-  :type 'integer
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-show-reasoning t
-  "Whether to show reasoning content.  Enabled by default, matching dsh web
-(the web always shows the Think line).  Set to nil for a leaner transcript."
-  :type 'boolean
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-show-tool-calls t
-  "Whether to show tool calls."
-  :type 'boolean
   :group 'dsh-emacs)
 
 (defcustom dsh-emacs-default-cwd default-directory
@@ -186,70 +145,16 @@ Set to nil to keep the old behavior (sessions always start in CWD)."
   :type 'boolean
   :group 'dsh-emacs)
 
-(defcustom dsh-emacs-default-model "deepseek-v4-flash-0731"
-  "Default model name."
-  :type 'string
-  :group 'dsh-emacs)
-
 (defcustom dsh-emacs-default-preset nil
   "Default agent preset (agentPreset id) for new sessions.
 
 nil lets the host pick its own default preset (no `agentPreset' field is
 sent to `session/create').  Known values are the built-in preset ids
-\"standard\" (Standard mode), \"minimal\" (Minimal mode), \"ptc\" (PTC
-mode) and \"cordis\" (Creator mode), or the id of a user preset listed
-by `agentPresets/list'.  Interactively, `dsh-emacs-new-session' with a
-prefix argument asks for the preset instead of using this value."
+\"standard\", \"minimal\", \"ptc\" and \"cordis\", or the id of a user
+preset listed by `agentPresets/list'.  Interactively,
+`dsh-emacs-new-session' with a prefix argument asks for the preset
+instead of using this value."
   :type '(choice (const :tag "Host default" nil) string)
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-attach-media-types
-  '("image/png" "image/jpeg" "image/webp" "image/gif")
-  "Image media types sent as inline image attachments.
-
-A file whose type is in this set rides the prompt as an image (the host
-validates it against this set, plus byte/pixel limits of its own).  Every
-other file is uploaded to the host at submit time and reaches the model as
-a file attachment — see `dsh-emacs-attach-file'."
-  :type '(repeat string)
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-attach-max-file-size (* 32 1024 1024)
-  "Largest file (in bytes) `dsh-emacs-attach-file' uploads.
-
-A file attachment is read into this Emacs process and posted to the
-session's host in one request, so the limit protects Emacs memory as much
-as the host.  A larger file is refused with `user-error' before anything is
-read; images in `dsh-emacs-attach-media-types' are not governed by it
-\(they have their own host-side limits).  nil removes the check."
-  :type '(choice (const :tag "No limit" nil) integer)
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-input-history-length 50
-  "Maximum number of submitted prompts kept for `M-p' / `M-n' recall."
-  :type 'integer
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-input-history-cross-session nil
-  "Whether `M-p' / `M-n' recall prompts from every session.
-Non-nil shares one prompt history across all chat buffers; nil (the
-default) restricts recall to the prompts the CURRENT session submitted
-itself (per-session history, useful while several unrelated sessions are
-open).  Every prompt is recorded in both scopes regardless; the option
-only picks which list the keys browse, so toggling it never loses
-recorded prompts."
-  :type 'boolean
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-word-completion-limit 100000
-  "How many characters above the input word completion searches.
-Input word completion offers words already present in the chat buffer —
-the draft before point plus the transcript above it — so a term from an
-earlier message or tool result completes without retyping.  Only this
-many characters of buffer text directly above the input are scanned, so
-a long transcript does not slow down every keystroke; nil searches the
-whole buffer."
-  :type '(choice (const :tag "Whole buffer" nil) integer)
   :group 'dsh-emacs)
 
 (defcustom dsh-emacs-busy-enter-behavior 'queue
@@ -264,41 +169,6 @@ of the local busy indicator."
   :type '(choice (const :tag "Queue as the next turn" queue)
                  (const :tag "Steer the running turn" steer)
                  (const :tag "Interrupt the turn" stop))
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-question-skip-key "C-c C-s"
-  "Key that skips the current ask question (answers it with an empty
-selection, dsh web's per-question Skip) and moves to the next one.
-A `C-c' prefix by default: the reader's text is the answer, so a bare
-letter would make that letter untypable (and the free-text sentinel
-contains several).  Bound only inside the question reader's minibuffer, so
-nothing leaks into unrelated `completing-read' prompts; every question also
-skips on an EMPTY input, and the key is only bound where there is a
-candidate list.  Set to nil to disable the shortcut."
-  :type '(choice (key-sequence :tag "Key sequence")
-                 (const :tag "No shortcut" nil))
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-question-help-display 'echo-area
-  "Whether to show the question detail while answering.
-`echo-area' shows the detail in the echo area without logging it; nil
-disables it.  Selection and answer input are unchanged, and a question
-without a detail never shows help.  Option descriptions ride along with
-the completion candidates themselves (their `:annotation-function'), so
-the echo area carries only the question's own detail."
-  :type '(choice (const :tag "Echo area" echo-area)
-                 (const :tag "No help" nil))
-  :group 'dsh-emacs)
-
-(defcustom dsh-emacs-approval-language nil
-  "Language used for host-localized approval reasons.
-Use a language tag such as \"zh\", \"zh-CN\" or \"en\".  nil follows
-`system-messages-locale', then LC_ALL, LC_MESSAGES and LANG, ignoring
-empty values.  Region tags and POSIX locales such as zh_CN.UTF-8 work.
-Fallback order is the full tag, its base language, English, then the
-original reason.  Only translations supplied by the host are displayed."
-  :type '(choice (const :tag "Follow Emacs message locale" nil)
-                 (string :tag "Language tag"))
   :group 'dsh-emacs)
 
 ;;; ---------------------------------------------------------------------------
@@ -324,8 +194,9 @@ renaming by session ID.")
 (defvar dsh-emacs--agent-presets nil
   "Cached `agentPresets/list' response (a `dsh-protocol-agent-preset-list'
 struct), used by the new-session preset picker.  Refreshed lazily by
-`dsh-emacs--agent-presets-refresh'; nil before the first successful
-fetch falls back to the built-in preset ids.")
+`dsh-emacs--agent-presets-refresh'; `dsh-emacs--read-preset' fetches it
+synchronously when nil, so the picker has no choices until such a fetch
+succeeds.")
 
 (defvar dsh-emacs--archived-sessions nil
   "Set of archived session IDs (hash table).")
@@ -350,18 +221,8 @@ NOT resolve their target from this variable alone — they read
 (defvar dsh-emacs--activity-groups (make-hash-table :test 'equal)
   "Activity-group state table.")
 
-(defvar-local dsh-emacs--input-marker nil
-  "Marker for the start of the input area (buffer-local).")
-
 (defvar-local dsh-emacs--pending-user-messages nil
   "Text of messages the user sent but that are not yet rendered in the transcript.")
-
-(defvar-local dsh-emacs--pending-attachments nil
-  "Attachments staged for this buffer's next prompt, in staging order.
-Each element is one staged entry (an image alist, or a local file entry
-uploaded at submit time) — see `dsh-emacs--submit-prompt'.  The Composer
-renders them as one read-only row; `C-c C-c' consumes them, `C-c C-d'
-discards them.")
 
 (defvar-local dsh-emacs--pending-user-echoes nil
   "Optimistic transcript echoes awaiting their submit's acceptance.
@@ -398,30 +259,6 @@ transcript or a `C-c C-c' belongs to.")
 ;; can still match the current buffer against its session id.
 (put 'dsh-emacs--buffer-session 'permanent-local t)
 
-(defvar dsh-emacs--input-history nil
-  "Prompts submitted with `dsh-emacs-send-or-stop', newest first.
-Shared across chat buffers (session transcripts are volatile, the prompt
-history is not).  Browsed by `M-p' / `M-n' when
-`dsh-emacs-input-history-cross-session' is non-nil.")
-
-(defvar dsh-emacs--input-history-by-session
-  (make-hash-table :test 'equal)
-  "Session id -> prompts that session submitted, newest first.
-The recall list per chat buffer's session for `M-p' / `M-n' when
-`dsh-emacs-input-history-cross-session' is nil.  Every prompt is recorded
-here alongside `dsh-emacs--input-history', so toggling the option never
-loses history — the lists merely start with the prompts recorded since
-this feature shipped.")
-
-(defvar-local dsh-emacs--input-history-pos nil
-  "Index into the browsed `M-p' / `M-n' history list, nil when not browsing.
-Buffer-local: each chat buffer holds its own recall position, so browsing
-one session never bleeds its index or pending text into another.")
-
-(defvar-local dsh-emacs--input-history-pending nil
-  "Input text saved before history browsing started, restored by M-n.
-Buffer-local alongside `dsh-emacs--input-history-pos'.")
-
 ;;; ---------------------------------------------------------------------------
 ;;;  Session management
 ;;; ---------------------------------------------------------------------------
@@ -441,15 +278,25 @@ is unavailable does `dsh-emacs-default-cwd' apply."
 
 (defun dsh-emacs--chat-session-item (session-id)
   "Return the cached session item for SESSION-ID, or nil."
-  (catch 'found
-    (dolist (item dsh-emacs--sessions)
-      (when (equal session-id (dsh-protocol-session-session-id item))
-        (throw 'found item)))))
+  (cl-find session-id dsh-emacs--sessions
+           :test #'equal :key #'dsh-protocol-session-session-id))
 
 (defun dsh-emacs--chat-title (session-id)
   "Display title for SESSION-ID, identical to the session list row, or nil."
   (let ((item (dsh-emacs--chat-session-item session-id)))
     (and item (dsh-emacs-session--display-title item))))
+
+(defun dsh-emacs--workspace-by-id (workspace-id)
+  "Return the cached workspace struct with WORKSPACE-ID, or nil."
+  (cl-find workspace-id dsh-emacs--workspaces
+           :test #'equal :key #'dsh-protocol-workspace-workspace-id))
+
+(defun dsh-emacs--workspace-containing (session-id)
+  "Return the cached workspace struct listing SESSION-ID, or nil."
+  (cl-find-if (lambda (ws)
+                (member session-id
+                        (dsh-protocol-workspace-session-ids ws)))
+              dsh-emacs--workspaces))
 
 (defun dsh-emacs--chat-cwd (session-id)
   "Directory of SESSION-ID: the session's `cwd' from session/list.
@@ -457,13 +304,10 @@ Falls back to the path of the workspace that accounts for the session
 (a freshly created workspace session may not be in the session cache yet
 but is already in `dsh-emacs--workspaces').  Returns nil when the session
 is not known at all."
-  (or (let ((item (dsh-emacs--chat-session-item session-id)))
-        (and item (dsh-protocol-session-cwd item)))
-      (catch 'found
-        (dolist (ws dsh-emacs--workspaces)
-          (when (member session-id
-                        (dsh-protocol-workspace-session-ids ws))
-            (throw 'found (dsh-protocol-workspace-path ws)))))))
+  (or (when-let* ((item (dsh-emacs--chat-session-item session-id)))
+        (dsh-protocol-session-cwd item))
+      (when-let* ((ws (dsh-emacs--workspace-containing session-id)))
+        (dsh-protocol-workspace-path ws))))
 
 (defun dsh-emacs--sanitize-buffer-name (title)
   "Sanitize TITLE for use as a buffer name.
@@ -487,8 +331,12 @@ following character); it is replaced with the visually close full-width
       (format "dsh: %s" session-id))))
 
 (defun dsh-emacs--chat-buffer-untrack ()
-  "Remove the current chat buffer from `dsh-emacs--chat-buffers' when killed."
-  (when dsh-emacs--buffer-session
+  "Remove the current chat buffer from `dsh-emacs--chat-buffers' when killed.
+Leaves the entry alone when it already points at another buffer, so a stale
+kill or mode change cannot deregister a replacement chat for the session."
+  (when (and dsh-emacs--buffer-session
+             (eq (gethash dsh-emacs--buffer-session dsh-emacs--chat-buffers)
+                 (current-buffer)))
     (remhash dsh-emacs--buffer-session dsh-emacs--chat-buffers)))
 
 (defun dsh-emacs--chat-buffer-sync (session-id)
@@ -611,37 +459,56 @@ known value."
         (with-current-buffer buf
           (dsh-emacs-modeline-set-preset preset))))))
 
+(defvar dsh-emacs--session-list-fetch-generation 0
+  "Generation of the latest `session/list' fetch.
+Every fetch increments it and keeps the value it started with; only the
+response whose token still matches this variable may install its snapshot.
+Concurrent refreshes can complete out of order, so an older response must
+not roll the cache back below a newer one.")
+
 ;;;###autoload
 (defun dsh-emacs-list-sessions--fetch ()
   "Fetch the session list via RPC and populate `dsh-emacs--sessions'."
   ;; This callback owns global caches, not the lifetime of the caller's chat.
   (with-current-buffer (get-buffer-create " *dsh-session-cache*")
     (dsh-emacs-events--host-refresh-begin)
-    (dsh-emacs--rpc-async "session/list" (dsh-protocol-session-list-request)
-                          (lambda (ok value)
-                            (unwind-protect
-				(if ok
-                                    (progn
-                                      ;; JSON arrays arrive as vectors; normalize
-                                      ;; them before the session list renderer uses
-                                      ;; `dolist', and wrap each item in a
-                                      ;; `dsh-protocol-session' struct so field
-                                      ;; access is centralized (protoco.el).
-                                      (setq dsh-emacs--sessions
-                                            (dsh-protocol-session-list--from-alist value))
-                                      ;; Title/workspace may have drifted
-                                      ;; (auto summary/rename/session move):
-                                      ;; re-sync all live chat buffers' name and
-                                      ;; default-directory.
-                                      (dsh-emacs--chat-buffers-sync-all)
-                                      ;; Refresh workspaces in parallel so the
-                                      ;; session list can group by workspace.
-                                      (dsh-emacs-list-workspaces))
-                                  (message "Failed to fetch session list: %S" value))
-                              ;; Snapshot installed: replay any frame that arrived
-                              ;; while the refresh was in flight, so the list never
-                              ;; rolls back below the stream's latest state.
-                              (dsh-emacs-events--host-refresh-drain))))))
+    (let ((generation (setq dsh-emacs--session-list-fetch-generation
+                            (1+ dsh-emacs--session-list-fetch-generation))))
+      (dsh-emacs--rpc-async "session/list" (dsh-protocol-session-list-request)
+                            (lambda (ok value)
+                              (unwind-protect
+                                  (when (= generation
+                                           dsh-emacs--session-list-fetch-generation)
+                                    (if ok
+                                        (progn
+                                          ;; JSON arrays arrive as vectors; normalize
+                                          ;; them before the session list renderer uses
+                                          ;; `dolist', and wrap each item in a
+                                          ;; `dsh-protocol-session' struct so field
+                                          ;; access is centralized (protoco.el).
+                                          (setq dsh-emacs--sessions
+                                                (dsh-protocol-session-list--from-alist value))
+                                          ;; Title/workspace may have drifted
+                                          ;; (auto summary/rename/session move):
+                                          ;; re-sync all live chat buffers' name and
+                                          ;; default-directory.
+                                          (dsh-emacs--chat-buffers-sync-all)
+                                          ;; Refresh workspaces in parallel so the
+                                          ;; session list can group by workspace.
+                                          ;; This fetch can outlive the chat that
+                                          ;; triggered it (the lazy preset link):
+                                          ;; keep the installed cache, but do not
+                                          ;; create a core connection when no list
+                                          ;; or chat is left to own and close it.
+                                          (when (dsh-emacs-events--host-needed-p)
+                                            (dsh-emacs-list-workspaces)))
+                                      (message "Failed to fetch session list: %s"
+                                               (dsh-emacs-rpc-error-text value))))
+                                ;; End the refresh span even for a superseded
+                                ;; response: the depth must balance and frames
+                                ;; recorded mid-flight must replay, but the stale
+                                ;; snapshot must not touch the caches.
+                                (dsh-emacs-events--host-refresh-drain)))))))
 
 (defun dsh-emacs-list-sessions--fetch-when-ready (deadline)
   "Poll until the server is alive, then fetch the session list.
@@ -664,11 +531,21 @@ loads the plugin tree, which does not fit in a fixed few seconds."
                  " (see `*dsh-server*')")))))
 
 (defun dsh-emacs-list-sessions ()
-  "Fetch the session list and refresh workspaces."
+  "Fetch the session list and refresh workspaces.
+With `dsh-emacs-server-auto-start' nil this never starts or installs a
+server: an unreachable server signals a `user-error' with startup
+instructions instead.  A managed process already being started by the
+user is still awaited; an explicit `dsh-emacs-server-start' is
+unaffected."
   (interactive)
-  ;; Non-blocking: launch the server in the background if needed.
-  ;; When the server was just started, poll until it's ready before
+  ;; Non-blocking: launch the server in the background if auto-start is
+  ;; allowed.  When the server is starting, poll until it is ready before
   ;; firing the RPC to avoid a 404 race.
+  (when (and (not dsh-emacs-server-auto-start)
+             (not (dsh-emacs--server-alive-p))
+             (not (and dsh-emacs--server-process
+                       (process-live-p dsh-emacs--server-process))))
+    (dsh-emacs--server-unreachable-error))
   (let ((alive (dsh-emacs-server-start)))
     (if alive
         (dsh-emacs-list-sessions--fetch)
@@ -728,15 +605,13 @@ matches the workspace registered for it under any spelling."
 
 (defun dsh-emacs--workspace-id-by-path (dir workspaces)
   "Id from WORKSPACES whose canonical path equals DIR, or nil."
-  (let ((want (dsh-emacs--workspace-canonical-path dir)))
-    (and want
-         (catch 'found
-           (dolist (ws workspaces)
-             (when (equal want
-                          (dsh-emacs--workspace-canonical-path
-                           (dsh-protocol-workspace-path ws)))
-               (throw 'found
-                      (dsh-protocol-workspace-workspace-id ws))))))))
+  (when-let* ((want (dsh-emacs--workspace-canonical-path dir))
+              (ws (cl-find want workspaces
+                           :test #'equal
+                           :key (lambda (workspace)
+                                  (dsh-emacs--workspace-canonical-path
+                                   (dsh-protocol-workspace-path workspace))))))
+    (dsh-protocol-workspace-workspace-id ws)))
 
 (declare-function dsh-emacs-events--host-upsert-workspace
                   "dsh-emacs-events" (workspace))
@@ -799,7 +674,24 @@ clearing the draft, using the last session identity confirmed by the server."
                    ((error quit) (fail (error-message-string err))))))))
          (created (ok value)
            (if (not ok)
-               (fail (format "%S" value))
+               (if (and preset
+                        (dsh-emacs--agent-preset-unavailable-p value))
+                   (progn
+                     ;; The server no longer has the preset this draft asked
+                     ;; for (removed or renamed, e.g. a stale
+                     ;; `dsh-emacs-default-preset').  The web applies the same
+                     ;; recovery when restoring a saved blank Session; here
+                     ;; every create carries the preset, so retry once under
+                     ;; the host default and keep the fallback for manual
+                     ;; retries.
+                     (let ((missing preset))
+                       (setq preset nil
+                             context (list dir workspace nil server id)
+                             dsh-emacs--creation-context context)
+                       (message "Preset %s unavailable; using the host default"
+                                missing))
+                     (create))
+                 (fail (dsh-emacs-rpc-error-text value)))
              (widen)
              (let* ((session (dsh-protocol-session--from-alist value))
                     (sid (dsh-protocol-session-session-id session))
@@ -854,7 +746,8 @@ clearing the draft, using the last session identity confirmed by the server."
             (lambda (ok value) (step #'created ok value))))
          (workspace-created (ok value)
            (if (not ok)
-               (fail (format "Workspace creation: %S" value))
+               (fail (format "Workspace creation: %s"
+                             (dsh-emacs-rpc-error-text value)))
              (let ((ws (dsh-protocol-workspace-result-workspace
                         (dsh-protocol-workspace-result--from-alist value))))
                (unless ws (error "Workspace creation returned no workspace"))
@@ -912,7 +805,7 @@ may still appear in the session list.  Return the draft buffer."
       (setq-local default-directory (file-name-as-directory dir)
                   dsh-emacs--creation-context
                   (list dir workspace-id preset server id)))
-    (pop-to-buffer buf)
+    (dsh-emacs-ui-navigate (point-marker) #'pop-to-buffer buf)
     (with-current-buffer buf (dsh-emacs-retry-session-creation))
     buf))
 
@@ -968,9 +861,9 @@ arrives."
             (cons session-id
                   (dsh-protocol-workspace-session-ids ws))))
     (when (and (listp dsh-emacs--sessions)
-               dsh-emacs-sessions-buffer
-               (get-buffer dsh-emacs-sessions-buffer))
-      (with-current-buffer (get-buffer dsh-emacs-sessions-buffer)
+               dsh-emacs--sessions-buffer
+               (get-buffer dsh-emacs--sessions-buffer))
+      (with-current-buffer (get-buffer dsh-emacs--sessions-buffer)
         (dsh-emacs-session--render))))
   session-id)
 
@@ -989,54 +882,32 @@ leaves the previous cache (when any) untouched.  Returns nothing."
                                   (dsh-protocol-agent-preset-list--from-alist
                                    value))))))
 
-(defconst dsh-emacs--preset-display-name-mapping
-  '(("standard" . "Standard mode")
-    ("minimal" . "Minimal mode")
-    ("ptc" . "PTC mode")
-    ("cordis" . "Creator mode"))
-  "Mapping (PRESET-ID . DISPLAY-NAME) of each shipped system preset.
-
-The dsh web resolves these presets' option labels through exactly this
-built-in key map (`presetDisplayText' in the web's agent-preset UI) —
-`agentPresets/list' carries no `name' for them.  The picker mirrors the
-mapping so the Emacs choices read the same as the web's.")
-
-(defun dsh-emacs--preset-display-name (preset)
-  "Web-consistent display name of roster row PRESET.
-Mirrors the web's `presetDisplayText': a shipped built-in id shows its web
-name (\"Standard mode\" …); anything else shows its published `name',
-falling back to the id.  PRESET is a `dsh-protocol-agent-preset' struct or
-wire alist.  dsh 0.1.7 dropped the roster row's `trust' field, so the map
-keys on the id alone — which is exactly what the web does."
-  (let* ((p (dsh-protocol--struct #'dsh-protocol-agent-preset-p
-                                  #'dsh-protocol-agent-preset--from-alist
-                                  preset))
-         (id (dsh-protocol-agent-preset-id p)))
-    (or (cdr (assoc id dsh-emacs--preset-display-name-mapping))
-        (dsh-protocol-agent-preset-name p)
-        id)))
-
 (defun dsh-emacs--preset-choices ()
   "((DISPLAY . ID) ...) preset choices for the new-session picker.
-From the cached `agentPresets/list' roster (broken entries excluded),
-each DISPLAY matches what the dsh web shows for that preset — the web
-name for the shipped system presets (\"Standard mode\" …), the
-published `name' (or the id) for everything else.  Before the first
-roster arrives, the four built-in presets are offered with their web
-names."
-  (let ((presets (and dsh-emacs--agent-presets
-                      (dsh-protocol-agent-preset-list-presets
-                       dsh-emacs--agent-presets))))
-    (if presets
-        (delq nil
-              (mapcar
-               (lambda (p)
-                 (unless (dsh-protocol-agent-preset-broken p)
-                   (cons (dsh-emacs--preset-display-name p)
-                         (dsh-protocol-agent-preset-id p))))
-               presets))
-      (mapcar (lambda (pair) (cons (cdr pair) (car pair)))
-              dsh-emacs--preset-display-name-mapping))))
+From the cached `agentPresets/list' roster (broken entries excluded).
+DISPLAY is the preset's published `name', or its id when the declaration
+carries none — shipped presets publish no name.  When two preset rows
+render identically, each adds its id in parentheses so that picking one
+still selects a single preset.  Nil before the first roster arrives."
+  (let* ((presets (and dsh-emacs--agent-presets
+                       (dsh-protocol-agent-preset-list-presets
+                        dsh-emacs--agent-presets)))
+         (rows (delq nil
+                     (mapcar
+                      (lambda (p)
+                        (unless (dsh-protocol-agent-preset-broken p)
+                          (cons (or (dsh-protocol-agent-preset-name p)
+                                    (dsh-protocol-agent-preset-id p))
+                                (dsh-protocol-agent-preset-id p))))
+                      presets)))
+         (seen (make-hash-table :test #'equal)))
+    (dolist (row rows)
+      (puthash (car row) (1+ (gethash (car row) seen 0)) seen))
+    (mapcar (lambda (row)
+              (if (> (gethash (car row) seen) 1)
+                  (cons (format "%s (%s)" (car row) (cdr row)) (cdr row))
+                row))
+            rows)))
 
 (defun dsh-emacs--preset-default-id (&optional default)
   "Preset id the new-session picker pre-selects, or nil.
@@ -1053,186 +924,51 @@ valid choice; otherwise the roster's `isDefault' preset; otherwise nil
                           (dsh-protocol-agent-preset-id p)))
                    presets)))))
 
+(defun dsh-emacs--agent-preset-unavailable-p (value)
+  "Non-nil when RPC error VALUE says the requested preset is unusable.
+Covers `agent-preset/not-found' (the id no longer exists) and
+`agent-preset/invalid' (the id resolves but cannot compose), the two
+codes the dsh web drops a restored blank's preset for."
+  (member (dsh-protocol-rpc-error-code
+           (dsh-protocol-rpc-error--from-alist value))
+          '("agent-preset/not-found" "agent-preset/invalid")))
+
 (defun dsh-emacs--read-preset (&optional default)
   "Read an agent preset id for a new session; nil keeps the host default.
-Choices come from the cached `agentPresets/list' roster (the built-in
-presets with their web names before the first fetch); a background
-refresh is kicked off so the next pick sees fresh entries.  Pre-selects
-DEFAULT (the configured `dsh-emacs-default-preset') when it is a valid
-choice, else the host's `isDefault' preset — an empty RET accepts the
-pre-selection; without any pre-selection picking is required (unknown
-input is rejected).  C-g cancels the whole session creation."
-  (dsh-emacs--agent-presets-refresh)
-  (let* ((default-id (dsh-emacs--preset-default-id default))
-         (choices (dsh-emacs--preset-choices))
-         (default-name (and default-id
-                            (car (rassoc default-id choices))))
-         (picked (completing-read
-                  (format "Agent preset for the new session%s: "
-                          (if default-name
-                              (format " (default %s)" default-name)
-                            ""))
-                  choices nil t nil nil default-name)))
-    (cond ((and picked (not (string-empty-p picked)))
-           (or (cdr (assoc picked choices)) default-id))
-          (default-name default-id)
-          (t nil))))
-
-(defun dsh-emacs--ensure-input-marker ()
-  "Repair the chat input marker when it was lost, without touching content.
-The prompt anchor is located by its face; the marker is re-created right
-after the `❯ ' prompt so input sync and transcript rendering keep working.
-The glyph is found by scanning forward on the anchor's line instead of a
-blind 2-char skip: the anchor sits at the start of the prompt-face run,
-which may start left of the prompt itself (e.g. a queue prefix sharing
-the prompt face), and the marker must land after the prompt, not at the
-run start.  When no `❯ ' is found ahead of the anchor, the fixed skip is
-kept as a fallback."
-  (when (or (null dsh-emacs--input-marker)
-            (not (and (markerp dsh-emacs--input-marker)
-                      (eq (marker-buffer dsh-emacs--input-marker)
-                          (current-buffer)))))
-    (let ((anchor (dsh-emacs-render--input-anchor-pos)))
-      (when anchor
-        (setq dsh-emacs--input-marker
-              (save-excursion
-                (goto-char anchor)
-                (if (search-forward "❯ " (line-end-position) t)
-                    (point-marker)
-                  (forward-char 2)      ; skip "❯ "
-                  (point-marker))))))))
-
-(defun dsh-emacs--lock-cursor-to-input ()
-  "Clamp the cursor around the editable input area (post-command).
-Two, complementary clamps:
-- BELOW: positions past the end of the input area are pulled back to its
-  end, so the cursor can never rest under the input line.
-- ABOVE, on the input line itself: the read-only stretch from the start
-  of the input line up to the `❯ ' prompt is a no-park zone — e.g. after
-  `C-a' in the input or a stray click — and point is pulled to the edit
-  start after the prompt; the prompt icon is strictly non-resting while
-  the transcript above the input line stays freely readable.
-The BELOW clamp is area-based (`dsh-emacs--input-end'), not line-based,
-and the ABOVE clamp touches only the input line's left margin, so a
-multi-line input is unaffected — the cursor may roam anywhere inside the
-editable region.  Runs in every dsh-emacs-mode buffer (buffer-local
-hook) independent of the global `dsh-emacs--current-buffer', so it also
-holds in an inactive chat buffer while another session is the
-last-opened one."
-  (dsh-emacs--ensure-input-marker)
-  (when (and dsh-emacs--input-marker
-             (markerp dsh-emacs--input-marker)
-             (eq (marker-buffer dsh-emacs--input-marker) (current-buffer)))
-    (let* ((marker-pos (marker-position dsh-emacs--input-marker))
-           (input-end (max marker-pos (dsh-emacs--input-end)))
-           ;; Start of the input line (the line holding `❯ '): on that
-           ;; line, left of the icon is a no-park zone.
-           (line-start (save-excursion
-                         (goto-char marker-pos)
-                         (line-beginning-position))))
-      (cond
-       ((> (point) input-end)
-        (goto-char input-end))
-       ((and (< (point) marker-pos)
-             (>= (point) line-start))
-        (goto-char marker-pos))))))
-
-(defun dsh-emacs--route-typing-to-input ()
-  "When about to type or edit while point is in the read-only region, first\nmove the cursor back to the input area after `❯ '.\n
-Used with `dsh-emacs--reveal-input-when-typing': typing directly in the\nread-only area would trigger `text-read-only'; this moves point into the\ninput area before the command runs, so typing no longer errors\nand the input area scrolls into view automatically."
-  (when (and (memq this-command
-                   '(self-insert-command
-                     delete-backward-char
-                     delete-forward-char
-                     backward-delete-char-untabify
-                     dsh-emacs-delete-input
-                     yank yank-pop))
-             dsh-emacs--input-marker
-             (markerp dsh-emacs--input-marker)
-             (eq (marker-buffer dsh-emacs--input-marker) (current-buffer))
-             (< (point) (marker-position dsh-emacs--input-marker)))
-    (goto-char (marker-position dsh-emacs--input-marker))))
-
-(defun dsh-emacs--reveal-input-when-typing ()
-  "Immediately scroll the window to the input area when typing (self-insert /\nediting commands).\n
-When the input line is not visible because the window was scrolled up to\nread history, starting to type scrolls the input line\nback to the bottom of the window, so the `❯ ' line being typed is visible."
-  (when (and (window-live-p (get-buffer-window (current-buffer) t))
-             (memq this-command
-                   '(self-insert-command
-                     delete-backward-char
-                     delete-forward-char
-                     backward-delete-char-untabify
-                     dsh-emacs-delete-input
-                     yank yank-pop))
-             dsh-emacs--input-marker
-             (markerp dsh-emacs--input-marker)
-             (eq (marker-buffer dsh-emacs--input-marker) (current-buffer))
-             (>= (point) (marker-position dsh-emacs--input-marker)))
-    (let ((input-pos (marker-position dsh-emacs--input-marker)))
-      (unless (pos-visible-in-window-p input-pos (selected-window))
-        (save-excursion
-          (goto-char input-pos)
-          (recenter -1))))))
-
-(defun dsh-emacs--composer-boundary ()
-  "Return the editable input's end for the current chat buffer, or nil.
-A valid live input marker in the current buffer marks a composer context; the
-returned boundary is the position right before the structural newline the
-mode-line separator owns.  Deletion guards use it so a forward kill never
-removes that newline (see `dsh-emacs--composer-kill-region' and
-`dsh-emacs--composer-delete-forward')."
-  (when (and dsh-emacs--input-marker
-             (markerp dsh-emacs--input-marker)
-             (eq (marker-buffer dsh-emacs--input-marker) (current-buffer)))
-    (dsh-emacs--input-end)))
-
-(defun dsh-emacs--composer-kill-region (orig start end &rest args)
-  "`kill-region' advice: clip kills touching the composer to editable input.
-Backward word kills can cross the read-only prompt when a draft starts with
-punctuation such as `~/'; forward kills can cross the structural separator
-newline.  Clamp both endpoints without changing their direction, so only
-draft text reaches the kill ring.  If word motion has already moved point
-past a boundary, bring it back into the input as well.  Empty clipped kills
-do nothing.  Kills wholly above the input and in non-chat buffers retain
-their standard behavior."
-  (if-let* ((boundary (dsh-emacs--composer-boundary))
-            (input-start (marker-position dsh-emacs--input-marker))
-            ((>= (max start end) input-start)))
-      (let ((clipped-start (max input-start (min start boundary)))
-            (clipped-end (max input-start (min end boundary))))
-        (when (<= (min start end) (point) (max start end))
-          (goto-char (max input-start (min (point) boundary))))
-        (unless (= clipped-start clipped-end)
-          (apply orig clipped-start clipped-end args)))
-    (apply orig start end args)))
-
-(defun dsh-emacs--composer-delete-forward (orig &optional arg)
-  "`delete-forward-char' advice: stop at the composer's structural newline.
-`C-d' at the very end of the input would otherwise delete the separator
-newline (a plain buffer's `C-d' at end-of-line joins lines; here the newline is
-structural and there is nothing to join), stranding the cursor below the input
-line.  Deletions are capped at the input boundary."
-  (let* ((arg (or arg 1))
-         (boundary (dsh-emacs--composer-boundary))
-         (effective (and boundary (min arg (max 0 (- boundary (point)))))))
-    (cond ((and boundary (<= effective 0)) nil)
-          ((null boundary) (funcall orig arg))
-          (t (funcall orig effective)))))
-
-(defvar dsh-emacs--composer-delete-guard-installed nil
-  "Non-nil once the composer deletion guards have been added once.")
-
-(defun dsh-emacs--composer-delete-guard-install ()
-  "Install the composer deletion boundary guards (global, idempotent).
-Advises the deletion commands (`kill-region', which `C-k'/`kill-line' and
-word/region kills route through, and `delete-forward-char'/`C-d')
-rather than the `delete-region' primitive, because a native-compiled caller
-can bypass advice on the primitive while the interactive command symbols are
-always reached through advice."
-  (unless dsh-emacs--composer-delete-guard-installed
-    (setq dsh-emacs--composer-delete-guard-installed t)
-    (advice-add 'kill-region :around #'dsh-emacs--composer-kill-region)
-    (advice-add 'delete-forward-char :around #'dsh-emacs--composer-delete-forward)))
+Choices come from the cached `agentPresets/list' roster; a cached roster is
+refreshed in the background, while a missing one is fetched synchronously
+after ensuring the server is ready, so the picker never opens without
+choices.  A failed fetch signals `user-error' instead of creating with an
+unchosen preset.  Pre-selects DEFAULT (the configured
+`dsh-emacs-default-preset') when it is a valid choice, else the host's
+`isDefault' preset — an empty RET accepts the pre-selection; without any
+pre-selection picking is required (unknown input is rejected).  C-g
+cancels the whole session creation."
+  (if dsh-emacs--agent-presets
+      (dsh-emacs--agent-presets-refresh)
+    (dsh-emacs-server-ensure)
+    (let ((res (dsh-emacs--rpc-request "agentPresets/list" nil)))
+      (unless (car res)
+        (user-error "Could not load the agent preset list: %s"
+                    (dsh-emacs-rpc-error-text (cdr res))))
+      (setq dsh-emacs--agent-presets
+            (dsh-protocol-agent-preset-list--from-alist (cdr res)))))
+  (let ((choices (dsh-emacs--preset-choices)))
+    (unless choices
+      (user-error "No agent presets are available"))
+    (let* ((default-id (dsh-emacs--preset-default-id default))
+           (default-name (and default-id
+                              (car (rassoc default-id choices))))
+           (picked (completing-read
+                    (format "Agent preset for the new session%s: "
+                            (if default-name
+                                (format " (default %s)" default-name)
+                              ""))
+                    choices nil t nil nil default-name)))
+      (cond ((and picked (not (string-empty-p picked)))
+             (or (cdr (assoc picked choices)) default-id))
+            (default-name default-id)
+            (t nil)))))
 
 ;;;###autoload
 (defun dsh-emacs-open-session (session-id &optional address other-window)
@@ -1247,7 +983,8 @@ was created.  Reopening never reconnects a live buffer; use
   (when (and address
              (equal (dsh-protocol-subagent-address-mode address) "external"))
     (user-error "External subagents have no local conversation"))
-  (let* ((existing (gethash session-id dsh-emacs--chat-buffers))
+  (let* ((departure (point-marker))
+         (existing (gethash session-id dsh-emacs--chat-buffers))
          (live (buffer-live-p existing))
          (buf (if live
                   existing
@@ -1261,8 +998,14 @@ was created.  Reopening never reconnects a live buffer; use
           dsh-emacs--current-buffer buf)
     (unless live
       (dsh-emacs--activate-chat-buffer session-id buf address))
-    (pop-to-buffer buf
-                   (when other-window '(display-buffer-pop-up-window)))))
+    (if (and address (not live))
+        (prog1
+          (pop-to-buffer buf
+                         (when other-window '(display-buffer-pop-up-window)))
+          (setq dsh-emacs--subagent-departure departure))
+      (dsh-emacs-ui-navigate
+       departure #'pop-to-buffer buf
+       (when other-window '(display-buffer-pop-up-window))))))
 
 (defun dsh-emacs--activate-chat-buffer (session-id buf &optional address)
   "Initialize BUF and connect it to SESSION-ID, optionally at ADDRESS.
@@ -1321,17 +1064,55 @@ The caller owns server readiness and window selection."
     ;; the transcript (see `dsh-emacs-events--follow-snapshot'), followed by
     ;; gapless live event frames — no history/stream hand-off gap exists.
     (dsh-emacs--subagent-input-update)
+    ;; The core connection is client-wide, not list-owned: a chat opened
+    ;; directly (M-x dsh-emacs-open-session, or a new session after
+    ;; `session/create') must start it too, or its queue projections,
+    ;; questions and approvals never arrive.  A live connection is a no-op.
+    (dsh-emacs-events-host-connect)
     (dsh-emacs-events-connect buf))
   buf)
 
 (defun dsh-emacs-open-subagent (parent entry &optional other-window)
   "Open catalog ENTRY through its direct PARENT, optionally in OTHER-WINDOW."
-  (let ((marker (point-marker))
-        (address (dsh-emacs-subagent-address parent entry)))
+  (let ((address (dsh-emacs-subagent-address parent entry)))
     (dsh-emacs-open-session (dsh-protocol-subagent-entry-id entry) address other-window)
-    (with-current-buffer dsh-emacs--current-buffer
-      (setq dsh-emacs--subagent-departure marker))
     (dsh-emacs-subagent--refresh-summaries)))
+
+(defun dsh-emacs-notify--open (session-id)
+  "Open SESSION-ID's chat after its desktop notification was clicked.
+Reuse a live chat or resolve a closed child's direct parent from the catalog.
+Raise and focus the selected frame when Emacs is graphical."
+  (condition-case err
+      (let* ((live (buffer-live-p (gethash session-id dsh-emacs--chat-buffers)))
+             (owner
+              (unless live
+                (catch 'found
+                  (maphash
+                   (lambda (parent _state)
+                     (when-let* ((entry
+                                  (cl-find session-id
+                                           (dsh-emacs-subagent--value
+                                            parent 'subagentCatalog)
+                                           :test #'equal
+                                           :key #'dsh-protocol-subagent-entry-id)))
+                       (throw 'found (cons parent entry))))
+                   dsh-emacs--subagent-catalogs)
+                  nil)))
+             (session (unless (or live owner)
+                        (dsh-emacs--chat-session-item session-id))))
+        (if (or live owner
+                (and session
+                     (not (equal (dsh-protocol-session-origin session)
+                                 "subagent"))))
+            (progn
+              (if owner
+                  (dsh-emacs-open-subagent (car owner) (cdr owner))
+                (dsh-emacs-open-session session-id))
+              (when (display-graphic-p)
+                (select-frame-set-input-focus (selected-frame))))
+          (message "dsh: the notified session is no longer available")))
+    (error (message "dsh: cannot open the notified session (%s)"
+                    (error-message-string err)))))
 
 (defun dsh-emacs--subagent-input-update ()
   "Apply child input presentation; command guards independently enforce policy."
@@ -1349,22 +1130,15 @@ The caller owns server readiness and window selection."
   "Return SESSIONS belonging to WORKSPACE-ID, excluding archived,
 subagent and blank rows.  Returns a list of session structs in recency
 order."
-  (let ((ws-by-id
-         (catch 'found
-           (dolist (ws dsh-emacs--workspaces)
-             (when (equal workspace-id
-                            (dsh-protocol-workspace-workspace-id ws))
-               (throw 'found ws))))))
-    (if (null ws-by-id)
-        nil
-      (let ((session-ids (dsh-protocol-workspace-session-ids ws-by-id)))
-        (dsh-emacs-session--sort-by-recency
-         (cl-remove-if
-          (lambda (s)
-            (or (not (dsh-emacs-session--visible-p s))
-                (not (member (dsh-protocol-session-session-id s)
-                             session-ids))))
-          dsh-emacs--sessions))))))
+  (when-let* ((ws (dsh-emacs--workspace-by-id workspace-id)))
+    (let ((session-ids (dsh-protocol-workspace-session-ids ws)))
+      (dsh-emacs-session--sort-by-recency
+       (cl-remove-if
+        (lambda (s)
+          (or (not (dsh-emacs-session--visible-p s))
+              (not (member (dsh-protocol-session-session-id s)
+                           session-ids))))
+        dsh-emacs--sessions)))))
 
 (defun dsh-emacs--workspace-label (workspace-id)
   "Human label of WORKSPACE-ID: title, else path basename, else the id."
@@ -1385,71 +1159,19 @@ across all workspaces."
 
 (defun dsh-emacs--workspace-title (workspace-id)
   "Return the title of the workspace with WORKSPACE-ID, or nil."
-  (catch 'found
-    (dolist (ws dsh-emacs--workspaces)
-      (when (equal workspace-id (dsh-protocol-workspace-workspace-id ws))
-        (throw 'found (dsh-protocol-workspace-title ws))))))
+  (when-let* ((ws (dsh-emacs--workspace-by-id workspace-id)))
+    (dsh-protocol-workspace-title ws)))
 
 (defun dsh-emacs--workspace-path (workspace-id)
   "Return the path of the workspace with WORKSPACE-ID, or nil."
-  (catch 'found
-    (dolist (ws dsh-emacs--workspaces)
-      (when (equal workspace-id (dsh-protocol-workspace-workspace-id ws))
-        (throw 'found (dsh-protocol-workspace-path ws))))))
+  (when-let* ((ws (dsh-emacs--workspace-by-id workspace-id)))
+    (dsh-protocol-workspace-path ws)))
 
 (defun dsh-emacs--workspace-for-session (session-id)
   "Return the workspace id SESSION-ID belongs to, or nil when ungrouped."
-  (catch 'found
-    (dolist (ws dsh-emacs--workspaces)
-      (when (member session-id (dsh-protocol-workspace-session-ids ws))
-        (throw 'found (dsh-protocol-workspace-workspace-id ws))))))
+  (when-let* ((ws (dsh-emacs--workspace-containing session-id)))
+    (dsh-protocol-workspace-workspace-id ws)))
 
-;; With `ivy-mode' on, `ivy-sort-functions-alist' takes over
-;; sorting; we adapt to whichever completion framework the user
-;; actually enabled (see `dsh-emacs--completing-read-ordered').
-;; The defvar only silences a byte-compile warning and guarantees
-;; dynamic binding; it has no effect when the framework is not
-;; loaded.
-(defvar ivy-sort-functions-alist)
-
-(defun dsh-emacs--completion-table-with-metadata (collection metadata)
-  "Return COLLECTION as a completion table carrying METADATA.
-METADATA is an alist of completion metadata (see `completion-metadata'),
-e.g. `display-sort-function' pinned to identity to stop a frontend from
-reordering the candidates.  Uses the Emacs 31 built-in when present and
-the equivalent table lambda otherwise; the built-in is Emacs 31-only,
-while the package baseline is 28.1."
-  (if (fboundp 'completion-table-with-metadata)
-      (completion-table-with-metadata collection metadata)
-    (lambda (string pred action)
-      (if (eq action 'metadata)
-          `(metadata . ,metadata)
-        (complete-with-action action collection string pred)))))
-
-(defun dsh-emacs--completing-read-ordered (prompt collection &rest args)
-  "`completing-read', but keep COLLECTION's incoming order from
-  being reordered by the completion framework.
-  Adapts to whichever framework the user actually enabled, without
-  hardcoding any of them:
-  - vertico / corfu / stock minibuffer: reads the completion
-    metadata's `display-sort-function' (vertico--sort-function /
-    corfu both take priority over their own sort toggles); set it to
-    identity here and the framework drops the reorder by itself;
-  - ivy: does not read that metadata and takes the sort function per
-    collection/caller from `ivy-sort-functions-alist' — bound
-    dynamically to ((t . nil)) (docstring: nil = no sorting),
-    effective for this call only;
-  - other frameworks (selectrum etc.) also honor the
-    display-sort-function convention.
-  PROMPT/COLLECTION/ARGS have exactly the same semantics as
-  `completing-read'."
-  (let ((ordered (dsh-emacs--completion-table-with-metadata
-                  collection
-                  '((display-sort-function . identity)))))
-    (if (bound-and-true-p ivy-mode)
-        (let ((ivy-sort-functions-alist '((t))))
-          (apply #'completing-read prompt ordered args))
-      (apply #'completing-read prompt ordered args))))
 
 (defun dsh-emacs--sessions-index ()
   "Hash table session-id → session struct for `dsh-emacs--sessions'.
@@ -1642,7 +1364,7 @@ results in bounded increments."
              (id-table (dsh-emacs--switch-id-table vec))
              (table (dsh-emacs--switch-table
                      vec dsh-emacs-switch-max-candidates))
-             (picked (dsh-emacs--completing-read-ordered
+             (picked (dsh-emacs-ui--completing-read-ordered
                       (dsh-emacs--switch-prompt workspace-id all)
                       table nil t)))
         (when picked
@@ -1684,6 +1406,18 @@ that leaves nothing to choose, signal EMPTY-MESSAGE instead of letting
       (user-error "%s" (or empty-message "No session to choose from")))
     (cdr (assoc (completing-read prompt entries nil t) entries))))
 
+(defun dsh-emacs--fork-failure-text (value)
+  "Explain a failed `session/fork' with error VALUE.
+An unavailable-preset error also lists the preset ids the server does
+provide; every other failure uses the generic RPC error text."
+  (let ((preset-error
+         (dsh-protocol-agent-preset-error--from-alist value)))
+    (if (and preset-error (cdr preset-error))
+        (format "%s; available presets: %s"
+                (dsh-emacs-rpc-error-text value)
+                (string-join (cdr preset-error) ", "))
+      (dsh-emacs-rpc-error-text value))))
+
 ;;;###autoload
 (defun dsh-emacs-fork-session (session-id &optional at-seq)
   "Fork SESSION-ID into a new child session that inherits its history.
@@ -1699,7 +1433,8 @@ list refreshes and the child buffer opens with the same workspace path."
                         (dsh-protocol-session-fork-request session-id at-seq)
                         (lambda (ok value)
                           (if (not ok)
-                              (message "Failed to fork session: %S" value)
+                              (message "Failed to fork session: %s"
+                                       (dsh-emacs--fork-failure-text value))
                             (let ((child-id
                                    (dsh-protocol-session-session-id
                                     (dsh-protocol-session--from-alist value))))
@@ -1725,17 +1460,18 @@ streams, user messages and transcript controls are not fork boundaries."
 
 (defun dsh-emacs--session-preset (session-id)
   "Return the agentPreset cached for SESSION-ID, or nil when unknown."
-  (catch 'found
-    (dolist (item dsh-emacs--sessions)
-      (when (equal session-id (dsh-protocol-session-session-id item))
-        (throw 'found (dsh-protocol-session-agent-preset item))))))
+  (when-let* ((item (dsh-emacs--chat-session-item session-id)))
+    (dsh-protocol-session-agent-preset item)))
 
 (defun dsh-emacs--link-session-preset (session-id)
   "Fill the mode-line agent preset for SESSION-ID.
 Uses the cached session list when possible; otherwise refreshes
-`session/list' once and lets the sync feed the preset from the response.
-SAFE outside a chat buffer (the RPC callback runs in the buffer that called
-this).  The lazy fetch also covers the ctx% snapshot on first open: a session
+`session/list' once through `dsh-emacs-list-sessions--fetch' and lets the sync
+feed the preset from the response.  SAFE outside a chat buffer: that fetch
+runs from the hidden session-cache buffer, so a killed caller cannot drop the
+callback, and it brackets the round trip with the refresh replay so a live
+status/title frame that lands mid-flight survives the stale snapshot.
+The lazy fetch also covers the ctx% snapshot on first open: a session
 missing from `dsh-emacs--sessions' has no `contextPressure' to feed the
 mode-line either (see `dsh-emacs--chat-buffer-context-sync'), so the same
 fetch — whose callback calls `dsh-emacs--chat-buffers-sync-all' — brings
@@ -1746,18 +1482,11 @@ preset, context snapshot, title and workspace in one round trip."
       ;; mode line through the shared sync (same source the cache refresh
       ;; uses for model/ctx), so the preset and its siblings stay consistent.
       (dsh-emacs--chat-buffer-preset-sync session-id (current-buffer))
-    (dsh-emacs--rpc-async "session/list" (dsh-protocol-session-list-request)
-                          (lambda (ok value)
-                            (when ok
-                              (let ((items (dsh-protocol-session-list--from-alist value)))
-                                ;; A brand-new session on first open is missing
-                                ;; from the cache: refresh the whole cache so
-                                ;; the buffer name (`dsh: <title>') and the
-                                ;; workspace (default-directory) come along
-                                ;; too; `dsh-emacs--chat-buffers-sync-all' now
-                                ;; also feeds the preset to open chat buffers.
-                                (setq dsh-emacs--sessions items)
-                                (dsh-emacs--chat-buffers-sync-all)))))))
+    ;; No cached row/preset yet: use the shared, replay-protected refresh
+    ;; rather than installing a raw `session/list' response.  A brand-new
+    ;; session on first open is missing from the cache, and a stale response
+    ;; must not roll back state the core stream already delivered.
+    (dsh-emacs-list-sessions--fetch)))
 
 (defun dsh-emacs-archive-session (session-id)
   "Archive SESSION-ID: remove it from its workspace view.
@@ -1778,7 +1507,8 @@ inverse.  Refreshes the archived set and the session list on success."
                                         (dsh-protocol-archived-set--from-alist value))))
                                 (dsh-emacs-list-sessions)
                                 (message "Session archived"))
-                            (message "Failed to archive: %S" value)))))
+                            (message "Failed to archive: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 (defun dsh-emacs--archived-session-p (session)
   "Whether SESSION is in the cached archived set."
@@ -1809,7 +1539,8 @@ and the session list."
                                         (dsh-protocol-archived-set--from-alist value))))
                                 (dsh-emacs-list-sessions)
                                 (message "Session restored"))
-                            (message "Failed to restore session: %S" value)))))
+                            (message "Failed to restore session: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 (defun dsh-emacs-rename-session (session-id new-title)
   "Rename session SESSION-ID to NEW-TITLE.
@@ -1833,7 +1564,8 @@ title prompt is prefilled with the session's current title."
                               (progn
                                 (dsh-emacs-list-sessions)
                                 (message "Session renamed"))
-                            (message "Failed to rename: %S" value)))))
+                            (message "Failed to rename: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;;  Workspace management
@@ -1854,17 +1586,14 @@ the `workspace/follow' logical stream (a baseline frame on open).  A
 refresh re-opens that stream on the live core connection (retiring the
 previous one first); the fresh baseline seeds
 `dsh-emacs--workspaces'/`dsh-emacs--archived-sessions' and repaints.
-When no core connection is open the session list is connected first and
-the connect's own `workspace/follow' baseline (opened by
-`dsh-emacs-events--host-open' once the handshake completes) repaints —
-no immediate re-baseline is attempted on a not-yet-handshaken socket."
+When no core connection is open it is started, and the connect's own
+`workspace/follow' baseline (opened by `dsh-emacs-events--host-open' once
+the handshake completes) repaints — no immediate re-baseline is attempted
+on a not-yet-handshaken socket."
   (interactive)
   (dsh-emacs-server-ensure)
   (unless (dsh-emacs-events--core-workspace-rebaseline)
-    (when (and dsh-emacs-sessions-buffer
-               (get-buffer dsh-emacs-sessions-buffer))
-      (with-current-buffer (get-buffer dsh-emacs-sessions-buffer)
-        (dsh-emacs-events-host-connect)))))
+    (dsh-emacs-events-host-connect)))
 
 ;;;###autoload
 (defun dsh-emacs-create-workspace (path)
@@ -1878,7 +1607,8 @@ no immediate re-baseline is attempted on a not-yet-handshaken socket."
                               (progn
                                 (dsh-emacs-list-workspaces)
                                 (message "Workspace created"))
-                            (message "Failed to create workspace: %S" value)))))
+                            (message "Failed to create workspace: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 ;;;###autoload
 (defun dsh-emacs-rename-workspace (workspace-id new-title)
@@ -1894,7 +1624,8 @@ no immediate re-baseline is attempted on a not-yet-handshaken socket."
                               (progn
                                 (dsh-emacs-list-workspaces)
                                 (message "Workspace renamed"))
-                            (message "Failed to rename: %S" value)))))
+                            (message "Failed to rename: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 ;;;###autoload
 (defun dsh-emacs-delete-workspace (workspace-id)
@@ -1912,7 +1643,8 @@ no immediate re-baseline is attempted on a not-yet-handshaken socket."
                               (progn
                                 (dsh-emacs-list-workspaces)
                                 (message "Workspace deleted"))
-                            (message "Failed to delete: %S" value)))))
+                            (message "Failed to delete: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 ;;;###autoload
 (defun dsh-emacs-move-workspace (workspace-id before-workspace-id)
@@ -1956,7 +1688,8 @@ repaints)."
                                     ;; membership/order stays authoritative.
                                     (dsh-emacs-list-workspaces)))
                                 (message "Workspace reordered"))
-                            (message "Failed to reorder: %S" value)))))
+                            (message "Failed to reorder: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;;  Chat mode
@@ -2015,273 +1748,6 @@ and prompt \"save?\".  Restore the flag without invalidating the mode line
 after every text or property edit; session statistics refresh separately."
   (restore-buffer-modified-p nil))
 
-;;; ---------------------------------------------------------------------------
-;;;  Undo (scoped to the input area)
-;;; ---------------------------------------------------------------------------
-
-;; A chat buffer is a live view of a session, not a document: everything
-;; above the input is written by the renderer (history, streamed replies,
-;; tool cards, Composer chrome), and only the text after `❯ ' is the user's.
-;; `undo' therefore has to work on that input alone — undoing rendered
-;; transcript text would corrupt the view, and `primitive-undo' binds
-;; `inhibit-read-only' internally, so the transcript's read-only property is
-;; no protection.  Two mechanisms keep the two apart:
-;;
-;; 1. Programmatic writes run under `buffer-undo-list' bound to t (every
-;;    `(let ((inhibit-read-only t)) ...)' around transcript text carries the
-;;    binding), so they leave no undo entry at all.
-;; 2. A write above the input still SHIFTS it down, which invalidates the
-;;    absolute positions in the entries already recorded for the draft;
-;;    `dsh-emacs--note-undo-change' flags that, and
-;;    `dsh-emacs--reset-undo-history' rebuilds the history before the next
-;;    command can reach a stale entry.
-
-(defvar-local dsh-emacs--undo-stale nil
-  "Non-nil when a transcript write invalidated the input's undo records.
-Set by `dsh-emacs--note-undo-change' from `after-change-functions';
-`dsh-emacs--reset-undo-history' rebuilds the history from it before the next
-command runs.")
-
-(defvar-local dsh-emacs--undo-consumed nil
-  "Last consumed input, with text properties, until the next input edit.
-Together with the current input, this is the position-independent state
-from which `dsh-emacs--input-undo-history' rebuilds one undo step.
-Only `dsh-emacs--clear-input' saves it, for every submission kind; any
-input edit, including undo restoring it or failure rollback, discards it.
-It holds text only, never attachments or a stack of earlier submissions.")
-
-(defvar-local dsh-emacs--undo-restored-end nil
-  "End of the input text a running undo command re-inserted, or nil.
-Set by `dsh-emacs--note-undo-change' while `undo-in-progress' is non-nil and
-the restored text reaches the input's end; `dsh-emacs--park-point-after-undo'
-consumes it in `post-command-hook'.")
-
-(defun dsh-emacs--transcript-change-p (beg)
-  "Whether the change starting at BEG belongs to the transcript, not the input.
-Everything left of the editable input is transcript text or the Composer
-chrome above it.  Without a live input marker nothing can be classified as
-input, so every change counts as transcript."
-  (let ((input-start (and (markerp dsh-emacs--input-marker)
-                          (eq (marker-buffer dsh-emacs--input-marker)
-                              (current-buffer))
-                          (marker-position dsh-emacs--input-marker))))
-    (or (null input-start) (< beg input-start))))
-
-(defun dsh-emacs--note-undo-change (beg end &rest _)
-  "`after-change-functions' hook: keep this buffer's undo state honest.
-A change left of the input is a transcript write: it shifts the input down,
-so the records made for the draft no longer point at it.  Runs for writes
-kept out of the undo history as well — they still move the input.  A change
-INSIDE the input while an undo runs is text that command just restored:
-remember where it ends when it reaches the input's end, so the cursor can
-follow it (see `dsh-emacs--park-point-after-undo')."
-  (if (dsh-emacs--transcript-change-p beg)
-      (setq dsh-emacs--undo-stale t)
-    (setq dsh-emacs--undo-consumed nil)
-    (when (and undo-in-progress
-               (> end beg)
-               (= end (dsh-emacs--input-end)))
-      (setq dsh-emacs--undo-restored-end end))))
-
-(defun dsh-emacs--input-undo-history ()
-  "Return one undo step for the position-independent input state, or nil.
-Nonempty input becomes an insertion record: undo clears the current draft.
-Otherwise `dsh-emacs--undo-consumed' becomes a deletion record: undo restores
-the last consumed input.  Input edits (including undo) invalidate that saved
-consumption, so it cannot resurface after a new draft is edited away.
-Both records use the live input marker; no live marker means no history."
-  (when-let* ((start (and (markerp dsh-emacs--input-marker)
-                          (eq (marker-buffer dsh-emacs--input-marker)
-                              (current-buffer))
-                          (marker-position dsh-emacs--input-marker)))
-              (end (dsh-emacs--input-end)))
-    (cond
-     ((< start end) (list nil (cons start end)))
-     (dsh-emacs--undo-consumed
-      (list nil (cons dsh-emacs--undo-consumed (- start)))))))
-
-(defun dsh-emacs--park-point-after-undo ()
-  "`post-command-hook': leave point after input text an undo command restored.
-`undo' re-inserts a restored region at the position it was deleted from and
-parks point there, so a draft comes back with the cursor at its beginning —
-while the next keystroke belongs at its end.  Consumes the position
-`dsh-emacs--note-undo-change' recorded; a command that only removed input
-text leaves point where that text was, which is where the user was editing."
-  (when (and dsh-emacs--undo-restored-end
-             (memq this-command '(undo undo-redo undo-only)))
-    (goto-char dsh-emacs--undo-restored-end)
-    (setq dsh-emacs--undo-restored-end nil)))
-
-(defun dsh-emacs--reset-undo-history ()
-  "Prepare this buffer's undo state at the start of a command.
-Rebuild `buffer-undo-list' around the input area, the only undoable region,
-once a transcript write has shifted the input (see `dsh-emacs--undo-stale'):
-undo records hold absolute buffer positions, and Emacs does not adjust them
-when text lands elsewhere, so records made for the draft before the write
-point at transcript text now.  Rebuild from `dsh-emacs--input-undo-history':
-the current draft or its last unclaimed consumption survives as one step;
-earlier editing granularity and redo history do not.  The restored-text
-position belongs only to the previous command and is cleared here too.
-
-A native deletion record alone requires clearing AFTER the submit echo,
-and even then cannot survive another transcript write.  Every submission
-must consume through `dsh-emacs--clear-input', which saves the actual input
-independently of its position.  That state survives echo/reply writes in
-either order until an input edit takes ownership; callbacks must not
-reinstall a previous consumption."
-  (setq dsh-emacs--undo-restored-end nil)
-  (when dsh-emacs--undo-stale
-    (setq dsh-emacs--undo-stale nil
-          buffer-undo-list (dsh-emacs--input-undo-history))))
-
-;;; ---------------------------------------------------------------------------
-;;; Input completion: local paths and words
-;;;
-;;; Two sources beyond the token owners.  Slash commands and @ references are
-;;; served by their own CAPFs (dsh-emacs-command.el / dsh-emacs-reference.el);
-;;; a path-like token completes against the local filesystem, and anything
-;;; else completes as a word from the draft above point and the transcript
-;;; above it instead of being retyped.
-;;; ---------------------------------------------------------------------------
-
-(defconst dsh-emacs--path-completion-chars "[:alnum:]_.~/+-"
-  "Characters that make up a path token in the chat input.
-The set stops at whitespace, quotes and punctuation, so completing
-`see docs/rpc.md,' inside the input leaves the comma alone instead of
-treating it as part of the file name.  The hyphen is last on purpose:
-inside a `skip-chars' set a hyphen in the middle starts a range, which
-would silently drop `.' and `-' from the token.")
-
-(defun dsh-emacs--path-completion-start ()
-  "Return the start of the path token before point in the input area, or nil.
-A token counts as a path when it contains a slash — the separator the user
-types to mean \"this is a path\" — so `~/…', `./src/' and absolute paths
-qualify while a bare name (and a lone `~') stays with word completion.
-Slash-command prefixes at the start of the input and @ reference tokens
-belong to their own completion sources."
-  (when-let* ((marker (and (boundp 'dsh-emacs--input-marker)
-                           dsh-emacs--input-marker))
-              ((markerp marker))
-              ((eq (marker-buffer marker) (current-buffer)))
-              (input-start (marker-position marker))
-              ((>= (point) input-start)))
-    (let* ((start (save-excursion
-                    (skip-chars-backward dsh-emacs--path-completion-chars)
-                    (point)))
-           (token (and (>= start input-start) (< start (point))
-                       (buffer-substring-no-properties start (point)))))
-      (when (and token
-                 (string-match-p "/" token)
-                 (not (and (= start input-start)
-                           (dsh-emacs-command--completion-prefix-p token)))
-                 (not (dsh-emacs-reference--at-token input-start (point))))
-        start))))
-
-(defun dsh-emacs-path-completion-at-point ()
-  "`completion-at-point-functions' entry: complete a local file path.
-`docs/rp', `./src/', `~/…' and absolute paths complete through the stock
-file-name completer against the chat buffer's `default-directory' — the
-session workspace — so the rows and drill-down match `find-file'.  The
-region includes the path suffix after point, and matching follows the
-active completion styles, including abbreviated directory components.
-Returns nil outside the input area, for an empty or non-path token, for a
-slash-command prefix or @ reference, and when no path matches, so a word
-token falls through to `dsh-emacs-word-completion-at-point'.
-
-Completion reads the LOCAL filesystem, like the `!' shell lines and
-`dsh-emacs-attach-file'; with a dsh server on another host, use an @
-reference instead, which the server resolves in the agent's working
-directory."
-  (when-let* ((start (dsh-emacs--path-completion-start))
-              (end (save-excursion
-                     (skip-chars-forward dsh-emacs--path-completion-chars)
-                     (point)))
-              (token (buffer-substring-no-properties start end))
-              ((completion-try-completion
-                token #'completion-file-name-table nil (- (point) start))))
-    ;; Matching is already style-aware above.  `:exclusive no' makes stock
-    ;; CAPF dispatch repeat a prefix-only test and reject directory shorthand.
-    (list start end #'completion-file-name-table)))
-
-(defconst dsh-emacs--word-completion-chars "[:alnum:]_-"
-  "Characters that make up one completion word in the chat input.
-Hyphens join identifier-like words (`dsh-emacs-mode', `read-only'), so a
-word is completed whole rather than one segment at a time.")
-
-(defun dsh-emacs--word-completion-start ()
-  "Return the start of the word before point in the input area, or nil.
-A word must lie entirely inside the editable input (after
-`dsh-emacs--input-marker') and be non-empty (point right after a
-non-word character yields nil, so TAB does nothing there).
-Slash-command prefixes and @ reference tokens belong to their own CAPFs."
-  (when-let* ((marker (and (boundp 'dsh-emacs--input-marker)
-                           dsh-emacs--input-marker))
-              ((markerp marker))
-              ((eq (marker-buffer marker) (current-buffer)))
-              (input-start (marker-position marker))
-              ((>= (point) input-start)))
-    (let ((start (save-excursion
-                   (skip-chars-backward dsh-emacs--word-completion-chars)
-                   (point))))
-      ;; An empty token would make the candidate regexp match the empty
-      ;; string at every position, so point right after a non-word
-      ;; character must yield nil.
-      (when (and (>= start input-start) (< start (point))
-                 (not (and (= start (1+ input-start))
-                           (dsh-emacs-command--completion-prefix-p
-                            (buffer-substring-no-properties
-                             input-start (point)))))
-                 (not (dsh-emacs-reference--at-token input-start (point))))
-        start))))
-
-(defun dsh-emacs--word-completion-candidates (prefix start)
-  "Return buffer words starting with PREFIX, nearest to START first.
-Searches backward from START over at most
-`dsh-emacs-word-completion-limit' characters, so a term the user has just
-seen wins over an older duplicate, and de-duplicates the result.  Matching
-follows `completion-ignore-case', the same option the completion front-end
-filters the returned candidates with."
-  (let* ((limit dsh-emacs-word-completion-limit)
-         (from (if limit (max (point-min) (- start limit)) (point-min)))
-         (case-fold-search completion-ignore-case)
-         (regexp (concat "\\(?:\\`\\|[^" dsh-emacs--word-completion-chars
-                         "]\\)\\(" (regexp-quote prefix)
-                         "[" dsh-emacs--word-completion-chars "]*\\)"))
-         (seen (make-hash-table :test #'equal))
-         (words nil))
-    (save-excursion
-      (goto-char start)
-      (while (re-search-backward regexp from t)
-        (let ((word (match-string-no-properties 1)))
-          (unless (gethash word seen)
-            (puthash word t seen)
-            (push word words)))
-        (goto-char (match-beginning 1))))
-    ;; Backward scanning pushes the nearest occurrence first, so reverse to
-    ;; return nearest-first.
-    (nreverse words)))
-
-(defun dsh-emacs-word-completion-at-point ()
-  "`completion-at-point-functions' entry: complete a word from the buffer.
-Offers words already present in this chat buffer — the draft before point
-and, within `dsh-emacs-word-completion-limit' characters, the transcript
-above it — so a term that appeared in an earlier message or tool result
-completes without retyping.  Returns nil outside the input area, for an
-empty word, for a slash command or @ reference, or when nothing matches.
-The completion region includes any word suffix after point.  Completion
-metadata preserves nearest-first ordering for display and cycling."
-  (when-let* ((start (dsh-emacs--word-completion-start))
-              (prefix (buffer-substring-no-properties start (point)))
-              (candidates (dsh-emacs--word-completion-candidates prefix start)))
-    (list start
-          (save-excursion
-            (skip-chars-forward dsh-emacs--word-completion-chars)
-            (point))
-          (dsh-emacs--completion-table-with-metadata
-           candidates '((display-sort-function . identity)
-                        (cycle-sort-function . identity)))
-          :exclusive 'no)))
-
 (define-derived-mode dsh-emacs-mode fundamental-mode "DSH"
   "DeepSeek Harness chat mode.
 \\{dsh-emacs-mode-map}"
@@ -2301,40 +1767,7 @@ metadata preserves nearest-first ordering for display and cycling."
   (buffer-enable-undo)
   (setq-local comment-start "// ")
   (setq-local comment-end "")
-  ;; Complete a slash command or skill when a "/name" token ends at point —
-  ;; at the input start or after any whitespace, the boundary the host's
-  ;; gesture grammar uses (mid-message it is catalog-confirmed, so prose like
-  ;; "see /usr" falls through to path completion); complete file/session
-  ;; references while an "@" token is in progress (see dsh-emacs-command.el /
-  ;; dsh-emacs-reference.el); complete a local file path when the token
-  ;; carries a separator; otherwise complete an ordinary word from the draft
-  ;; and the transcript above the input.
-  (setq-local completion-at-point-functions
-              '(dsh-emacs-command-completion-at-point
-                dsh-emacs-reference-completion-at-point
-                dsh-emacs-path-completion-at-point
-                dsh-emacs-word-completion-at-point))
-  ;; Cooperative slash / @ auto-trigger (see `dsh-emacs-command-auto-trigger-setup'
-  ;; and `dsh-emacs-reference-auto-trigger-setup'): dsh-emacs never enables a
-  ;; completion front-end's auto mode itself — it only contributes "/" and "@"
-  ;; to a front-end the user already turned on, and that front-end pops the list
-  ;; (corfu-auto / company idle).  Stock *Completions* / vertico / icomplete have
-  ;; no auto channel and trigger on TAB only.
-  (dsh-emacs-command-auto-trigger-setup)
-  (dsh-emacs-reference-auto-trigger-setup)
-  ;; @ references are host/query-dynamic (files, sessions), unlike the static
-  ;; slash catalog: while an @ token is in progress under corfu-auto, watch it
-  ;; and issue background host fetches so a settled query can reopen/refresh
-  ;; corfu's native popup.  This watcher only fetches data — it never opens a
-  ;; completion UI (corfu owns the popup via the "@" trigger; non-corfu buffers
-  ;; complete on TAB).  No-op without an active @ token or corfu-auto.
-  (add-hook 'post-command-hook #'dsh-emacs-reference--auto-complete nil t)
-
-  ;; The `/` and `@` completion categories register their default styles in
-  ;; `completion-category-defaults' at load time (see dsh-emacs-command.el /
-  ;; dsh-emacs-reference.el), the way a package is meant to; nothing is set
-  ;; buffer-locally here, so `completion-category-overrides' stays the user's
-  ;; knob and a user override for either category wins.
+  (dsh-emacs-input-setup-completion)
   ;; imenu: index by user message, so M-x imenu jumps to any past input.
   ;; Auto-rescan rebuilds that directory once a history page has landed.  No
   ;; `require' of imenu is needed: the command is autoloaded and both variables
@@ -2361,31 +1794,25 @@ metadata preserves nearest-first ordering for display and cycling."
   ;; it too, so no window is left showing a stream nobody serves.
   (add-hook 'kill-buffer-hook #'dsh-emacs-jobs--chat-closed nil t)
   (add-hook 'kill-buffer-hook #'dsh-emacs--chat-buffer-untrack nil t)
+  ;; The core connection outlives one chat; close it only when the last
+  ;; owner (list or chat) is gone.  Append so the untrack hook above has
+  ;; already removed this buffer from the registry.
+  (add-hook 'kill-buffer-hook #'dsh-emacs-events--host-maybe-disconnect t t)
+  ;; Leaving the chat mode releases ownership.  The hook runs before the
+  ;; local session variable is killed, so untrack first; the owner check
+  ;; then closes the core stream when this was the last owner (a failed
+  ;; activation leaves the buffer in draft mode the same way).
+  (add-hook 'change-major-mode-hook #'dsh-emacs-events--host-maybe-disconnect
+            nil t)
+  (add-hook 'change-major-mode-hook #'dsh-emacs--chat-buffer-untrack nil t)
   ;; Chat buffers are never "modified": the session transcript
   ;; is not written to disk, so closing must not prompt to save
   (add-hook 'kill-buffer-query-functions #'dsh-emacs--chat-buffer-clear-modified nil t)
   (add-hook 'after-change-functions #'dsh-emacs--chat-buffer-keep-clean nil t)
-  ;; Lock the cursor to the input area (after `❯ ') when a session opens
-  (add-hook 'post-command-hook #'dsh-emacs--lock-cursor-to-input nil t)
-  ;; Undo/redo is scoped to the input area: flag the records a transcript
-  ;; write invalidated, rebuild them before the next command runs, and leave
-  ;; point after text an undo restores.
-  (add-hook 'after-change-functions #'dsh-emacs--note-undo-change nil t)
-  (add-hook 'pre-command-hook #'dsh-emacs--reset-undo-history nil t)
-  (add-hook 'post-command-hook #'dsh-emacs--park-point-after-undo nil t)
-  ;; Before insert/edit commands, move point back to the input
-  ;; area if it sits in the read-only region
-  (add-hook 'pre-command-hook #'dsh-emacs--route-typing-to-input nil t)
-  ;; Scroll to the input area immediately when typing
-  (add-hook 'post-command-hook #'dsh-emacs--reveal-input-when-typing nil t)
-  ;; Word/region kills stay inside the editable input, protecting the prompt
-  ;; on backward kills and the structural newline on forward kills.  `C-d'
-  ;; also stops at the trailing boundary; `C-k' keeps standard line semantics.
-  (dsh-emacs--composer-delete-guard-install)
+  (dsh-emacs-input-setup-editing)
   (setq dsh-emacs--tool-calls (make-hash-table :test 'equal))
   (setq dsh-emacs--activity-groups (make-hash-table :test 'equal))
   (setq dsh-emacs--pending-user-messages nil
-        dsh-emacs--pending-attachments nil
         dsh-emacs--event-ready nil)
   (dsh-emacs-events--watchdog-stop)
   (dsh-emacs-events--health-stop)
@@ -2399,63 +1826,11 @@ metadata preserves nearest-first ordering for display and cycling."
 
   ;; Initialize the input area
   (dsh-emacs--setup-input-area)
+  (dsh-emacs--subagent-input-update)
   ;; Reset Composer chrome with the buffer; the next projection or snapshot
   ;; rebuilds the chrome rows and their top marker.
   (dsh-emacs-composer-reset)
-  ;; Clipboard images may also arrive through stock `yank-media' (Emacs 29+),
-  ;; which dispatches by media type to a buffer-local handler.  The handler is
-  ;; registered per chat buffer, so it can never stage an image from an
-  ;; unrelated mode's `yank-media'.
-  (when (fboundp 'yank-media-handler)
-    (yank-media-handler "image/.*" #'dsh-emacs--yank-media-handler)
-    ;; A macOS pasteboard exposes TIFF only, which the stock preferred-types
-    ;; list omits; prefer it in chat buffers so a plain `M-x yank-media' does
-    ;; not stop at "no preferred MIME type to yank".  The list itself is
-    ;; Emacs 31+; older versions have no such knob.
-    (when (boundp 'yank-media-preferred-types)
-      (with-suppressed-warnings ((free-variable yank-media-preferred-types))
-        (setq-local yank-media-preferred-types
-                    (cons 'image/tiff yank-media-preferred-types))))))
-
-(defun dsh-emacs--setup-input-area ()
-  "Set up the input area (a read-only transcript plus a writable input box).
-All welcome text is marked read-only; only the region after ❯ is writable.
-The layout is buffer structure, not user input: it leaves no undo entry, and
-the erase discards any history an earlier layout left behind."
-  (let ((inhibit-read-only t)
-        (buffer-undo-list t))
-    ;; Clear the buffer
-    (erase-buffer)
-    ;; Add a minimal chat header
-    (let ((welcome-start (point)))
-      (insert (propertize "dsh  " 'face 'dsh-emacs-accent-face))
-      (insert (propertize "DeepSeek Harness\n\n" 'face 'dsh-emacs-header-face))
-      ;; Input prompt
-      (insert (propertize "❯ " 'face 'dsh-emacs-input-prompt-face))
-      ;; Mark the whole welcome area read-only (via a text property,
-      ;; not buffer-read-only)
-      (put-text-property welcome-start (point) 'read-only t)
-      (put-text-property welcome-start (point) 'front-sticky '(read-only))
-      ;; Do not let properties leak into the input inserted at the end of the
-      ;; prompt.  Text properties are sticky by default, so inserting
-      ;; immediately after the prompt would otherwise inherit them:
-      ;;  - `read-only': would signal `text-read-only' even though the
-      ;;    insertion point itself has no `read-only' property.
-      ;;  - `face` / `font-lock-face': typing runs `insert-and-inherit'
-      ;;    (Emacs 31 `self-insert-command'), which copies the previous
-      ;;    character's face.  Without the exclusion, manual input after
-      ;;    `❯ ' inherited the prompt's accent face (blue) while pasted
-      ;;    (`yank' strips faces) or completed (plain `insert') text stayed
-      ;;    default coloured — the "half blue, half white" input line.
-      (put-text-property welcome-start (point) 'rear-nonsticky
-                         '(read-only face font-lock-face)))
-    ;; Mark the input start position (the marker follows text
-    ;; insertion/deletion automatically)
-    (setq dsh-emacs--input-marker (point-marker)))
-  ;; The erase above invalidated any record an earlier layout left behind.
-  (setq buffer-undo-list nil)
-  (setq dsh-emacs--undo-stale nil)
-  (dsh-emacs--subagent-input-update))
+  (dsh-emacs--setup-attachments))
 
 (defun dsh-emacs--active-session-id ()
   "Return the session id the current command context belongs to.
@@ -2509,7 +1884,8 @@ until the next wake (see `dsh-emacs-list-queue')."
                                   (message (if dsh-emacs--buffer-subagent
                                                "⏸ Stop requested"
                                              "⏸ Turn interrupted")))
-                              (message "Failed to interrupt: %S" value))))))
+                              (message "Failed to interrupt: %s"
+                                       (dsh-emacs-rpc-error-text value)))))))
 
 (defun dsh-emacs-send-or-stop ()
   "Send the input as a message, or act on the running turn.
@@ -2565,14 +1941,14 @@ replaying it as text would drop them."
         ;; after the echo for ordinary messages, before uploading for files.
         ;; A synchronous exception restores the exact original caption.
         (cl-labels ((submit (mode)
-                      (dsh-emacs--consume-pending-attachments)
+                      (when (dsh-emacs-pending-attachments)
+                        (dsh-emacs--set-pending-attachments nil))
                       (condition-case err
                           (dsh-emacs--submit-prompt text attachments mode)
                         ((error quit)
                          (dsh-emacs--replace-input input)
                          (when attachments
-                           (setq dsh-emacs--pending-attachments attachments)
-                           (dsh-emacs-composer-refresh))
+                           (dsh-emacs--set-pending-attachments attachments))
                          (signal (car err) (cdr err))))))
           (cond
            ((and steer-p (not empty-p)) (submit 'steer))
@@ -2582,62 +1958,6 @@ replaying it as text would drop them."
               (submit dsh-emacs-busy-enter-behavior)))
            (empty-p (message "Please enter a message"))
            (t (submit nil))))))))
-
-(defun dsh-emacs--input-end ()
-  "Return the end of editable input, before the mode-line separator newline."
-  (let ((modeline-start (and (boundp 'dsh-emacs--modeline-overlay)
-                             dsh-emacs--modeline-overlay
-                             (overlay-start dsh-emacs--modeline-overlay))))
-    (cond
-     ;; Structural separator the input-area geometry relies on: the editable
-     ;; input ends right at the `\n' the mode-line overlay follows.
-     ((and modeline-start
-           (> modeline-start (point-min))
-           (eq (char-before modeline-start) ?\n))
-      (1- modeline-start))
-     ;; The mode-line overlay can be torn while its separator newline survives
-     ;; (window follow / overlay churn around a split).  Falling back to
-     ;; point-max here would treat the phantom display line BENEATH the input
-     ;; as editable end, so `dsh-emacs--lock-cursor-to-input' could never pull
-     ;; a cursor parked there back onto the input line — the "cursor stuck
-     ;; under the input line until reopen" symptom.  Mirror the separator
-     ;; case instead so below-positions still clamp onto the input line.
-     ((and (not (bobp))
-           (eq (char-before (point-max)) ?\n))
-      (1- (point-max)))
-     (t (point-max)))))
-
-(declare-function dsh-emacs-reference--expanded-text "dsh-emacs-reference.el"
-                  (start end))
-
-(defun dsh-emacs--get-input ()
-  "Get the text in the input area, excluding the mode-line newline.
-Completed session @ chips are stored in the buffer as short `@label' text and
-expanded back to their canonical mention by
-`dsh-emacs-reference--expanded-text', so the returned text is always the wire
-form; file references (`@path', no canonical property) and plain text pass
-through unchanged."
-  (when (and dsh-emacs--input-marker (marker-buffer dsh-emacs--input-marker))
-    (dsh-emacs-reference--expanded-text
-     dsh-emacs--input-marker (dsh-emacs--input-end))))
-
-(defun dsh-emacs--clear-input ()
-  "Consume the input, keeping its text undoable and the mode-line newline.
-Save actual input (including reference-chip properties), not the expanded
-wire text or a synthesized attachment caption.  Save AFTER deletion, since
-the input change hook invalidates the preceding consumption.  An empty
-consumption replaces it with nil.  History navigation resets here, never
-when an asynchronous completion arrives for an older draft."
-  (when (and dsh-emacs--input-marker (marker-buffer dsh-emacs--input-marker))
-    (dsh-emacs--reset-undo-history)
-    (let ((inhibit-read-only t)
-          (text (buffer-substring dsh-emacs--input-marker
-                                  (dsh-emacs--input-end))))
-      (delete-region dsh-emacs--input-marker (dsh-emacs--input-end))
-      (setq dsh-emacs--undo-consumed (unless (string-empty-p text) text)
-            dsh-emacs--input-history-pos nil
-            dsh-emacs--input-history-pending nil)
-      (goto-char dsh-emacs--input-marker))))
 
 (defun dsh-emacs--valid-iana-time-zone-p (zone)
   "Return non-nil when ZONE names an installed IANA timezone."
@@ -2670,65 +1990,16 @@ ambiguous and are not accepted by the dsh API."
           local-zone)))
      (t "UTC"))))
 
-(defun dsh-emacs--input-history-record (list text)
-  "Return LIST with TEXT recorded newest-first.
-Drops TEXT when it repeats the newest entry and trims the result to
-`dsh-emacs-input-history-length' entries.  LIST may be nil."
-  (let ((list (if (string= text (car list)) list (cons text list)))
-        (len dsh-emacs-input-history-length))
-    (when (> (length list) len)
-      (setcdr (nthcdr (1- len) list) nil))
-    list))
-
-(defun dsh-emacs--push-input-history (text)
-  "Record TEXT in the input history, newest first.
-Lands in the shared cross-session list and in the per-session list of the
-buffer's session (see `dsh-emacs-input-history-cross-session'); both drop
-consecutive repeats and trim to `dsh-emacs-input-history-length'."
-  (when (and text (not (string-empty-p text)))
-    (let* ((session-id (dsh-emacs--active-session-id))
-           (own (gethash session-id dsh-emacs--input-history-by-session)))
-      (setq dsh-emacs--input-history
-            (dsh-emacs--input-history-record dsh-emacs--input-history text))
-      (puthash session-id
-               (dsh-emacs--input-history-record own text)
-               dsh-emacs--input-history-by-session))))
-
-(defun dsh-emacs--seed-input-history (events session-id &optional older)
-  "Seed SESSION-ID's per-session `M-p' / `M-n' recall from EVENTS.
-EVENTS is the [{event: ...}] history window; the texts of its
-`user/message' events are recorded into that session's per-session list,
-newest first.  First-entry recall would otherwise be empty — the
-per-session list only holds prompts submitted in THIS Emacs run until the
-session's earlier messages are backfilled here, on every history load
-(open, refresh, backfill).  Texts already present are skipped, so
-reloading the same window never duplicates entries; the shared
-cross-session list is untouched.  With OLDER, append missing prompts behind
-existing entries instead of treating the batch as a newer snapshot.
-
-Only messages the user wrote are recorded: the host injects its own
-model-facing `user/message' copies (workspace instructions, runtime-context
-snapshots, goal and subagent notices) into the same surface, and recalling
-one through `M-p' would paste a system-reminder wall of text back into the
-input; see `dsh-emacs-render--user-authored-p'.  Only prompts whose content
-is entirely text are recorded: a message carrying an image (or file) part
-cannot be replayed as text — the images would be lost — and the paste
-path's synthesized caption (`shot.png') must not come back as a prompt
-either.  This mirrors the submit paths, which never record an
-attachment-bearing prompt."
-  (when (and events session-id)
-    (let ((own (gethash session-id dsh-emacs--input-history-by-session))
-          (missing nil))
-      (dolist (entry (dsh-protocol--list events))
-        (let ((text (dsh-protocol-input-prompt--from-alist entry)))
-          (when (and text (not (string-empty-p text))
-                     (not (member text own))
-                     (not (member text missing)))
-            (push text missing))))
-      (setq own (if older (append own missing) (append missing own)))
-      (when (> (length own) dsh-emacs-input-history-length)
-        (setcdr (nthcdr (1- dsh-emacs-input-history-length) own) nil))
-      (puthash session-id own dsh-emacs--input-history-by-session))))
+(defun dsh-emacs--restore-draft (text attachments)
+  "Restore TEXT and the STAGED attachments of a failed submit.
+Leave a newer draft alone if either its text or staged attachments is
+nonempty.  A restored file entry still carries its path, so the next
+submit uploads it again and never reuses a spent receipt."
+  (when (and (string-empty-p (or (dsh-emacs--get-input) ""))
+             (null (dsh-emacs-pending-attachments)))
+    (dsh-emacs--replace-input text)
+    (when attachments
+      (dsh-emacs--set-pending-attachments attachments))))
 
 (defun dsh-emacs--submit-prompt (message &optional attachments mode)
   "Submit MESSAGE to the current session.
@@ -2781,8 +2052,8 @@ is not recorded for `M-p' recall: every submit path skips it."
              ;; unless a newer draft has taken its place.
              (dsh-emacs--restore-draft message attachments)
              (message "File upload failed: %s"
-                      (or (dsh-protocol-error-message--from-alist err)
-                          err "transport error"))))))
+                      (if err (dsh-emacs-rpc-error-text err)
+                        "transport error"))))))
     (dsh-emacs--submit-dispatch
      message :parts (delq nil (mapcar #'dsh-protocol-image-content-part
                                     attachments))
@@ -2824,7 +2095,7 @@ once every staged file has become a receipt."
         ;; by the `commands.execute' response, and the result is
         ;; rendered from the command/run + command/done session events.
         (unless parts
-          (dsh-emacs--push-input-history message))
+          (dsh-emacs--push-input-history (string-trim message)))
         (unless input-consumed
           (when (buffer-live-p input-buffer)
             (with-current-buffer input-buffer
@@ -2847,8 +2118,9 @@ once every staged file has become a receipt."
                    (with-current-buffer input-buffer
                      (dsh-emacs-render-command-cleanup-optimistic)
                      (dsh-emacs--restore-draft message staged)))
-                 (message "Command failed to run: %S"
-                          (or err "transport error")))
+                 (message "Command failed to run: %s"
+                          (if err (dsh-emacs-rpc-error-text err)
+                            "transport error")))
                 ((null execution)
                  ;; Not in the registry → clear the optimistic row and send
                  ;; it as an ordinary message (browser semantics); history was
@@ -2883,6 +2155,8 @@ uploading; the host admits images by the session's current model at claim
 time.  Slash lines are NOT routed to `commands.execute' here — busy input
 is queued as literal text, the same semantics as dsh web's busyEnter.  A
 prompt carrying attachments is not recorded for `M-p' recall.
+MESSAGE stays unchanged for failure recovery; outgoing text and history use
+its trimmed form.
 With nothing already pending in the mirror, the submit arms
 `dsh-emacs-queue--mark-submit-suppress': the splice+claim transient of
 this own message gets no `queued:' / `running:' echo (nothing to order
@@ -2891,17 +2165,18 @@ against); genuinely parked items keep their feedback."
   (dsh-emacs-subagent-require 'send)
   (when (and dsh-emacs--buffer-subagent parts)
     (user-error "Attachments are unavailable in subagent conversations"))
-  (let* ((mode (pcase mode
+  (let* ((text (string-trim message))
+         (mode (pcase mode
                  ((or "queue" "steer") mode)
                  ((or 'queue 'steer) (symbol-name mode))
                  ('stop "queue")
                  (_ (if (eq dsh-emacs-busy-enter-behavior 'steer) "steer" "queue"))))
          (session-id (dsh-emacs--active-session-id))
          (input-buffer (current-buffer))
-         (content (dsh-protocol-prompt-content message parts))
+         (content (dsh-protocol-prompt-content text parts))
          (payload (if dsh-emacs--buffer-subagent
                       (dsh-protocol-subagent-prompt-request
-                       dsh-emacs--buffer-subagent (dsh-emacs--rpc-id) mode message
+                       dsh-emacs--buffer-subagent (dsh-emacs--rpc-id) mode text
                        (dsh-emacs--client-time-zone))
                     (dsh-protocol-session-prompt-request
                      session-id (dsh-emacs--rpc-id) mode content
@@ -2909,7 +2184,7 @@ against); genuinely parked items keep their feedback."
     ;; Same web-style feel as the immediate path: the draft leaves the
     ;; input area and lands in history right away, before the RPC settles.
     (unless parts
-      (dsh-emacs--push-input-history message))
+      (dsh-emacs--push-input-history text))
     (unless input-consumed
       (when (buffer-live-p input-buffer)
         (with-current-buffer input-buffer
@@ -2924,7 +2199,7 @@ against); genuinely parked items keep their feedback."
     ;; A queued message is real but its host `inbox' projection frame is still a
     ;; round trip away; show it in the Next Message row now so the send does
     ;; not feel sticky.  The host's frame or the failure branch clears it.
-    (dsh-emacs-queue--optimistic-submit-show message)
+    (dsh-emacs-queue--optimistic-submit-show text)
     (dsh-emacs--rpc-async (if dsh-emacs--buffer-subagent
                               "subagents/prompt" "session/prompt") payload
                           (lambda (ok value)
@@ -2941,7 +2216,8 @@ against); genuinely parked items keep their feedback."
                               ;; splice/claim frames that would settle the
                               ;; suppression: clear it here (idempotent).
                               (dsh-emacs-queue--submit-suppress-clear)
-                              (message "Failed to submit: %S" value)
+                              (message "Failed to submit: %s"
+                                       (dsh-emacs-rpc-error-text value))
                               ;; Nothing will consume the text, put it back
                               ;; (same restore as the command path).
                               (when (buffer-live-p input-buffer)
@@ -2978,15 +2254,18 @@ The draft leaves the input area at submit time — the same web-style feel
 as the command and deferred paths — so a second submit keypress during
 the RPC round-trip reads an empty input instead of sending the message
 twice; on a transport failure the draft is restored only when both the
-input and staged attachments are empty (a newer draft is left alone)."
+input and staged attachments are empty (a newer draft is left alone).
+MESSAGE stays unchanged for recovery; outgoing text, echo and history use
+its trimmed form."
 
   (dsh-emacs-subagent-require 'mutate)
-  (let* ((session-id (dsh-emacs--active-session-id))
+  (let* ((text (string-trim message))
+         (session-id (dsh-emacs--active-session-id))
          (chat-buffer (and (boundp 'dsh-emacs--buffer-session)
                            dsh-emacs--buffer-session
                            (current-buffer)))
          (input-buffer (current-buffer))
-         (content (dsh-protocol-prompt-content message parts))
+         (content (dsh-protocol-prompt-content text parts))
          (payload (dsh-protocol-session-prompt-request
                    session-id (dsh-emacs--rpc-id) "queue" content
                    (dsh-emacs--client-time-zone)))
@@ -3004,16 +2283,16 @@ input and staged attachments are empty (a newer draft is left alone)."
         ;; Register before the RPC round-trip: a fast run can end before its
         ;; prompt callback is processed.
         (setq dsh-emacs--turn-awaiting t)
-        (unless (string-empty-p message)
+        (unless (string-empty-p text)
           (setq dsh-emacs--pending-user-messages
-                (append dsh-emacs--pending-user-messages (list message)))
+                (append dsh-emacs--pending-user-messages (list text)))
           ;; Echo the message NOW, not in the response callback: the user
           ;; pressed C-c C-c and the input is about to clear, so the
           ;; transcript must show it without waiting for the HTTP round trip
           ;; (a rejected prompt rolls the echo back, see the failure branch).
           (setq echo-entry
                 (dsh-emacs--render-user-message-optimistic
-                 message staged)))
+                 text staged)))
         ;; A submit with an empty queue still passes through the host
         ;; inbox (the wire knows only queue/steer modes): the host splices
         ;; the message in and claims it again at the turn start, and the
@@ -3037,44 +2316,17 @@ input and staged attachments are empty (a newer draft is left alone)."
                             (if ok
                                 (progn
                                   (unless (or history-recorded parts)
-                                    (dsh-emacs--push-input-history message))
-                                  ;; The echo is already on screen (rendered
-                                  ;; optimistically at submit); the callback
-                                  ;; only arms the live-follow state.
+                                    (dsh-emacs--push-input-history text))
                                   (when (buffer-live-p chat-buffer)
                                     (with-current-buffer chat-buffer
-                                      ;; The host accepted the prompt.  Light
-                                      ;; the mode-line running spinner only
-                                      ;; while the submitted run is still
-                                      ;; awaited: a fast run can start AND end
-                                      ;; on the mux before this HTTP callback
-                                      ;; runs (the ordering the
-                                      ;; `dsh-emacs--turn-awaiting'
-                                      ;; pre-registration above exists for),
-                                      ;; and re-lighting would leave the
-                                      ;; spinner running past that `turn/end'.
+                                      ;; A fast turn can end before HTTP accepts it.
+                                      ;; Never relight an already-finished turn.
                                       (when dsh-emacs--turn-awaiting
                                         (dsh-emacs--ml-busy-set t))
-                                      ;; Confirm the stream keeps delivering
-                                      ;; while this turn runs.
-                                      (dsh-emacs-events--watchdog-start)
                                       (dsh-emacs-render--follow-stream)
-                                      (unless dsh-emacs--event-ready
-                                        ;; Self-heal when the stream is offline:
-                                        ;; with no process at all, this session's
-                                        ;; mux dropped and nobody reconnected
-                                        ;; (opening a new session used to tear
-                                        ;; down the previous one's stream) — so
-                                        ;; reconnect first, letting the "switches
-                                        ;; back to realtime" promise hold; a
-                                        ;; process mid-handshake is covered by
-                                        ;; connect's health check, so do not
-                                        ;; connect again here.
-                                        (when (not (process-live-p
-                                                    dsh-emacs--event-process))
-                                          (dsh-emacs-events-connect
-                                           (current-buffer)))))))
-                              (message "Failed to send: %S" value)
+                                      (dsh-emacs-events-ensure-follow))))
+                              (message "Failed to send: %s"
+                                       (dsh-emacs-rpc-error-text value))
                               ;; The server rejected the prompt, so no
                               ;; `user/message' will ever arrive to consume the
                               ;; optimistic entry; drop it, lest the same text
@@ -3091,7 +2343,7 @@ input and staged attachments are empty (a newer draft is left alone)."
                                     (dsh-emacs--discard-user-message-echo
                                      echo-entry))
                                   (setq dsh-emacs--pending-user-messages
-                                        (delq message
+                                        (delq text
                                               dsh-emacs--pending-user-messages))
                                   ;; A failed prompt never produces the
                                   ;; splice/claim frames that would settle
@@ -3111,997 +2363,8 @@ input and staged attachments are empty (a newer draft is left alone)."
                                    message staged))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;;  Attachments / model selection / input history
+;;;  Permission, input history and chat commands
 ;;; ---------------------------------------------------------------------------
-
-(defun dsh-emacs--file-attachment (file)
-  "Read FILE into a wire-ready image attachment alist, or nil.
-
-The dsh host accepts base64 image uploads inline in `session/prompt'
-(media type, bytes and pixel limits are enforced server-side).  The
-base64 is emitted without line breaks: the wire field is validated as
-one continuous base64 run."
-  (let* ((media (ignore-errors
-                  (mailcap-file-name-to-mime-type
-                   (file-name-nondirectory file))))
-         (supported (and media (member media dsh-emacs-attach-media-types))))
-    (when (and supported (file-readable-p file))
-      (let ((bytes (dsh-emacs--binary-file-string file)))
-        (dsh-protocol-image-attachment
-         media bytes (file-name-nondirectory file))))))
-
-;; A non-image attachment is a *staged file entry*: metadata only, no
-;; bytes.  The host admits a file into a prompt as a one-time receipt
-;; minted by the upload route, so the bytes leave this machine at submit
-;; time (`dsh-emacs--upload-file') — never when the draft is composed,
-;; and never as base64 in the prompt.  See rpc.md §4.17.
-
-(defun dsh-emacs--attachment-file-p (attachment)
-  "Non-nil when staged ATTACHMENT is a local file awaiting upload."
-  (and (consp attachment) (assq 'file attachment)))
-
-(defun dsh-emacs--staged-file-attachment (file)
-  "Return FILE as a staged local file attachment, or nil.
-The entry \((file . PATH) (name . N) (bytes . B)) carries metadata only,
-so a draft never keeps a copy of the file.  A path that is not a readable
-regular file, or is larger than `dsh-emacs-attach-max-file-size', yields
-nil."
-  (when (and (file-regular-p file) (file-readable-p file))
-    (let ((size (file-attribute-size (file-attributes file))))
-      (when (or (null dsh-emacs-attach-max-file-size)
-                (<= size dsh-emacs-attach-max-file-size))
-        (list (cons 'file (expand-file-name file))
-              (cons 'name (file-name-nondirectory file))
-              (cons 'bytes size))))))
-
-(defun dsh-emacs--attachable-file (file)
-  "Return FILE as a staged attachment: an accepted image inline, else a file.
-An image whose type is in `dsh-emacs-attach-media-types' carries its
-base64 bytes inline (the host gives it to the model as an image); every
-other file becomes a staged file entry uploaded at submit time.  Nil when
-FILE cannot be attached, which is what `dsh-emacs-attach-file' reports."
-  (let ((media (ignore-errors
-                 (mailcap-file-name-to-mime-type
-                  (file-name-nondirectory file)))))
-    (if (and media (member media dsh-emacs-attach-media-types))
-        (dsh-emacs--file-attachment file)
-      (dsh-emacs--staged-file-attachment file))))
-
-(defun dsh-emacs--upload-file (session-id attachment callback)
-  "Upload local file ATTACHMENT for SESSION-ID; CALLBACK gets (OK RECEIPT ERROR).
-The bytes POST to the host's raw upload route as
-`application/octet-stream' (rpc.md §4.17) and the answer carries the
-one-time receipt the prompt must submit.  CALLBACK receives OK non-nil
-and the `dsh-protocol-file-receipt' as RECEIPT when the host accepted the
-upload, else ERROR: the route's own error object (`{code, message,
-details}'), a message-bearing alist for local validation, read or startup
-errors, or nil for transport failures already reported by HTTP."
-  (let* ((path (cdr (assq 'file attachment)))
-         (name (or (cdr (assq 'name attachment))
-                   (file-name-nondirectory path)))
-         (url (format "%s/api/session/uploadFileBinary?sessionId=%s&name=%s"
-                      (dsh-emacs--server-base-url)
-                      (url-hexify-string session-id)
-                      (url-hexify-string name)))
-         (callback-started nil)
-         (startup-error nil))
-    (message "Uploading %s…" name)
-    (condition-case err
-        (progn
-          ;; A staged file may have disappeared or grown since composition.
-          (unless (dsh-emacs--staged-file-attachment path)
-            (user-error "File is unreadable or exceeds attachment size limit: %s"
-                        path))
-          (dsh-emacs--http-post
-           url "application/octet-stream" (dsh-emacs--binary-file-string path)
-           (lambda (body)
-             ;; A synchronous response must not turn downstream callback
-             ;; exceptions into a second, failed upload completion.
-             (setq callback-started t)
-             ;; The route has its own {ok, value|error} discriminant.
-             (pcase-let ((`(,ok . ,value)
-                          (dsh-protocol-rpc-result--from-alist body :direct-p t)))
-               (if ok
-                   (funcall callback t
-                            (dsh-protocol-file-receipt--from-alist value) nil)
-                 (funcall callback nil nil value))))))
-      (error
-       (if callback-started
-           (signal (car err) (cdr err))
-         (setq startup-error err))))
-    (when startup-error
-      (funcall callback nil nil
-               (list (cons 'message (error-message-string startup-error)))))))
-
-(defun dsh-emacs--upload-attachments (session-id attachments callback)
-  "Upload the staged files of ATTACHMENTS, then resolve every part.
-Image entries become inline parts without a round trip; file entries
-upload one after another, so PARTS always follows the staged order.
-CALLBACK receives (OK PARTS ERROR): on success PARTS is the complete
-tagged content-part list; on failure OK is nil and ERROR is the failing
-upload's value, with no part list (the caller restores its draft)."
-  (unless session-id
-    (user-error "No active session to attach a file to"))
-  (let ((pending attachments)
-        (parts nil))
-    (cl-labels
-     ((next ()
-        (if (null pending)
-            (funcall callback t (nreverse parts) nil)
-          (let* ((entry pending)
-                 (attachment (car entry)))
-            (setq pending (cdr pending))
-            (if (dsh-emacs--attachment-file-p attachment)
-                (dsh-emacs--upload-file
-                 session-id attachment
-                 (lambda (ok receipt err)
-                   (if ok
-                       (progn
-                         ;; Keep authoritative display metadata separate
-                         ;; from the local name used for retry uploads.
-                         (let ((file (dsh-protocol-file-receipt-file receipt)))
-                           (when (or file (assq 'uploaded-file attachment))
-                             (setf (alist-get 'uploaded-file (car entry)) file)))
-                         (push (dsh-protocol-file-content-part receipt)
-                               parts)
-                         (next))
-                     (funcall callback nil nil err))))
-              (push (dsh-protocol-image-content-part attachment) parts)
-              (next))))))
-     (next))))
-
-;;; Clipboard images
-;;
-;; `C-c C-v' stages the system clipboard's image for the next prompt.  The
-;; selection surface differs per platform: X11/pgtk publish image MIME targets
-;; that `gui-get-selection' returns as-is, while macOS exposes TIFF only — a
-;; media type the dsh host does not accept — so those bytes are converted with
-;; the system `sips' tool before they leave this machine.
-
-(defun dsh-emacs--binary-file-string (file)
-  "Return FILE's bytes as a unibyte string, without coding conversion."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (insert-file-contents-literally file)
-    (buffer-string)))
-
-(defun dsh-emacs--write-binary-file (file bytes)
-  "Write the unibyte string BYTES to FILE without coding conversion."
-  (let ((coding-system-for-write 'binary))
-    (with-temp-buffer
-      (set-buffer-multibyte nil)
-      (insert bytes)
-      (write-region (point-min) (point-max) file nil 'silent))))
-
-(defun dsh-emacs--bytes-prefix-p (prefix bytes)
-  "Non-nil when unibyte BYTES start with the unibyte string PREFIX."
-  (and (>= (length bytes) (length prefix))
-       (string= prefix (substring bytes 0 (length prefix)))))
-
-(defun dsh-emacs--image-bytes-match-p (media-type bytes)
-  "Non-nil when unibyte BYTES carry MEDIA-TYPE's magic number.
-Guards against a selection that advertises a flavor but returns
-something else, which `create-image' and the host would both reject."
-  (pcase media-type
-    ("image/png" (dsh-emacs--bytes-prefix-p
-                  (unibyte-string 137 80 78 71 13 10 26 10) bytes))
-    ("image/jpeg" (dsh-emacs--bytes-prefix-p
-                   (unibyte-string 255 216 255) bytes))
-    ("image/gif" (dsh-emacs--bytes-prefix-p
-                  (unibyte-string 71 73 70 56) bytes))
-    ("image/webp" (and (>= (length bytes) 12)
-                       (dsh-emacs--bytes-prefix-p
-                        (unibyte-string 82 73 70 70) bytes)
-                       (dsh-emacs--bytes-prefix-p
-                        (unibyte-string 87 69 66 80)
-                        (substring bytes 8))))
-    ("image/tiff" (or (dsh-emacs--bytes-prefix-p
-                       (unibyte-string 73 73 42 0) bytes)
-                      (dsh-emacs--bytes-prefix-p
-                       (unibyte-string 77 77 0 42) bytes)))
-    (_ nil)))
-
-(defun dsh-emacs--selection-bytes (media-type)
-  "Return the clipboard's MEDIA-TYPE bytes (unibyte), or nil.
-MEDIA-TYPE is a MIME string such as \"image/png\".  A selection API
-error, a non-string result and an empty flavor all mean \"the
-clipboard carries no such type\"."
-  (let ((data (condition-case nil
-                  (gui-get-selection 'CLIPBOARD (intern media-type))
-                (error nil))))
-    (and (stringp data) (not (string-empty-p data)) data)))
-
-(defun dsh-emacs--tiff-bytes-to-png (tiff)
-  "Convert unibyte TIFF bytes to PNG bytes with macOS `sips', or nil.
-`create-image' can display TIFF, but the dsh host accepts only the
-media types in `dsh-emacs-attach-media-types'; `sips' is the system
-image converter, so no extra dependency is needed.  Returns nil when
-TIFF is malformed, `sips' is unavailable, or the conversion fails."
-  (when-let* ((sips (executable-find "sips"))
-              ((dsh-emacs--image-bytes-match-p "image/tiff" tiff)))
-    (let ((dir (make-temp-file "dsh-clipboard-" t)))
-      (unwind-protect
-          (let ((tiff-file (expand-file-name "clip.tiff" dir))
-                (png-file (expand-file-name "clip.png" dir)))
-            (dsh-emacs--write-binary-file tiff-file tiff)
-            (when (and (zerop (call-process sips nil nil nil
-                                            "-s" "format" "png"
-                                            tiff-file "--out" png-file))
-                       (file-readable-p png-file))
-              (let ((png (dsh-emacs--binary-file-string png-file)))
-                (and (dsh-emacs--image-bytes-match-p "image/png" png)
-                     png))))
-        (delete-directory dir t)))))
-
-(defun dsh-emacs--clipboard-image ()
-  "Return (MEDIA-TYPE . BYTES) for the clipboard's image, or nil.
-Accepted media types are tried directly first (X11/pgtk expose them);
-macOS exposes only TIFF on the pasteboard, so that flavor is converted
-to PNG only when PNG is accepted.  BYTES is the encoded image data
-as a unibyte string."
-  (or (cl-loop for media in dsh-emacs-attach-media-types
-               for bytes = (dsh-emacs--selection-bytes media)
-               when (and bytes (dsh-emacs--image-bytes-match-p media bytes))
-               return (cons media bytes))
-      (when-let* (((member "image/png" dsh-emacs-attach-media-types))
-                  (tiff (dsh-emacs--selection-bytes "image/tiff"))
-                  (png (dsh-emacs--tiff-bytes-to-png tiff)))
-        (cons "image/png" png))))
-
-(defun dsh-emacs--clipboard-image-present-p ()
-  "Non-nil when the clipboard advertises any image flavor at all.
-A cheap TARGETS probe that reads no image bytes; it only sharpens the
-error wording, distinguishing \"nothing to paste\" from \"the image's
-type is not accepted\"."
-  (let ((targets (condition-case nil
-                     (gui-get-selection 'CLIPBOARD 'TARGETS)
-                   (error nil))))
-    (and (sequencep targets)
-         (cl-some (lambda (target)
-                    (and (symbolp target)
-                         (string-prefix-p "image/" (symbol-name target))))
-                  (append targets nil)))))
-
-(defun dsh-emacs--clipboard-image-name (media-type)
-  "Return a display name for a pasted MEDIA-TYPE clipboard image."
-  (format-time-string
-   (concat "pasted-%Y%m%d-%H%M%S."
-           (pcase media-type
-             ("image/png" "png")
-             ("image/jpeg" "jpg")
-             ("image/webp" "webp")
-             ("image/gif" "gif")
-             (_ "img")))))
-
-;;; Staged attachments (Composer row)
-
-(defun dsh-emacs-pending-attachments ()
-  "Return this buffer's staged (not yet sent) attachments.
-Each element is one staged entry, as `dsh-emacs--submit-prompt' takes:
-an image alist \((mediaType . M) (data . B64) (name? . N)), or a local
-file entry \((file . PATH) (name . N) (bytes . B)).  The Composer renders
-them from this list, so it is the single source of truth for the row,
-never a copy."
-  dsh-emacs--pending-attachments)
-
-(defun dsh-emacs--attachments-summary (attachments)
-  "Return the names of staged ATTACHMENTS, or a count when none are named.
-This is the message text of a blank-input send and the feedback of a
-staging or removal step, so it names the files themselves instead of
-reporting an attachment count."
-  (let ((names (delq nil (mapcar (lambda (attachment)
-                                   (cdr (assq 'name attachment)))
-                                 attachments))))
-    (if names
-        (mapconcat #'identity names ", ")
-      (format "%d attachment%s" (length attachments)
-              (if (= 1 (length attachments)) "" "s")))))
-
-(defun dsh-emacs--stage-attachments (attachments)
-  "Append ATTACHMENTS to this buffer's staged set and repaint the row."
-
-  (dsh-emacs-subagent-require 'mutate)
-  (when attachments
-    (setq dsh-emacs--pending-attachments
-          (append dsh-emacs--pending-attachments attachments))
-    (dsh-emacs-composer-refresh)
-    (message "%s staged · C-c C-c sends · C-c C-d discards"
-             (dsh-emacs--attachments-summary attachments))))
-
-(defun dsh-emacs--remove-attachment (attachment)
-  "Drop staged ATTACHMENT, one entry of `dsh-emacs-pending-attachments'.
-The Composer's per-file remove cell calls this with the very entry it
-rendered, so only that entry goes; `dsh-emacs-clear-attachments'
-(C-c C-d) still drops the whole set.  A no-op when ATTACHMENT is not
-staged."
-  (when (memq attachment dsh-emacs--pending-attachments)
-    (setq dsh-emacs--pending-attachments
-          (delq attachment dsh-emacs--pending-attachments))
-    (dsh-emacs-composer-refresh)
-    (message "%s removed" (dsh-emacs--attachments-summary (list attachment)))))
-
-(defun dsh-emacs--consume-pending-attachments ()
-  "Drop the staged attachments this buffer just submitted."
-  (when dsh-emacs--pending-attachments
-    (setq dsh-emacs--pending-attachments nil)
-    (dsh-emacs-composer-refresh)))
-
-(defun dsh-emacs--restore-draft (text attachments)
-  "Restore TEXT and the STAGED attachments of a failed submit.
-Leave a newer draft alone if either its text or staged attachments is
-nonempty.  A restored file entry still carries its path, so the next
-submit uploads it again and never reuses a spent receipt."
-  (when (and (string-empty-p (or (dsh-emacs--get-input) ""))
-             (null dsh-emacs--pending-attachments))
-    (dsh-emacs--replace-input text)
-    (when attachments
-      (setq dsh-emacs--pending-attachments attachments)
-      (dsh-emacs-composer-refresh))))
-
-(defun dsh-emacs--ensure-chat-buffer ()
-  "Signal a `user-error' unless the current buffer is a chat buffer."
-  (unless (and dsh-emacs--input-marker
-               (marker-buffer dsh-emacs--input-marker))
-    (user-error "Not in a dsh chat buffer")))
-
-(defun dsh-emacs--stage-clipboard-image (image)
-  "Stage clipboard IMAGE (a (MEDIA-TYPE . BYTES) pair) as an attachment."
-  (dsh-emacs--stage-attachments
-   (list (dsh-protocol-image-attachment
-          (car image) (cdr image)
-          (dsh-emacs--clipboard-image-name (car image))))))
-
-;;;###autoload
-(defun dsh-emacs-attach-clipboard-image ()
-  "Stage the system clipboard's image for the next message (C-c C-v).
-The image joins the pending attachments shown above the input; the
-next `C-c C-c' sends it with the typed caption (the image name when
-the caption is empty), and `C-c C-d' discards it.  Only the media
-types in `dsh-emacs-attach-media-types' are accepted; a macOS TIFF
-pasteboard image is converted to PNG when PNG is accepted.  Plain
-`yank' is unaffected."
-  (interactive)
-  (dsh-emacs-subagent-require 'mutate)
-  (dsh-emacs--ensure-chat-buffer)
-  (let ((image (dsh-emacs--clipboard-image)))
-    (unless image
-      (user-error "%s"
-                  (if (dsh-emacs--clipboard-image-present-p)
-                      "Clipboard image type is not in dsh-emacs-attach-media-types"
-                    "No image in the clipboard")))
-    (dsh-emacs--stage-clipboard-image image)))
-
-;;;###autoload
-(defun dsh-emacs-paste ()
-  "Paste into the chat input: the clipboard image if there is one, else text.
-Bound to `s-v' in chat buffers, where stock Emacs maps the key
-to `yank'.  A clipboard carrying an image stages it exactly like `C-c C-v';
-otherwise this yanks text like `yank'.  The image wins when the clipboard
-carries both flavors, matching what a chat paste gesture means; `C-y' stays
-a plain text yank, so a clipboard holding an image and text (a copied
-picture and its URL, say) can still paste the text."
-  (interactive)
-  (dsh-emacs--ensure-chat-buffer)
-  (if-let* ((image (dsh-emacs--clipboard-image)))
-      (dsh-emacs--stage-clipboard-image image)
-    (call-interactively #'yank)))
-
-(defun dsh-emacs--yank-media-handler (media-type data)
-  "`yank-media' handler: stage clipboard DATA as a pending attachment.
-MEDIA-TYPE is the selection's MIME symbol and DATA its bytes.  Types
-the host accepts are taken as-is; TIFF is converted to PNG through
-`dsh-emacs--tiff-bytes-to-png'; anything else is refused."
-  (dsh-emacs--ensure-chat-buffer)
-  (let* ((media (symbol-name media-type))
-         (converted (cond
-                     ((not (stringp data)) nil)
-                     ;; Only host-accepted types pass through as-is; a TIFF
-                     ;; selection ALSO matches its own magic number, and must
-                     ;; take the conversion branch instead.
-                     ((and (member media dsh-emacs-attach-media-types)
-                           (dsh-emacs--image-bytes-match-p media data))
-                      (cons media data))
-                     ((and (member "image/png" dsh-emacs-attach-media-types)
-                           (member media '("image/tiff" "image/tif")))
-                      (when-let* ((png (dsh-emacs--tiff-bytes-to-png data)))
-                        (cons "image/png" png))))))
-    (unless converted
-      (user-error "Unsupported clipboard media type: %s" media))
-    (dsh-emacs--stage-clipboard-image converted)))
-
-;;;###autoload
-(defun dsh-emacs-clear-attachments ()
-  "Discard this buffer's staged attachments (C-c C-d)."
-  (interactive)
-  (dsh-emacs--ensure-chat-buffer)
-  (if (null dsh-emacs--pending-attachments)
-      (message "No staged attachments")
-    (setq dsh-emacs--pending-attachments nil)
-    (dsh-emacs-composer-refresh)
-    (message "Attachments discarded")))
-
-;;;###autoload
-(defun dsh-emacs-attach-file (file)
-  "Stage FILE for the next message (C-c C-a).
-Repeat to add more files.  Write the caption in the chat input, then use
-`C-c C-c' to send the text and all staged attachments together; `C-c C-d'
-discards the staged set.
-
-An image whose type is in `dsh-emacs-attach-media-types' rides the prompt
-inline as an image.  Every other file is uploaded to the host at submit
-time and reaches the model as a file attachment; such a file must be a
-readable regular file no larger than `dsh-emacs-attach-max-file-size'."
-  (interactive
-   (progn
-     (dsh-emacs-subagent-require 'mutate)
-     (dsh-emacs--ensure-chat-buffer)
-     (list (read-file-name "File to attach: " default-directory nil t))))
-  (dsh-emacs-subagent-require 'mutate)
-  (dsh-emacs--ensure-chat-buffer)
-  (let ((attachment (dsh-emacs--attachable-file file)))
-    (unless attachment
-      (user-error "Cannot attach %s (not a readable file, or above `dsh-emacs-attach-max-file-size')"
-                  file))
-    (dsh-emacs--stage-attachments (list attachment))))
-
-(defun dsh-emacs--dnd-attach (event)
-  "Stage files from a `drag-n-drop' EVENT for the next message."
-  (interactive "e")
-  (dsh-emacs-subagent-require 'mutate)
-  (dsh-emacs--ensure-chat-buffer)
-  (let* ((files (and (listp event) (nth 1 event)))
-         (paths (and files
-                     (delq nil (mapcar (lambda (f) (dnd-get-local-file-name f t))
-                                       (if (listp files) files (list files)))))))
-    (unless paths (user-error "No files in drop event"))
-    (if (not (y-or-n-p (format "Stage %d file(s) for the next message? "
-                               (length paths))))
-        (message "Attach cancelled")
-      (let ((attachments (delq nil (mapcar #'dsh-emacs--attachable-file paths))))
-        (if (null attachments)
-            (message "No attachable files among the dropped files")
-          (dsh-emacs--stage-attachments attachments))))))
-
-(defun dsh-emacs--model-candidates (directory)
-  "Flatten model DIRECTORY into per-model entries, sorted.
-
-The list is sorted by provider display name then model id
-(case-insensitive), so the model picker shows a stable, predictable
-order regardless of the host's own group/model ordering.
-
-Each entry is (ID PROVIDER PROVIDER-NAME NAME REASONING):
-  ID            — the model id, sent as `session/selectModel' model.
-  PROVIDER      — the owning group's id; the live host resolves
-                  `current.provider' to exactly this value (the provider
-                  `session/selectModel' expects for the model).
-  PROVIDER-NAME — the group's display name (may equal PROVIDER).
-  NAME          — the model's display name (may equal ID).
-  REASONING     — the model's reasoning metadata
-                  (a `dsh-protocol-reasoning' struct), or nil when the
-                  model offers no reasoning-effort options.
-
-DIRECTORY is a decoded `dsh-protocol-model-directory' struct."
-  (let ((groups (dsh-protocol-model-directory-groups directory)))
-    (sort (cl-loop for g in groups
-                   for provider = (dsh-protocol-provider-group-id g)
-                   for provider-name = (or (dsh-protocol-provider-group-name g)
-                                           provider)
-                   append (cl-loop for m in (dsh-protocol-provider-group-models g)
-                                   for id = (dsh-protocol-model-catalog-entry-id m)
-                                   for name = (or (dsh-protocol-model-catalog-entry-name m)
-                                                  id)
-                                   for reasoning = (dsh-protocol-model-catalog-entry-reasoning m)
-                                   collect (list id provider provider-name
-                                                 name reasoning)))
-          (lambda (a b)
-            (pcase-let* ((`(,id-a ,_ ,provider-a . ,_) a)
-                         (`(,id-b ,_ ,provider-b . ,_) b)
-                         (provider-a (downcase provider-a))
-                         (provider-b (downcase provider-b)))
-              (or (string-lessp provider-a provider-b)
-                  (and (string= provider-a provider-b)
-                       (string-lessp (downcase id-a) (downcase id-b)))))))))
-
-(defun dsh-emacs--model-effort-choices (reasoning)
-  "Effort options of REASONING (a `dsh-protocol-reasoning' struct, or a
-wire alist) as ((NAME . ID) ...), keeping the host's directory order for
-display; entries without a display name fall back to their id.  Returns
-nil when REASONING has no efforts."
-  (setq reasoning (dsh-protocol--struct
-                   #'dsh-protocol-reasoning-p
-                   #'dsh-protocol-reasoning--from-alist
-                   reasoning))
-  (mapcar (lambda (e)
-            (let ((id (dsh-protocol-effort-id e))
-                  (name (or (dsh-protocol-effort-name e)
-                            (dsh-protocol-effort-id e))))
-              (cons name id)))
-          (dsh-protocol-reasoning-efforts reasoning)))
-
-(defun dsh-emacs--model-effort-default-id (reasoning &optional current-id)
-  "The effort id to pre-select for a model with REASONING options.
-CURRENT-ID wins when it is a valid option (the session already runs that
-model at that effort); otherwise the model's `defaultEffort' when it is a
-known option; otherwise the first effort in the directory."
-  (setq reasoning (dsh-protocol--struct
-                   #'dsh-protocol-reasoning-p
-                   #'dsh-protocol-reasoning--from-alist
-                   reasoning))
-  (let* ((choices (dsh-emacs--model-effort-choices reasoning))
-         (ids (mapcar #'cdr choices))
-         (default (dsh-protocol-reasoning-default-effort reasoning)))
-    (cond ((and current-id (member current-id ids)) current-id)
-          ((member default ids) default)
-          (ids (car ids))
-          (t nil))))
-
-(defun dsh-emacs--model-pick-effort (model choices default-id)
-  "Read a reasoning-effort choice for MODEL from CHOICES ((NAME . ID) ...).
-Returns the chosen effort id.  The choice whose id equals DEFAULT-ID is
-passed as completing-read's DEF: vertico pre-selects it and an empty RET
-takes it — re-picking the current model keeps its live effort, other
-models default to their host-supplied default.  Signals quit on C-g, so
-the caller can cancel the whole selection."
-  (let* ((default-name (car (rassoc default-id choices)))
-         (name (completing-read
-                (if default-name
-                    (format "Reasoning effort for %s (default %s): "
-                            model default-name)
-                  (format "Reasoning effort for %s: " model))
-                choices nil t nil nil default-name)))
-    (or (cdr (assoc name choices)) default-id)))
-
-(defun dsh-emacs--model-row-entry (c dup)
-  "One (KEY . C) completing-read entry for model tuple C.
-KEY = \"id [provider|Provider Name]\" — the id first, so prefix
-completion (default `completion-styles' match by prefix) hits when the
-user types a model id; provider id and display name are embedded for
-exact `assoc' and for searching by provider name — with a `display'
-property rendering \"  id\" (or, when DUP non-nil — the same id is
-offered by several providers — and no group headers are available,
-\"  id (Provider Name)\" so duplicate-id rows stay distinguishable
-after the group headers are dropped)."
-  (pcase-let* ((`(,id ,provider ,provider-name . ,_) c)
-               (shown (if dup
-                          (format "  %s (%s)" id provider-name)
-                        (format "  %s" id)))
-               (key (propertize (format "%s [%s|%s]" id provider provider-name)
-                                'display shown)))
-    (cons key c)))
-
-(defun dsh-emacs--model-key-parts (key)
-  "Parse row KEY built by `dsh-emacs--model-row-entry' as
-\"id [provider|Provider Name]\", returning (ID PROVIDER PROVIDER-NAME)
-or nil when KEY is not a model row."
-  (when (string-match "\\`\\([^ ]+\\) \\[\\([^]|]*\\)|\\([^]]*\\)\\]\\'" key)
-    (list (match-string 1 key)
-          (match-string 2 key)
-          (match-string 3 key))))
-
-(defun dsh-emacs--model-entries (candidates)
-  "Entries for completion UIs WITHOUT grouping support: provider shown
-once as a bare header row, its models following, indented, each
-showing the model id (the payload keeps the display NAME for
-messages/the mode line) with payload = the candidate tuple
-(ID PROVIDER PROVIDER-NAME NAME REASONING), where REASONING is the
-host's `dsh-protocol-reasoning' struct or nil.  Rows are
-(DISPLAY . PAYLOAD) conses, so a picked header is rejected by the
-caller instead of being treated as a model.
-
-The row KEY embeds the owning provider (\"id [provider|Provider
-Name]\", id first so prefix filtering still matches) and a `display'
-property renders the row: bare \"  id\" for unique ids, and
-\"  m2 (Qwen)\" when an id collides across providers — because this
-path's group headers are ordinary candidates and vanish from the
-displayed list the moment the user types a query."
-  (let ((entries '())
-        (last-provider nil)
-        (id-count (make-hash-table :test #'equal)))
-    (dolist (c candidates)
-      (let ((id (car c)))
-        (puthash id (1+ (gethash id id-count 0)) id-count)))
-    (dolist (c candidates (nreverse entries))
-      (pcase-let* ((`(,id ,_ ,provider-name . ,_) c)
-                   (dup (> (gethash id id-count 0) 1)))
-        (unless (equal provider-name last-provider)
-          (push (cons provider-name (cons :header provider-name)) entries)
-          (setq last-provider provider-name))
-        (push (dsh-emacs--model-row-entry c dup) entries)))))
-
-(defun dsh-emacs--model-grouped-collection (candidates)
-  "Completion table with sticky group headers, returns (TABLE . ROWS).
-For completion UIs that honour the `group-function' completion
-metadata — modern vertico draws sticky group headers from it,
-recomputing them on every filter input, and the Emacs 27+ *Completions*
-buffer renders them too: rows are flat (no header-row candidates),
-each KEY \"id [provider|Provider Name]\" rendered as bare \"  id\"
-via the `display' property (id first so prefix completion still
-matches while typing; provider name sits in the key, so substring
-styles also find it), and the table metadata carries a
-`group-function' mapping every key back to its provider display name.
-The UI then paints one sticky group header per provider that stays
-visible while any of its rows still matches the query — grouping is
-NOT lost while searching."
-  (let* ((rows (mapcar (lambda (c) (dsh-emacs--model-row-entry c nil))
-                       candidates))
-         (group-fn
-          ;; Self-contained: parse the provider display name
-          ;; straight from the key, capturing no variables.
-          ;; The title must be a property-free string
-          ;; (match-string keeps the candidate key's display
-          ;; property).  The transform branch moves the match
-          ;; highlight face over the id span to the matching
-          ;; position in the display string: key = "m2
-          ;; [g2|Qwen]" (display hides the rest); typing "m2"
-          ;; makes orderless/basic put completion-match-face on
-          ;; the key's first [0,2) — spreading the whole key
-          ;; through vertico--display-string would paint the
-          ;; entire line background, and stripping every
-          ;; property loses the highlight; the right move is to
-          ;; embed a face-carrying substring into the visible
-          ;; "  " + id text
-          (lambda (cand transform)
-            (if transform
-                (let* ((c (copy-sequence cand))
-                       (id (car (dsh-emacs--model-key-parts cand))))
-                  (if (and id (> (length id) 0))
-                      (let ((sub (substring c 0 (length id))))
-                        ;; The substring drops display/invisible (properties
-                        ;; of the hidden part) while keeping face.
-                        (remove-text-properties
-                         0 (length sub) '(display nil invisible nil) sub)
-                        sub)
-                    c))
-              (let ((parts (dsh-emacs--model-key-parts cand)))
-                (and parts (substring-no-properties (nth 2 parts)))))))
-         (table (dsh-emacs--completion-table-with-metadata
-                 rows
-                 ;; Emacs 31's completion-table-with-metadata wants
-                 ;; the metadata without the (metadata ...) prefix —
-                 ;; give it the plist directly and it wraps it itself.
-                 ;; (category . dsh-model): nerd-icons-completion
-                 ;; inserts an icon at the start of every candidate
-                 ;; row — in its icon table the nil category maps to
-                 ;; nf-cod-arrow_small_right (the "->" arrow at line
-                 ;; start) while categories absent from the table
-                 ;; return an empty string; declaring a private
-                 ;; category keeps the row start icon-free (and
-                 ;; marginalia injects no suffix annotation either,
-                 ;; because the category is not in its annotator
-                 ;; table).
-                 ;; An identity affixation-function is the last
-                 ;; backstop: a third-party package trying to append
-                 ;; an annotation/affixation suffix is overridden too
-                 (list (cons 'category 'dsh-model)
-                       (cons 'group-function group-fn)
-                       (cons 'affixation-function
-                             (lambda (cands)
-                               (mapcar (lambda (c) (list c "" "")) cands)))))))
-    (cons table rows)))
-
-;; Model picker row-start icon (optional integration, no new
-;; dependency): the picker metadata declares category=dsh-model;
-;; once nerd-icons-completion is loaded, register a default chip
-;; icon (nf-cod-chip) for that category — it shows at the row
-;; start with no user configuration.  To change the icon,
-;; add-to-list a same-category entry in your own config first and
-;; it overrides the default (the default registration is skipped
-;; when assq already finds one).  No effect when
-;; nerd-icons-completion is not installed.
-(defun dsh-emacs--install-model-completion-icon ()
-  "Register the default model-picker icon without overriding user choices."
-  (when (and (boundp 'nerd-icons-completion-category-icons)
-             (not (assq 'dsh-model nerd-icons-completion-category-icons)))
-    (add-to-list 'nerd-icons-completion-category-icons
-                 '(dsh-model . (nerd-icons-codicon "nf-cod-chip" nerd-icons-blue)))))
-
-(eval-after-load 'nerd-icons-completion
-  #'dsh-emacs--install-model-completion-icon)
-
-(defun dsh-emacs--model-select-setup-hook (grouped)
-  "Buffer-local tweaks for the model picker's minibuffer.
-GROUPED says whether vertico's native group-function rendering is
-active (see the detection in `dsh-emacs--select-model-prompt').
-Sorting and preselect are tamed locally so the provider order and the
-cursor position stay put; when GROUPED, `vertico-group-format' is
-overridden buffer-locally by `dsh-emacs-model-group-format' (killing
-the stock long separator lines inside the picker only)."
-  (when (boundp 'vertico-sort-function)
-    (setq-local vertico-sort-function nil))
-  (when (boundp 'vertico-sort-override-function)
-    (setq-local vertico-sort-override-function nil))
-  (when (boundp 'vertico-preselect)
-    (setq-local vertico-preselect 'first))
-  (when (and grouped (boundp 'vertico-group-format))
-    (setq-local vertico-group-format dsh-emacs-model-group-format))
-  ;; Return nil explicitly: Emacs 31's minibuffer-with-setup-hook
-  ;; funcalls the evaluation result of the SETUP expression, so
-  ;; never let another value flow back (such as the setq-local
-  ;; value above — that would become "Invalid function: ...")
-  nil)
-
-;;;###autoload
-(defun dsh-emacs-select-model ()
-  "Choose a model for the current session from the live model catalog.
-Lists the models the host can route to (`session/modelCatalog'), shows each
-under its provider as its id, reads one with `completing-read'
-and switches via `session/selectModel'.  Each row's key carries its
-provider (hidden from display), and the provider display name is part
-of the key too, so provider names stay searchable while filtering.
-Modern vertico draws sticky provider group headers from the table's
-`group-function' metadata (an Emacs 27+ *Completions* buffer does the
-same), kept while any row of the group matches the query; without a
-group-aware UI, header rows plus a per-row provider suffix on
-colliding ids are shown.  The mode-line model segment updates
-immediately."
-  (interactive)
-  (dsh-emacs-subagent-require 'mutate)
-  (dsh-emacs-server-ensure)
-  (let ((session-id (dsh-emacs--active-session-id)))
-    (unless session-id (user-error "Open or select a session first"))
-    ;; `session/modelCatalog' is session-agnostic (args {}), so its only
-    ;; "current"-ish value is the host `default'.  The session's real
-    ;; running model lives in the cached row's `modelSelection' projection
-    ;; (`lastUsed'), and is resolved inside `dsh-emacs--select-model-prompt'
-    ;; (falling back to the catalog default only when the row has none yet).
-    (dsh-emacs--rpc-async "session/modelCatalog" nil
-                          (lambda (ok value)
-                            (if (not ok)
-                                (message "Failed to list models: %S" value)
-                              (dsh-emacs--select-model-prompt
-                               session-id value))))))
-
-(defun dsh-emacs--select-model-prompt (session-id value)
-  "Read a model choice for SESSION-ID from a `session/modelCatalog' VALUE.
-Each candidate is a provider header or an indented model row showing
-the model id; the provider
-actually sent to `session/selectModel' is the owning group's id (the host
-resolves `current.provider' to exactly that).  Row keys carry the
-provider hidden behind a `display' property, so `assoc' always resolves
-to the row the user picked, even when the same id is offered by
-several providers.
-
-Two display paths: with `vertico-group-mode' active (Emacs 27+
-`*Completions*' buffers group too), candidates are flat rows and a
-`group-function' metadata keeps one sticky header per provider while
-the user filters — grouping survives searching.  In completion UIs
-without grouping support, provider headers are ordinary candidates
-(dropped by filtering) and colliding ids fall back to a visible
-provider suffix on their rows.
-
-When the chosen model declares reasoning-effort options (`reasoning'),
-a second reader asks for the effort: re-picking the current model
-pre-selects its live `reasoningEffort', other models pre-select their
-`defaultEffort', and the id is sent as `session/selectModel'
-`reasoningEffort'.  The \"current model\" is the session's real running
-model from its cached `modelSelection' projection (`lastUsed') — the same
-authoritative source the mode-line uses — and only falls back to the
-catalog host `default' when the session row carries no projection yet
-(a session just created, or never yet run).  Models without reasoning
-options send no effort field at all.
-
-No completing-read default is passed on purpose: vertico moves the default
-row to the top of the candidate list, which would pull the current model
-out of its provider group.  Instead an empty RET keeps the current model
-(no RPC at all) and unknown input is rejected against the entry table.
-A vertico preselect nudge (vertico-nudge.el) is available but not wired;
-without it the highlight starts on the first row and the user navigates
-manually.
-
-Runs inside the async RPC callback (a process filter), so C-g during
-`completing-read' is caught here; otherwise the `quit' would leak out of
-the filter as \"error in process filter: Quit\"."
-  (condition-case nil
-      (let* ((dir (dsh-protocol-model-directory--from-alist value))
-             ;; The reference model: the session's live `modelSelection'
-             ;; projection when present, else the catalog host default
-             ;; (folded into `dsh-protocol-model-directory-current').
-             (current (or (dsh-emacs--session-model-selection session-id)
-                          (dsh-protocol-model-directory-current dir)))
-             (current-model (and current
-                                 (dsh-protocol-model-selection-model current)))
-             ;; Same-model-id-across-providers disambiguation in the prompt:
-             ;; prefix the current model with its owning provider id, matching
-             ;; the mode-line/tooltip convention (the provider is only shown
-             ;; when the session row knows it).
-             (current-provider (and current
-                                    (dsh-protocol-model-selection-provider current)))
-             (candidates (dsh-emacs--model-candidates dir))
-             ;; The prompt's provider must match the picker's group headers,
-             ;; which show the provider DISPLAY name, not its id.  Resolve the
-             ;; current provider id to the display name from the catalog (the
-             ;; first row of that provider carries it); a current provider
-             ;; missing from the catalog falls back to its id.
-             (current-provider-label
-              (or (and current-provider
-                       (cl-some (lambda (c)
-                                  (pcase-let ((`(,_ ,provider ,name . ,_) c))
-                                    (and (equal provider current-provider)
-                                         name)))
-                                candidates))
-                  current-provider))
-             ;; Modern vertico (>=2.0) natively supports group-function
-             ;; metadata: it recomputes groups and redraws sticky group
-             ;; headers on every input (no vertico-group.el/group-mode)
-             ;; → take the metadata grouping path; otherwise fall back
-             ;; to candidate header rows + suffixes on duplicate rows
-             ;; (header rows get filtered out).  Old vertico +
-             ;; vertico-group use the same protocol.
-             (grouped (and (bound-and-true-p vertico-mode)
-                           (or (boundp 'vertico--groups)
-                               (boundp 'vertico-group--groups))))
-             (grouped-pair (and grouped
-                                (dsh-emacs--model-grouped-collection
-                                 candidates)))
-             ;; Provider header row + indented model rows (header
-             ;; payload is (:header . NAME))
-             (entries (if grouped (cdr grouped-pair)
-                        (dsh-emacs--model-entries candidates)))
-             (collection (if grouped (car grouped-pair) entries))
-             (picked (minibuffer-with-setup-hook
-                         ;; Locally disable vertico's sorting inside the model
-                         ;; picker (so candidates are not reordered) and set the
-                         ;; fallback preselect to the first row (vertico preselect
-                         ;; supports only prompt/first).  Must be an expression
-                         ;; evaluating to a function object: Emacs 31's macro does
-                         ;; (funcall (eval SETUP)), and passing a function call
-                         ;; directly makes it call the return value (see
-                         ;; dsh-emacs--model-select-setup-hook).
-                         (lambda () (dsh-emacs--model-select-setup-hook grouped))
-                         ;; No DEF: vertico moves the default to the front of the
-                         ;; list, which would pull the current model out of its
-                         ;; group and pin it to the first row forever.  An empty
-                         ;; RET is handled by the "" branch below (keep the
-                         ;; current model); garbage input is caught by the assoc
-                         ;; check.
-                          (completing-read
-                           (format "Select model%s: "
-                                   (if current-model
-                                       (format " (current %s)"
-                                               (if (and current-provider-label
-                                                        (not (string-empty-p
-                                                              current-provider-label)))
-                                                   (concat current-provider-label "/"
-                                                           current-model)
-                                                 current-model))
-                                     ""))
-                           collection nil nil nil nil nil)))
-             (empty (not (and picked (stringp picked)
-                              (not (string-empty-p picked))))))
-        (cond
-         (empty
-          (message (if current-model
-                       (format "Kept current model %s" current-model)
-                     "Kept the current model")))
-         ((not (assoc picked entries))
-          (message "Unknown model: %s" picked))
-         ;; A provider header row (not a model) was picked →
-         ;; message and do not switch
-         ((eq :header (car (cdr (assoc picked entries))))
-          (message "That is a provider header — pick a model below it"))
-         (t
-          (pcase-let* ((`(,model ,provider ,provider-name ,model-name ,reasoning)
-                        (cdr (assoc picked entries)))
-                       ;; Second layer: ask for effort only when the target
-                       ;; model declares reasoning options.  Re-picking the
-                       ;; current model → keep its live reasoningEffort; other
-                       ;; models → the catalog defaultEffort (or the first one).
-                       ;; RET/the vertico preselect takes the default; C-g
-                       ;; bubbles to the outer handler for a uniform "cancel".
-                       (effort-id (and reasoning
-                                       (dsh-emacs--model-pick-effort
-                                        model
-                                        (dsh-emacs--model-effort-choices reasoning)
-                                        (dsh-emacs--model-effort-default-id
-                                         reasoning
-                                         (and (equal model current-model)
-                                              (dsh-protocol-model-selection-reasoning-effort
-                                               current)))))))
-            (dsh-emacs--rpc-async "session/selectModel"
-              (dsh-protocol-session-select-model-request
-                session-id provider model effort-id)
-              (lambda (ok2 value2)
-                (if ok2
-                    (progn
-                      (dsh-emacs-modeline-set-model model)
-                      ;; The chosen row carries its provider: for the same
-                      ;; id across providers, the mode-line model segment
-                      ;; uses it to disambiguate (shown in the tooltip).
-                      (dsh-emacs-modeline-set-provider provider)
-                      (dsh-emacs-modeline-set-effort effort-id)
-                      ;; Refresh the session list right after the model switch:
-                      ;; the old model's contextPressure snapshot is no longer
-                      ;; trustworthy, so fetch the same projection snapshot for
-                      ;; the new model (the mode-line ctx% pressure+window pair
-                      ;; updates together).  Go straight through the internal
-                      ;; fetch (pure RPC), not server-start/event recovery.
-                      (dsh-emacs-list-sessions--fetch)
-                      (message "Model switched to %s (%s)%s"
-                               model-name provider-name
-                               (if effort-id
-                                   (format ", effort %s" effort-id)
-                                 "")))
-                  (message "Failed to switch model: %S" value2))))))))
-    (quit (message "Model selection cancelled"))))
-
-;;;###autoload
-(defun dsh-emacs-select-effort ()
-  "Choose a reasoning effort for the current session's running model.
-Reads the live model catalog (`session/modelCatalog') to find the running
-model's `reasoning' options, pre-selects the effort the session already
-runs at (or the model's default), and switches via `session/selectModel'
-with the same provider and model.  A model without reasoning-effort
-options reports that and sends no RPC; the mode-line effort segment
-updates immediately."
-  (interactive)
-  (dsh-emacs-subagent-require 'mutate)
-  (dsh-emacs-server-ensure)
-  (let ((session-id (dsh-emacs--active-session-id)))
-    (unless session-id (user-error "Open or select a session first"))
-    (dsh-emacs--rpc-async "session/modelCatalog" nil
-                          (lambda (ok value)
-                            (if (not ok)
-                                (message "Failed to list models: %S" value)
-                              (dsh-emacs--select-effort-prompt
-                               session-id value))))))
-
-(defun dsh-emacs--select-effort-prompt (session-id value)
-  "Read and apply a reasoning effort for SESSION-ID's running model.
-VALUE is the raw `session/modelCatalog' response.  The reference
-(provider, model, effort) triple is the session's cached `modelSelection'
-projection, falling back to the catalog host default exactly as
-`dsh-emacs--select-model-prompt' does.  Does nothing when the reference
-model declares no `reasoning' options; C-g cancels the whole read."
-  (condition-case nil
-      (let* ((dir (dsh-protocol-model-directory--from-alist value))
-             (current (or (dsh-emacs--session-model-selection session-id)
-                          (dsh-protocol-model-directory-current dir)))
-             (model (and current
-                         (dsh-protocol-model-selection-model current)))
-             (provider (and current
-                            (dsh-protocol-model-selection-provider current)))
-             (effort (and current
-                          (dsh-protocol-model-selection-reasoning-effort
-                           current))))
-        (cond
-         ((null model)
-          (message "No running model is known for this session"))
-         (t
-          (pcase-let* ((entries (dsh-emacs--model-candidates dir))
-                       (entry (cl-find-if
-                               (lambda (e)
-                                 (pcase-let ((`(,id ,owner . ,_) e))
-                                   (and (equal id model)
-                                        (or (null provider)
-                                            (equal owner provider)))))
-                               entries))
-                       (`(,_ ,entry-provider ,_ ,_ ,reasoning) entry)
-                       (choices (dsh-emacs--model-effort-choices reasoning)))
-            (cond
-             ((null entry)
-              (message "Model %s is not in the live catalog" model))
-             ((null choices)
-              (message "Model %s offers no reasoning-effort options" model))
-             (t
-              (let ((effort-id
-                     (dsh-emacs--model-pick-effort
-                      model choices
-                      (dsh-emacs--model-effort-default-id reasoning effort))))
-                (dsh-emacs--rpc-async
-                 "session/selectModel"
-                 (dsh-protocol-session-select-model-request
-                  session-id (or provider entry-provider) model effort-id)
-                 (lambda (ok2 value2)
-                   (if ok2
-                       (progn
-                         (dsh-emacs-modeline-set-effort effort-id)
-                         ;; The next effort prompt reads the session cache.
-                         ;; Refresh it just as the model picker does.
-                         (dsh-emacs-list-sessions--fetch)
-                         (message "Reasoning effort set to %s" effort-id))
-                     (message "Failed to set reasoning effort: %S"
-                              value2)))))))))))
-    (quit (message "Reasoning-effort selection cancelled"))))
 
 ;;;###autoload
 (defun dsh-emacs-set-permission ()
@@ -4122,7 +2385,8 @@ reports when the effective knobs match no preset, not a switch target."
      "permissionPresets/catalog" nil
      (lambda (ok value)
        (if (not ok)
-           (message "Failed to list permission presets: %S" value)
+           (message "Failed to list permission presets: %s"
+                    (dsh-emacs-rpc-error-text value))
          (dsh-emacs--set-permission-prompt session-id value))))))
 
 (defun dsh-emacs--set-permission-prompt (session-id value)
@@ -4156,8 +2420,9 @@ inside the async RPC callback (a process filter), so a C-g during
                (lambda (ok execution err)
                  (cond
                   ((null ok)
-                   (message "Permission switch failed: %S"
-                            (or err "transport error")))
+                   (message "Permission switch failed: %s"
+                            (if err (dsh-emacs-rpc-error-text err)
+                              "transport error")))
                   ((null execution)
                    (message "The host did not admit /permission"))
                   (t
@@ -4169,62 +2434,6 @@ inside the async RPC callback (a process filter), so a C-g during
                                     "Permission updated"
                                   "Permission not changed")))))))))))
     (quit (message "Permission selection cancelled"))))
-
-(defun dsh-emacs--replace-input (text)
-  "Replace the input area of the current buffer with TEXT and park point."
-  (when (and dsh-emacs--input-marker (marker-buffer dsh-emacs--input-marker))
-    (let ((inhibit-read-only t))
-      (delete-region dsh-emacs--input-marker (dsh-emacs--input-end))
-      (goto-char dsh-emacs--input-marker)
-      (insert text)
-      (goto-char (dsh-emacs--input-end)))))
-
-(defun dsh-emacs--input-history-active ()
-  "Return the prompt-history list `M-p' / `M-n' currently browse.
-Cross-session mode (`dsh-emacs-input-history-cross-session' non-nil)
-returns the shared global list; per-session mode returns the current
-session's own list (nil when the session recorded no prompts yet)."
-  (if dsh-emacs-input-history-cross-session
-      dsh-emacs--input-history
-    (let ((session-id (dsh-emacs--active-session-id)))
-      (and session-id
-           (gethash session-id dsh-emacs--input-history-by-session)))))
-
-(defun dsh-emacs-input-history-back ()
-  "Show the previous submitted prompt in the input area (M-p).
-Browses the shared cross-session history, or the current session's own
-prompts when `dsh-emacs-input-history-cross-session' is nil."
-  (interactive)
-  (let* ((history (dsh-emacs--input-history-active))
-         (len (length history)))
-    (cond
-     ((zerop len) (message "No input history"))
-     ((null dsh-emacs--input-history-pos)
-      (setq-local dsh-emacs--input-history-pending (dsh-emacs--get-input))
-      (setq-local dsh-emacs--input-history-pos 0)
-      (dsh-emacs--replace-input (nth 0 history)))
-     ((>= (1+ dsh-emacs--input-history-pos) len)
-      (message "Beginning of history"))
-     (t (setq-local dsh-emacs--input-history-pos
-                   (1+ dsh-emacs--input-history-pos))
-        (dsh-emacs--replace-input
-         (nth dsh-emacs--input-history-pos history))))))
-
-(defun dsh-emacs-input-history-forward ()
-  "Show the next submitted prompt, or restore the typed text (M-n)."
-  (interactive)
-  (cond
-   ((null dsh-emacs--input-history-pos)
-    (message "No newer history"))
-   ((zerop dsh-emacs--input-history-pos)
-    (dsh-emacs--replace-input dsh-emacs--input-history-pending)
-    (setq-local dsh-emacs--input-history-pos nil)
-    (setq-local dsh-emacs--input-history-pending nil))
-   (t (setq-local dsh-emacs--input-history-pos
-                 (1- dsh-emacs--input-history-pos))
-      (dsh-emacs--replace-input
-       (nth dsh-emacs--input-history-pos
-            (dsh-emacs--input-history-active))))))
 
 (defun dsh-emacs--render-user-message-optimistic (message attachments)
   "Render MESSAGE's transcript echo immediately, before its RPC settles.
@@ -4327,7 +2536,8 @@ Matching waits for the workspace cache when necessary; no workspace is
 created.  Without a match, retain the active-session navigation below.
 
 The cursor lands on the invoking chat's session row (the last opened
-session outside a chat), not on whatever row the buffer was showing:
+session outside a chat), not on whatever row the buffer was showing.
+`dsh-emacs-session-jump-target' chooses its Recents or workspace occurrence:
 opening the list is an explicit
 \"where am I\" request, whereas a plain refresh (`g', events,
 auto-refresh) keeps the row you are on.  The list is populated
@@ -4345,7 +2555,7 @@ and fetches any missing catalogs.  A cold session cache is fetched as before;
 `g' and `dsh-emacs-list-sessions' remain the explicit refresh."
   (interactive)
   (let ((session-id (dsh-emacs--active-session-id))
-        (buf (get-buffer-create dsh-emacs-sessions-buffer)))
+        (buf (get-buffer-create dsh-emacs--sessions-buffer)))
     ;; Re-opening a live list must not re-run the major mode: that runs
     ;; `kill-all-local-variables', which wipes the buffer's fold overrides
     ;; (so groups the user folded with TAB come back expanded), its workspace
@@ -4363,7 +2573,7 @@ and fetches any missing catalogs.  A cold session cache is fetched as before;
     ;; Select before arming/rendering: the jump excludes this window from
     ;; row restoration, and centering must operate on the window just opened.
     ;; Without a jump, the render restores this window's existing row.
-    (pop-to-buffer buf)
+    (dsh-emacs-ui-navigate (point-marker) #'pop-to-buffer buf)
     (with-current-buffer buf
       ;; Arm the target after the mode/connect step: entering a major mode
       ;; would erase a buffer-local target armed earlier.
@@ -4534,6 +2744,23 @@ assistant message."
           (kill-new transcript)
           (message "Transcript copied to clipboard"))))))
 
+(defun dsh-emacs-copy-session-id ()
+  "Copy the current session id to the kill ring.
+In a chat buffer this is the chat's session id.  In the session list it is
+the session on the current row; a subagent row copies the child's own id."
+  (interactive)
+  (let ((session-id
+         (cond
+          ((derived-mode-p 'dsh-emacs-session-mode)
+           (or (dsh-emacs-session-id-at-point)
+               (user-error "No session at point")))
+          ((derived-mode-p 'dsh-emacs-mode)
+           (or dsh-emacs--buffer-session
+               (user-error "No session is open")))
+          (t (user-error "Not in a dsh chat or session list")))))
+    (kill-new session-id)
+    (message "Copied session id: %s" session-id)))
+
 (defun dsh-emacs-modeline-toggle ()
   "Toggle the mode-line stats display."
   (interactive)
@@ -4568,1067 +2795,8 @@ matching runs only for a local server and a non-remote directory."
                         (lambda (ok value)
                           (if ok
                               (message "dsh service is running")
-                            (message "dsh service unreachable: %S" value)))))
-
-;; ---------------------------------------------------------------------------
-;;  User question/approval waterfall ($events) responses
-;; ---------------------------------------------------------------------------
-;; dsh's `ask' tool and sandbox approvals push waterfall frames
-;; over the core connection's `$events' stream:
-;; `user-questions/request' (questions) and `approval/request'
-;; (approvals).  Each waterfall carries a host-assigned `eventId';
-;; after reading the user's choice/decision the client answers
-;; with an outcome via the unary endpoint POST /api/$events/result
-;; (args {clientId, eventId, outcome}, where clientId comes from
-;; the `$events' ready frame).  outcome.kind ∈ result (with a
-;; value) / next (handed to the next taker) / rejected (with an
-;; error).
-;;
-;; Question answer value = {answers: [{id, selected: string[],
-;; custom?}]} (selected is a vector; empty when custom-only).
-;; Match the host's validation rules exactly: single-select takes
-;; one label or a custom (either/or), multi-select takes a set of
-;; labels + optional custom, an option-less question can only give
-;; a custom, and answers must cover the whole frame.  Approval
-;; answer value = an ApprovalOutcome string: `allowed-once' or
-;; `rejected' (rejection is the default — C-g/ESC answers with
-;; rejection too; sending no decision leaves the host blocked
-;; forever on the pending approval).
-;;
-;; Interaction: read every question in the MINIBUFFER in one pass —
-;; options are completion candidates (numbered), multi-select is
-;; comma-separated; text that matches no option is itself the
-;; answer, and empty input skips the question.  Prompts carry the
-;; Question N/M number; once all are answered, one outcome is
-;; returned for the batch.
-;; Skipping one question uses only the `dsh-emacs-question-skip-key'
-;; shortcut = that question is overridden with an empty selected
-;; (dsh web's per-question Skip); the rest are answered normally.
-;; Empty input on an option-less question also skips it.
-;; C-g abandons the whole batch: it returns outcome.kind `rejected'
-;; with an error body (name/message, mirroring the cancelled intent
-;; kept by the old protocol) — the host withdraws the ask and the
-;; ask tool call aborts; the old behavior (no answer at all) left
-;; the host pending forever and the turn stuck.
-;;
-;; Per waterfall generation (each $events reconnect mints a new
-;; ready/clientId): when a new ready arrives this side retires all
-;; pending frames of the previous generation (no answer — the old
-;; clientId's result is a no-op); when the host cancels a waterfall
-;; (cancel frame or session end) the pending frame is retired by
-;; eventId.
-;;
-;; The minibuffer is a single global resource: with several
-;; sessions live, other streams keep delivering waterfalls while
-;; one frame is being answered.  Each kind has a FIFO queue, and
-;; only one frame is answered at a time (nested completing-read calls
-;; would stack different sessions' prompts in the same minibuffer
-;; and overwrite each other); prompts carry the owning session's
-;; identifier (the chat buffer name, e.g. [dsh: <title>]) so the user
-;; knows which session asked.
-
-(defvar dsh-emacs--question-queue nil
-  "Pending `user-questions/request' waterfalls awaiting the single
-interactive answering slot; each entry is (CHAT EVENT-ID SESSION-ID
-QUESTIONS WAIT).")
-
-(defvar dsh-emacs--approval-queue nil
-  "Pending `approval/request' waterfalls awaiting the single interactive
-answering slot; each entry is (CHAT EVENT-ID SESSION-ID TOOL-NAME
-REASON CALL-ID).")
-
-(defvar dsh-emacs--interaction-active nil
-  "Identity occupying the shared question/approval prompt slot, or nil.
-Dynamically bound to (KIND . EVENT-ID) for a question or approval waterfall,
-or (late-answer) while the late-answer picker and reader run.  It owns only
-the synchronous interaction; a timed question's wait claim can outlive it.")
-
-(defvar dsh-emacs--waterfall-cancelled-event-id nil
-  "Waterfall event id cancelled while its minibuffer was active.
-Bound by the interaction drain for each frame, so no stale outcome is sent.")
-
-(defvar-local dsh-emacs--session-questions nil
-  "Latest `userQuestions' projection view of this chat's session, or nil.
-A `dsh-protocol-user-questions' struct: the timed `ask_user_question' calls
-still answerable and the ones already settled (dsh 0.2.0).  It is the only
-source for a question whose foreground waterfall is gone, so
-`dsh-emacs-answer-question' reads it and a settled transcript card can be
-completed from it.")
-
-(defun dsh-emacs--session-questions-apply (questions)
-  "Merge decoded question projection QUESTIONS by sequence for this chat.
-Nil resets the mirror on a new host generation.  Capability absence retains
-its sequence, so an older update cannot restore stale questions.
-A newly settled call also completes its transcript ask row, so a late answer
-is recorded on the card that asked the question."
-  (let ((seq (and questions (dsh-protocol-user-questions-seq questions)))
-        (previous (and dsh-emacs--session-questions
-                       (dsh-protocol-user-questions-seq
-                        dsh-emacs--session-questions))))
-    (when (or (not (integerp seq)) (not (integerp previous))
-              (>= seq previous))
-      (setq dsh-emacs--session-questions questions)
-      (dolist (settled (and questions
-                           (dsh-protocol-user-questions-settled questions)))
-        (dsh-emacs-render-question-settled
-         (dsh-protocol-settled-question-call-id settled)
-         (dsh-protocol-question-answers-json
-          (dsh-protocol-settled-question-answers settled)))))))
-
-(defun dsh-emacs--waterfall-cancel-active (kind event-id)
-  "Cancel the active waterfall when both KIND and EVENT-ID match.
-Mark the id before leaving the minibuffer so its answering function can
-distinguish remote resolution from the user's `C-g'."
-  (when (equal dsh-emacs--interaction-active (cons kind event-id))
-    (setq dsh-emacs--waterfall-cancelled-event-id event-id)
-    (when (active-minibuffer-window)
-      (abort-recursive-edit))))
-
-(defun dsh-emacs--interaction-drain (kind)
-  "Answer queued waterfalls, starting with KIND (question or approval).
-Each kind is FIFO: finish its queue before switching to the other kind.
-New frames received during a reader only enqueue; this loop owns the shared
-slot and releases it on every exit.  Answer submission is asynchronous, so
-the next reader may start before the preceding response is acknowledged."
-  (unless dsh-emacs--interaction-active
-    (while (or dsh-emacs--question-queue dsh-emacs--approval-queue)
-      (unless (if (eq kind 'question)
-                  dsh-emacs--question-queue
-                dsh-emacs--approval-queue)
-        (setq kind (if (eq kind 'question) 'approval 'question)))
-      (let* ((frame (if (eq kind 'question)
-                        (pop dsh-emacs--question-queue)
-                      (pop dsh-emacs--approval-queue)))
-             (dsh-emacs--interaction-active (cons kind (nth 1 frame)))
-             (dsh-emacs--waterfall-cancelled-event-id nil))
-        (pcase kind
-          ('question (dsh-emacs--question-answer frame))
-          ('approval (dsh-emacs--approval-answer frame)))))))
-
-(defun dsh-emacs--question-session-label (session-id)
-  "Label identifying SESSION-ID in question prompts.
-Prefers the live chat buffer's name (the title-based \"dsh: <title>\"
-form); falls back to `dsh-emacs--chat-buffer-name', then to the raw id.
-Long labels are truncated so the minibuffer prompt stays readable; a nil
-SESSION-ID (direct test calls) yields an empty label."
-  (let* ((buf (and session-id
-                   (boundp 'dsh-emacs--chat-buffers)
-                   (hash-table-p dsh-emacs--chat-buffers)
-                   (gethash session-id dsh-emacs--chat-buffers)))
-         (label (cond
-                 ((and buf (buffer-live-p buf)) (buffer-name buf))
-                 (session-id (dsh-emacs--chat-buffer-name session-id))
-                 (t ""))))
-    (if (> (length label) 40)
-        (concat (substring label 0 37) "…")
-      label)))
-
-(defun dsh-emacs--events-result-async (client-id event-id outcome callback)
-  "Answer a `$events' waterfall: send OUTCOME for EVENT-ID on CLIENT-ID.
-OUTCOME is the wire `outcome' object (an alist whose `kind' is
-`result' with a `value', `next', or `rejected' with an `error' body).
-The answer goes as a one-shot unary RPC to POST /api/$events/result with
-args {clientId, eventId, outcome} (rpc.md §3.3).  CALLBACK receives
-(ok-p . value-or-error) like `dsh-emacs--rpc-async'."
-  (dsh-emacs--rpc-async
-   "$events/result"
-   (dsh-protocol-events-result-request client-id event-id outcome)
-   callback))
-
-(defun dsh-emacs--question-answer (frame)
-  "Read and answer one question FRAME in its owning chat buffer.
-Called with the shared interaction slot held.  The answer goes to
-`$events/result' carrying the current `$events' generation's client-id.
-A timed frame claims its foreground wait before reading, so the host cannot
-expire the question out from under the user.  A submitted answer keeps the
-claim until its asynchronous response arrives; other exits release it."
-  (pcase-let* ((`(,chat ,event-id ,session-id ,raw-questions ,wait) frame)
-               (questions (dsh-protocol--list raw-questions))
-               (claim nil)
-               (submitted nil))
-    (unwind-protect
-        (condition-case err
-            (progn
-              (setq claim
-                    (and wait
-                         (dsh-protocol-question-wait-timed wait)
-                         (dsh-emacs--question-claim-wait
-                          chat session-id
-                          (dsh-protocol-question-wait-call-id wait))))
-              (let ((answers
-                     (when (buffer-live-p chat)
-                       (with-current-buffer chat
-                         (dsh-emacs--collect-question-answers
-                          questions session-id)))))
-                (cond
-                 ((equal event-id dsh-emacs--waterfall-cancelled-event-id)
-                  (message "Question was answered elsewhere"))
-                 (answers
-                  (dsh-emacs--events-result-async
-                   dsh-emacs-events--client-id
-                   event-id
-                   (dsh-protocol-question-result-outcome answers)
-                   (lambda (ok value)
-                     (unwind-protect
-                         (if ok
-                             (message "Answered %d question(s)" (length answers))
-                           (message "Question response not accepted (%s)" value))
-                       (dsh-emacs--question-release-wait claim)
-                       (setq claim nil))))
-                  (setq submitted t))
-                 (t
-                  ;; No choices collected (aborted via an empty no-option
-                  ;; input, or the chat buffer died): abandon the whole
-                  ;; waterfall — outcome kind `rejected' with an error body
-                  ;; (dsh web's "abandon questions") so the ask aborts
-                  ;; host-side and the run is never left blocked.
-                  (dsh-emacs--question-decline event-id)))))
-          (quit
-           (unless (equal event-id dsh-emacs--waterfall-cancelled-event-id)
-             (dsh-emacs--question-decline event-id)))
-          (error
-           (message "dsh question error: %S" err)
-           ;; The host waits for an outcome even when reading failed (for
-           ;; example, a nested minibuffer made the reader signal).  Decline
-           ;; unless an answer already went out or the host cancelled it.
-           (unless (or submitted
-                       (equal event-id dsh-emacs--waterfall-cancelled-event-id))
-             (condition-case fallback
-                 (dsh-emacs--question-decline event-id)
-               (error (message "dsh question decline error: %S" fallback))))))
-      (unless submitted
-        (dsh-emacs--question-release-wait claim)))))
-
-(defun dsh-emacs--question-claim-wait (chat session-id call-id)
-  "Claim the timed foreground wait of CALL-ID on CHAT while it is being read.
-The host suspends the wait's deadline while a client holds the
-`userQuestions/attachWait' stream (dsh 0.2.0), so an answer prompt cannot be
-expired and closed out from under the user.  Returns a (PROCESS . STREAM-ID)
-token for `dsh-emacs--question-release-wait', or nil when there is nothing to
-claim — no live socket, or no named call."
-  (when (and (buffer-live-p chat)
-             (stringp call-id)
-             (not (string-empty-p call-id)))
-    (with-current-buffer chat
-      (let ((process dsh-emacs--event-process))
-        (when (process-live-p process)
-          (let ((stream
-                 (dsh-emacs-events-open-stream
-                  process "userQuestions/attachWait"
-                  (dsh-protocol-question-wait-request session-id call-id)
-                  "userQuestions/attachWait"
-                  (lambda (_value) nil))))
-            (and stream (cons process stream))))))))
-
-(defun dsh-emacs--question-release-wait (claim)
-  "Release a CLAIM made by `dsh-emacs--question-claim-wait'.
-Closing the stream reschedules the host's original deadline, which can
-already have passed.  Submitted answers must hold it until acknowledgement.
-Safe on nil."
-  (when claim
-    (dsh-emacs-events-close-stream (car claim) (cdr claim))))
-
-;; Forward declaration of the $events generation's client-id, owned by
-;; dsh-emacs-events.el.  The bare (defvar X) form asserts existence without
-;; binding a default, so the owner's own defvar is not shadowed.
-(defvar dsh-emacs-events--client-id)
-
-(defconst dsh-emacs--question-skip-label "Skip this question"
-  "Internal sentinel for skipping one question with an empty selection.
-The skip command returns it directly; it is not a visible candidate.")
-
-;; Bound by `dsh-emacs--question-choice' around its reader, so the helper
-;; functions below stay parameterless and the reader sees one context.
-(defvar dsh-emacs--question-where nil
-  "Prompt prefix of the question being read (session and question number).")
-
-(defvar dsh-emacs--question-text nil
-  "Text of the question being read.")
-
-(defvar dsh-emacs--question-hint nil
-  "Input hint appended to the question prompt.")
-
-(defvar dsh-emacs--question-roster nil
-  "Plain option labels of the question being read.")
-
-(defvar dsh-emacs--question-options nil
-  "Option structs of the question being read.")
-
-(defvar dsh-emacs--question-current nil
-  "Protocol struct of the question being read.")
-
-(defvar dsh-emacs--question-multi nil
-  "Whether the question being read selects multiple options.")
-
-(defun dsh-emacs--question-pick-labels (labels)
-  "Return LABELS numbered from 1, the form the reader offers.
-The number is part of the option, so a comma-separated answer can name
-options by number as well as by label."
-  (cl-loop for label in labels for n from 1
-           collect (format "%d. %s" n label)))
-
-(defun dsh-emacs--question-prefix-label (prefix labels)
-  "Return the single LABELS entry PREFIX unambiguously starts, or nil.
-Matching ignores case, so a typed `alph' finds `Alpha'.  `require-match' is
-nil in the reader, so completion may hand back an unexpanded prefix instead
-of the candidate; an ambiguous prefix stays unresolved on purpose, so the
-text is never mapped to the wrong option."
-  (let ((hits (cl-remove-if-not
-               (lambda (label)
-                 (and (<= (length prefix) (length label))
-                      (eq t (compare-strings prefix 0 nil label 0 (length prefix)
-                                             t))))
-               labels)))
-    (and (= 1 (length hits)) (car hits))))
-
-(defun dsh-emacs--question-numbered-label (number labels)
-  "Return the LABELS entry NUMBER refers to, or nil.
-NUMBER is a bare option number.  The numbered candidates are matched in
-order, so `2' finds `2. Version' even when the label itself is numeric, and
-an out-of-range number matches nothing."
-  (let (found)
-    (dolist (candidate (dsh-emacs--question-pick-labels labels) found)
-      (unless found
-        (when (and (string-prefix-p (concat number ". ") candidate)
-                   (string-match "\\`[0-9]+\\. \\(.+\\)\\'" candidate))
-          ;; The numbered form was built from the label, so the tail is it.
-          (setq found (match-string 1 candidate)))))))
-
-(defun dsh-emacs--question-label-of (picked labels)
-  "Return the plain LABELS entry PICKED names, or nil.
-PICKED is a candidate string, a bare option number, a label, or an
-unambiguous prefix of a label.  An exact label wins over an unambiguous
-prefix, and both win over stripping a numbered prefix, so a label that
-starts with \"<number>. \" still round-trips; a bare number addresses the
-option at that position, because `completing-read-multiple' can hand back
-an element the completion engine left unexpanded."
-  (or (cl-find picked labels :test #'equal)
-      (dsh-emacs--question-prefix-label picked labels)
-      (let ((plain
-             (cond
-              ((string-match "\\`[0-9]+\\. \\(.+\\)\\'" picked)
-               (match-string 1 picked))
-              ((string-match "\\`\\([0-9]+\\)\\'" picked)
-               (dsh-emacs--question-numbered-label picked labels)))))
-        (and plain (cl-find plain labels :test #'equal)))))
-
-(defvar-local dsh-emacs--question-echo-message nil
-  "Last echo-area detail this question reader showed.")
-
-(defun dsh-emacs--question-echo (text)
-  "Show TEXT as this reader's echo-area help, without logging it.
-Re-showing the same text stays quiet so repeated commands do not spam the
-echo area; an empty TEXT clears help this reader owns."
-  (cond
-   ((or (null dsh-emacs-question-help-display) (string-empty-p text))
-    (when (and dsh-emacs--question-echo-message
-               (equal (current-message) dsh-emacs--question-echo-message))
-      (message nil))
-    (setq dsh-emacs--question-echo-message nil))
-   ((equal text dsh-emacs--question-echo-message))
-   (t
-    (setq dsh-emacs--question-echo-message text)
-    (let ((inhibit-message t)
-          (message-log-max nil))
-      (message "%s" text)))))
-
-(defun dsh-emacs--question-echo-cleanup ()
-  "Clear echo-area help this reader owns, leaving other messages alone."
-  (when (and dsh-emacs--question-echo-message
-             (equal (current-message) dsh-emacs--question-echo-message))
-    (message nil))
-  (setq dsh-emacs--question-echo-message nil))
-
-(defun dsh-emacs--question-annotation (candidate)
-  "Return CANDIDATE's option description, or an empty string.
-The description rides along with its candidate, so it is visible in the
-completion list without a tooltip, styled with `dsh-emacs-meta-face' — the
-face the ask card gives the same description in the transcript.  The
-annotation must carry a face of its own: a frontend adds
-`completions-annotations' only to a suffix that has none, so a bare string
-would be repainted by whatever default the user's UI applies."
-  (let* ((label (or (dsh-emacs--question-label-of
-                     candidate dsh-emacs--question-roster)
-                    candidate))
-         (option (cl-find label dsh-emacs--question-options
-                          :key #'dsh-protocol-question-option-label
-                          :test #'equal))
-         (description (and option
-                           (dsh-protocol-question-option-description option))))
-    (if (or (null description) (string-empty-p description))
-        ""
-      (propertize (format "  %s" description)
-                  'face 'dsh-emacs-meta-face))))
-
-(defun dsh-emacs--question-skip-command ()
-  "Skip the current question with an empty selection.
-Bound from `dsh-emacs-question-skip-key' in the reader's minibuffer."
-  (interactive)
-  (throw 'dsh-emacs--question-command dsh-emacs--question-skip-label))
-
-(defun dsh-emacs--question-reader-keymap ()
-  "Return the reader's minibuffer keymap: the current local map plus the
-skip shortcut (`dsh-emacs-question-skip-key', default `C-c C-s'), so
-nothing leaks into unrelated `completing-read' prompts.  The typed text is the
-answer itself (comma-separated options, see `crm-separator'), so no key
-is remapped and completion keep working."
-  (let ((map (copy-keymap (current-local-map))))
-    (when dsh-emacs-question-skip-key
-      (define-key map (if (stringp dsh-emacs-question-skip-key)
-                          (kbd dsh-emacs-question-skip-key)
-                        dsh-emacs-question-skip-key)
-                  #'dsh-emacs--question-skip-command))
-    map))
-
-(defun dsh-emacs--question-reader-setup ()
-  "Install the reader's keymap, candidate annotations and echo-area help.
-Everything is minibuffer-local, so no other `completing-read' sees it.  The
-prompt is preselected instead of the first candidate: an empty answer means
-\"skip\", and a frontend that preselects the first row would otherwise turn
-a bare RET into an answer.  The same setup also serves the nested free-text
-read, where there is no question context to show."
-  ;; Keep our own previous text out of the way, but never clear a message
-  ;; this reader did not write.
-  (when (and dsh-emacs--question-echo-message
-             (equal (current-message) dsh-emacs--question-echo-message))
-    (message nil))
-  (setq-local dsh-emacs--question-echo-message nil)
-  (when (boundp 'vertico-preselect)
-    (setq-local vertico-preselect 'prompt))
-  (setq-local completion-extra-properties
-              (list :annotation-function #'dsh-emacs--question-annotation))
-  (use-local-map (dsh-emacs--question-reader-keymap))
-  (add-hook 'minibuffer-exit-hook #'dsh-emacs--question-echo-cleanup nil t)
-  (dsh-emacs--question-echo
-   (let ((question dsh-emacs--question-current)
-         detail)
-     (when (dsh-protocol-question-p question)
-       (setq detail (dsh-protocol-question-detail question)))
-     (if (or (null detail) (string-empty-p detail)) "" detail)))
-  nil)
-
-(defun dsh-emacs--question-answer-values (picked labels)
-  "Return PICKED resolved to LABELS entries, in the question's option order.
-Each element is a candidate, a bare number, a label, or a label prefix; an
-element that names no option is left as the typed text, so the caller can
-tell `every value is an option` from `the user is answering in text`, and
-never silently drops part of the answer.  The answer follows the order the
-question offered the options, not the order they were typed."
-  (let ((values (mapcar (lambda (value)
-                          (or (dsh-emacs--question-label-of value labels) value))
-                        picked)))
-    (cl-stable-sort values #'< :key (lambda (value)
-                                      (or (cl-position value labels :test #'equal)
-                                          most-positive-fixnum)))))
-
-(defun dsh-emacs--question-read-multiple (labels)
-  "Read one comma-separated answer over numbered LABELS.
-Returns the selected candidate strings, the free-text sentinel, or nil for
-an empty answer.  `require-match' is nil on purpose: the answer is typed
-text, so an empty minibuffer must stay empty (a mandatory match lets a
-frontend turn a bare RET into its preselected candidate) and an unknown
-value is better treated as a free-text answer than rejected.  C-g
-propagates.
-The candidates carry identity sort metadata: the number in a candidate is
-its position in the question, so a frontend must not reorder the list (the
-default ranking is by history, length and alphabet, which scrambles the
-numbered items and differs from question to question).  CRM hands the
-collection on to the frontend through `crm--collection-fn', which passes
-this metadata through."
-  (catch 'dsh-emacs--question-command
-    (minibuffer-with-setup-hook #'dsh-emacs--question-reader-setup
-      (completing-read-multiple
-       (concat dsh-emacs--question-where dsh-emacs--question-text
-               (or dsh-emacs--question-hint "") ": ")
-       (dsh-emacs--completion-table-with-metadata
-        (dsh-emacs--question-pick-labels labels)
-        '((display-sort-function . identity)
-          (cycle-sort-function . identity)))
-       nil nil nil nil nil))))
-
-(defun dsh-emacs--question-choose (labels)
-  "Read one answer over LABELS.
-The prompt carries the question and the candidates carry their own
-descriptions.  An empty input is a skip, and anything that names no option
-is the user's own text."
-  (catch 'answer
-    (let ((picked (dsh-emacs--question-read-multiple labels)))
-      (cond
-       ((equal picked dsh-emacs--question-skip-label)
-        (throw 'answer :skip))
-       ((null picked) :skip)
-       (t
-        (let* ((values (dsh-emacs--question-answer-values picked labels))
-               (options (cl-remove-if-not (lambda (value)
-                                            (cl-member value labels :test #'equal))
-                                          values)))
-          (cond
-           ((null options)
-            ;; Names no option: the text is the answer, like an unmatched
-            ;; input at any completion prompt.
-            (throw 'answer (cons :custom (string-join picked ", "))))
-           ((/= (length options) (length values))
-            ;; Only part of it names options; treating it as a selection
-            ;; would silently drop the rest, so the whole input is the text.
-            (throw 'answer (cons :custom (string-join picked ", "))))
-           (dsh-emacs--question-multi
-            (cons :selected options))
-           (t
-            (cons :one (car options))))))))))
-
-(defun dsh-emacs--question-choice (question &optional index total session-id)
-  "Read one answer to QUESTION as ((id . ID) (selected . LABELS) ...).
-QUESTION accepts a protocol struct or legacy wire alist.  INDEX/TOTAL
-and SESSION-ID identify the question and its owning session in the prompt.
-Multiple selection is one comma-separated answer (for example `2,3'):
-the numbered options are the candidates, an empty input skips the
-question, and any text that names no option is itself the answer (like an
-unmatched input at any completion prompt).  Single selection uses the first
-value when several are given.  Every question is answered by one minibuffer read, so the reader is
-never reopened per key.  The skip key
-(`dsh-emacs-question-skip-key') answers with an empty selection and C-g
-abandons the whole waterfall.  Questions without options read free text,
-with empty input meaning skip.  The question detail shows in the echo
-area; each option's description rides along with its candidate."
-  (let* ((question (dsh-protocol--struct
-                    #'dsh-protocol-question-p
-                    #'dsh-protocol-question--from-alist question))
-         (id (dsh-protocol-question-id question))
-         (text (or (dsh-protocol-question-text question) "Question"))
-         (options (dsh-protocol-question-options question))
-         (labels (mapcar #'dsh-protocol-question-option-label options))
-         (dsh-emacs--question-roster labels)
-         (dsh-emacs--question-current question)
-         (dsh-emacs--question-options options)
-         (dsh-emacs--question-multi
-          (dsh-protocol-question-multi-select question))
-         ;; The session label is redundant in the asking buffer.
-         (same-buffer (and (boundp 'dsh-emacs--buffer-session)
-                           (equal dsh-emacs--buffer-session session-id)))
-         (dsh-emacs--question-where
-          (concat
-           (if (and session-id (not (string-empty-p session-id))
-                    (not same-buffer))
-               (format "[%s] " (dsh-emacs--question-session-label session-id))
-             "")
-           (if index (format "Question %d/%d — " index total) "")))
-         (dsh-emacs--question-text text)
-         (dsh-emacs--question-hint
-          (if (null labels)
-              " (empty input = skip)"
-            (if dsh-emacs--question-multi
-                " (2,3 or names, or your own text; empty = skip)"
-              " (a name or your own text; empty = skip)"))))
-    (if (null labels)
-        (let ((custom
-               (minibuffer-with-setup-hook #'dsh-emacs--question-reader-setup
-                 (read-string (format "%s%s%s: "
-                                      dsh-emacs--question-where text
-                                      dsh-emacs--question-hint)))))
-          (dsh-protocol-question-answer-request
-           id [] (unless (string-empty-p custom) custom)))
-      (let ((answer (dsh-emacs--question-choose labels)))
-        (pcase answer
-          (:skip
-           (when (and index total)
-             (message "Question %d/%d skipped" index total))
-           (dsh-protocol-question-answer-request id []))
-          (`(:custom . ,custom)
-           (dsh-protocol-question-answer-request id [] custom))
-          (`(:selected . ,selected)
-           (dsh-protocol-question-answer-request id selected))
-          (`(:one . ,label)
-           (dsh-protocol-question-answer-request id (list label)))
-          (_ (error "Unhandled question answer: %S" answer)))))))
-
-(defun dsh-emacs--question-preview-item (id text detail multi options)
-  "Build one local preview question; no wire payload is involved.
-ID/TEXT/DETAIL are strings, MULTI says whether several options may be
-picked, and OPTIONS is a list of (LABEL . DESCRIPTION) pairs.  Values go
-in through the protocol accessors, so this local sample never spells a
-wire field name."
-  (let ((question (dsh-protocol-question--from-alist nil)))
-    (setf (dsh-protocol-question-id question) id
-          (dsh-protocol-question-text question) text
-          (dsh-protocol-question-detail question) detail
-          (dsh-protocol-question-multi-select question) multi
-          (dsh-protocol-question-options question)
-          (mapcar (pcase-lambda (`(,label . ,description))
-                    (let ((option (dsh-protocol-question-option--from-alist nil)))
-                      (setf (dsh-protocol-question-option-label option) label
-                            (dsh-protocol-question-option-description option)
-                            description)
-                      option))
-                  options))
-    question))
-
-(defun dsh-emacs--collect-question-answers (questions &optional session-id)
-  "Answer QUESTIONS one at a time from the minibuffer: each question's
-options are the completion candidates (`dsh-emacs--question-choice',
-with its INDEX/TOTAL in the prompt), in frame order.  SESSION-ID (when
-given) labels every prompt with the owning session.  Returns the answer
-alists in frame order.  Empty free text skips an option-less question;
-C-g propagates to the caller, which declines the waterfall."
-  (let ((total (length questions))
-        (answers nil)
-        (n 0))
-    (catch 'abort
-      (dolist (q questions)
-        (setq n (1+ n))
-        (let ((answer (dsh-emacs--question-choice q n total session-id)))
-          (if (null answer) (throw 'abort nil)
-            (push answer answers))))
-      (reverse answers))))
-
-;;;###autoload
-(defun dsh-emacs-question-preview ()
-  "Try the ask reader locally, without sending an RPC.
-Presents a three-question batch — a multi-select with option
-descriptions, a single-select, and an option-less free-text question — so
-one run shows every prompt shape and the \"Question N/M\" framing.  The
-answers of the whole batch are echoed the way the RPC outcome would carry
-them."
-  (interactive)
-  (message "Preview answers: %S"
-           (dsh-emacs--collect-question-answers
-            (list (dsh-emacs--question-preview-item
-                   "preview-1" "What should this update include?"
-                   "Multi-select: pick several (2,3), or type your own answer."
-                   t
-                   '(("UI" . "Show the current option's description here.")
-                     ("Regression tests" . "Cover multi-select and free text.")
-                     ("Docs" . "Update usage notes and the decision record.")))
-                  (dsh-emacs--question-preview-item
-                   "preview-2" "How should the change be verified?"
-                   "Single select: pick one option, or type your own answer."
-                   nil
-                   '(("Run scripts/verify.sh" . "Parens, tests, compile pass.")
-                     ("Click through the GUI only" . "Walk the path by hand.")))
-                  (dsh-emacs--question-preview-item
-                   "preview-3" "Anything else to add?"
-                   "No options: empty input skips, text is the answer."
-                   nil nil)))))
-
-(cl-defun dsh-emacs--question-requested (chat event-id session-id questions
-                                                  &optional wait)
-  "Queue a `user-questions/request' waterfall EVENT-ID of SESSION-ID and answer it.
-WAIT, when non-nil, is the frame's `dsh-protocol-question-wait' struct: it
-names the timed tool call whose foreground wait the reader claims while the
-question is on screen (dsh 0.2.0; nil for the blocking legacy tool).
-The minibuffer is one global resource: with several chat buffers open, a
-$events frame can deliver the next question while the previous one is
-still being answered interactively.  Nested `completing-read' calls
-would stack different sessions' prompts inside the same minibuffer, so
-frames are queued (FIFO) and drained one at a time by
-`dsh-emacs--interaction-drain'; each prompt carries the owning session's
-label (see `dsh-emacs--question-session-label').  All questions of the
-waterfall are then read one after another (options as completion
-candidates plus a \"Type answer…\" free-text choice) and answered with a
-single `$events/result' outcome (value = {answers: …}).  C-g abandons
-the whole waterfall with outcome kind
-`rejected' and an error body (dsh web's \"abandon questions\") so the host
-withdraws the ask and the run is never left blocked; the quit is caught
-here, so it cannot leak out of the process filter as \"error in process
-filter: Quit\".
-A waterfall whose EVENT-ID is already pending (queued or active) is
-dropped instead of asked twice, mirroring the approval flow.
-Explicit plan-review intent opens a document without occupying the minibuffer."
-  (when (dsh-emacs-plan--request chat event-id session-id questions)
-    (cl-return-from dsh-emacs--question-requested))
-  (unless (or (equal dsh-emacs--interaction-active (cons 'question event-id))
-              (cl-some (lambda (entry)
-                         (equal event-id (nth 1 entry)))
-                       dsh-emacs--question-queue))
-    (setq dsh-emacs--question-queue
-          (nconc dsh-emacs--question-queue
-                 (list (list chat event-id session-id questions wait))))
-    ;; Desktop notice, turn-finish style (`dsh-emacs-enable-notifications'):
-    ;; the answering prompt may wait behind another session's prompt, so
-    ;; announce a pending question even when the user is away from the
-    ;; chat.  Acceptance-gated: a replayed duplicate waterfall is dropped
-    ;; above and must never re-notify.
-    (when (buffer-live-p chat)
-      (let* ((qs (dsh-protocol--list questions))
-             (first-text
-              (dsh-protocol-question-text
-               (dsh-protocol--struct #'dsh-protocol-question-p
-                                     #'dsh-protocol-question--from-alist
-                                     (car qs))))
-             (count (length qs))
-             (body (format "Question%s%s"
-                           (if (stringp first-text)
-                               (format ": %s" first-text)
-                             "")
-                           (if (> count 1)
-                               (format " (+%d more)" (1- count))
-                             ""))))
-        (dsh-emacs-notify--post session-id body chat))))
-  (dsh-emacs--interaction-drain 'question))
-
-(defun dsh-emacs--question-decline (event-id)
-  "Abandon a whole `user-questions/request' waterfall EVENT-ID.
-Answers with outcome kind `rejected' and an error body (name/message)
-mirroring the old protocol's reserved `cancelled' intent — the same wire
-signal dsh web's \"abandon questions\" produces: the host resolves the
-pending ask as cancelled and the ask tool call aborts, so the agent's
-turn is never left blocked on an unanswered question.  The quit is
-contained here so it cannot leak out of the process filter as \"error in
-process filter: Quit\"."
-  (dsh-emacs--events-result-async
-   dsh-emacs-events--client-id
-   event-id
-   (dsh-protocol-events-cancelled-outcome "User abandoned the questions")
-   (lambda (ok value)
-     (if ok
-         (message "Question cancelled")
-       (message "Question response not accepted (%s)" value)))))
-
-(defun dsh-emacs--question-cancelled (event-id)
-  "Retire the queued `user-questions/request' waterfall EVENT-ID.
-A host `cancel' frame for EVENT-ID means the waterfall was withdrawn and
-no longer needs answering; drop any still-queued copy so a replay never
-re-asks a finished question.  When the matching waterfall owns the active
-minibuffer, close it and let its drain retire without sending an outcome."
-  (dsh-emacs-plan--cancel event-id)
-  (setq dsh-emacs--question-queue
-        (cl-remove-if (lambda (entry)
-                        (equal event-id (nth 1 entry)))
-                      dsh-emacs--question-queue))
-  (dsh-emacs--waterfall-cancel-active 'question event-id))
-
-(defun dsh-emacs--question-continued ()
-  "Return this chat's still-answerable `continued' timed questions.
-Entries are `dsh-protocol-pending-question' structs in ask order."
-  (let ((view dsh-emacs--session-questions))
-    (when view
-      (cl-remove-if-not
-       (lambda (question)
-         (eq 'continued (dsh-protocol-pending-question-state question)))
-       (dsh-protocol-user-questions-active view)))))
-
-(defun dsh-emacs--question-continued-label (question)
-  "Short picker label for a `continued' QUESTION.
-Its first question text names the call; a call the projection could not
-describe falls back to the call id."
-  (let ((first (car (dsh-protocol-pending-question-questions question))))
-    (or (and first (dsh-protocol-question-text first))
-        (dsh-protocol-pending-question-call-id question)
-        "Question")))
-
-(defun dsh-emacs--question-answer-late (session-id call-id answers)
-  "Submit ANSWERS for the timed CALL-ID of SESSION-ID.
-ANSWERS is the reader's wire-shaped answer list.  The host steers the batch
-into the agent as a late reply; a later `userQuestions' projection frame
-reports the call settled."
-  (dsh-emacs--rpc-async
-   "userQuestions/answer"
-   (dsh-protocol-question-late-answer-request session-id call-id answers)
-   (lambda (ok value)
-     (cond
-      ((not ok) (message "Question answer not accepted (%s)" value))
-      ((eq value t) (message "Answered %d question(s)" (length answers)))
-      (t (message "Question is no longer waiting for an answer"))))))
-
-;;;###autoload
-(defun dsh-emacs-answer-question ()
-  "Answer a timed `ask_user_question' whose foreground window has closed.
-A timed question the user did not answer before its window expired stays
-answerable (dsh 0.2.0).  This command reads the session's `userQuestions'
-projection, asks the chosen call's questions in the minibuffer with the
-ordinary reader, and submits the batch through `userQuestions/answer'; the
-host steers it into the agent as a late reply.  With several calls waiting,
-one is chosen by its first question, and the batch must cover every question
-of that call.  Reports instead of prompting when nothing is waiting."
-  (interactive)
-  (dsh-emacs-subagent-require 'mutate)
-  (let ((session-id (and (boundp 'dsh-emacs--buffer-session)
-                         dsh-emacs--buffer-session))
-        (pending (dsh-emacs--question-continued)))
-    (unless session-id
-      (user-error "Not in a dsh chat buffer"))
-    (unless pending
-      (user-error "No question is waiting for a later answer"))
-    (when (or dsh-emacs--interaction-active
-              (active-minibuffer-window))
-      (user-error "Another prompt is active"))
-    (unwind-protect
-        (let* ((dsh-emacs--interaction-active '(late-answer))
-               (entry (if (= 1 (length pending))
-                          (car pending)
-                        (let ((choices
-                               (mapcar (lambda (question)
-                                         (cons (dsh-emacs--question-continued-label
-                                                question)
-                                               question))
-                                       pending)))
-                          (cdr (assoc (completing-read "Answer which question: "
-                                                       choices nil t)
-                                      choices)))))
-               (call-id (dsh-protocol-pending-question-call-id entry))
-               (questions (dsh-protocol-pending-question-questions entry))
-               (answers (dsh-emacs--collect-question-answers questions session-id)))
-          (unless answers
-            (user-error "Question left unanswered"))
-          (dsh-emacs--question-answer-late session-id call-id answers))
-      ;; The dynamic reservation has unwound even on C-g or a reader error.
-      ;; Preserve the late-answer handoff order: questions, then approvals.
-      (dsh-emacs--interaction-drain 'question))))
-
-(defun dsh-emacs--waterfall-generation-retired ()
-  "Retire all pending question/approval waterfalls of a dead generation.
-Each `$events' reconnect hands out a NEW client-id; answering the old
-generation's still-queued frames with it would be a no-op, so the pending
-frames are dropped (a waterfall currently being prompted cannot be
-aborted from here — its stale answer is likewise a no-op).
-
-Silent when nothing was pending: a reconnect mints a new generation as a
-matter of course, and \"retiring 0 queued question(s) and 0 approval(s)\"
-on every one of them is echo-area noise.  The message stays for a
-generation that actually dropped queued work, which the user needs to
-know about."
-  (let ((questions (length dsh-emacs--question-queue))
-        (approvals (length dsh-emacs--approval-queue)))
-    (when (or (> questions 0) (> approvals 0))
-      (message "dsh: new $events generation — retiring %d queued question(s) and %d approval(s)"
-               questions approvals)))
-  (dsh-emacs-plan--cancel)
-  (setq dsh-emacs--question-queue nil
-        dsh-emacs--approval-queue nil))
-
-;; ---------------------------------------------------------------------------
-;;  User approval (approval/request) responses
-;; ---------------------------------------------------------------------------
-;; Out-of-bounds requests from sandboxed tools push
-;; `approval/request' waterfalls over the core connection's `$events'
-;; stream: when bash/fs and friends need files outside the workspace,
-;; the host first asks the user's permission (the same protocol as
-;; dsh web's ApprovalPanel).  The client must show the request
-;; (toolName + justification reason), read the user's approve/reject
-;; decision, and answer with an outcome via the unary endpoint POST
-;; /api/$events/result (value = ApprovalOutcome string: the client
-;; gives only "allowed-once" | "rejected"; the wire has no
-;; approvalId).
-;;
-;; Interaction: minibuffer y-or-n-p — y/the y key = allow once, n =
-;; reject; C-g/ESC answers with rejection too (with no decision the
-;; client sends nothing and the host blocks forever on the pending
-;; approval; a waterfall the host already cancelled has a no-op
-;; result and is dropped silently).  The minibuffer is a single
-;; global resource: approvals and questions share one slot
-;; (`dsh-emacs--interaction-active').  New frames queue while it is held;
-;; the interaction drain finishes the current kind's queue before switching,
-;; never nesting two minibuffer prompts.
-
-(defun dsh-emacs--approval-display-reason (request)
-  "Choose the localized reason of decoded approval REQUEST.
-Resolve once before queueing, so the notification and prompt agree."
-  (let* ((locale
-          (cl-find-if
-           (lambda (value) (and (stringp value) (not (string-empty-p value))))
-           (list dsh-emacs-approval-language system-messages-locale
-                 (getenv "LC_ALL") (getenv "LC_MESSAGES") (getenv "LANG")
-                 "en")))
-         (tag (car (split-string
-                    (downcase (replace-regexp-in-string "_" "-" locale))
-                    "[.@]")))
-         (translations (dsh-protocol-approval-request-display-reasons request)))
-    (or (cdr (assoc tag translations))
-        (cdr (assoc (car (split-string tag "-")) translations))
-        (cdr (assoc "en" translations))
-        (dsh-protocol-approval-request-reason request))))
-
-(defun dsh-emacs--approval-command-line (call-id)
-  "One-line summary of the tool call CALL-ID from the live transcript.
-Reads the buffer-local `dsh-emacs--tool-states' map, so it must run in
-the chat buffer of the approving session.  For bash the rendered body is
-the real command (\"$ cat /etc/hostname\"); other tools fall back to
-\"Title — args\".  Returns nil when CALL-ID is unknown (e.g. the call
-predates this window, or the approval replayed right after open)."
-  (when (and call-id
-             (boundp 'dsh-emacs--tool-states)
-             (hash-table-p dsh-emacs--tool-states))
-    (let* ((state (dsh-emacs-render--tool-state call-id))
-           (title (and state (plist-get state :title)))
-           (args (and state (plist-get state :args))))
-      (cond
-       ((and (stringp args) (string-match-p "\\`\\$ " args)) args)
-       ((and (stringp args) (not (string-empty-p args)))
-        (if (and (stringp title) (not (string-empty-p title)))
-            (format "%s — %s" title args)
-          args))
-       ((and (stringp title) (not (string-empty-p title))) title)
-       (t nil)))))
-
-(defun dsh-emacs--approval-answer (frame)
-  "Read and answer one approval FRAME with the shared interaction slot held.
-A quit (C-g/ESC) counts as a rejection so the host never stays blocked on a
-pending frame.
-The decision goes out as a `$events/result' outcome (value =
-ApprovalOutcome string) carrying the current generation's client-id and
-the waterfall's EVENT-ID.  The prompt runs in the frame's chat buffer so
-the tool-call lookup (`dsh-emacs--approval-command-line') can read the
-buffer-local transcript state."
-  (pcase-let ((`(,chat ,event-id ,session-id ,tool-name ,reason ,call-id) frame))
-    (let ((sent nil))
-      (condition-case err
-          (let ((allow
-                 (condition-case nil
-                     (if (buffer-live-p chat)
-                         (with-current-buffer chat
-                           (dsh-emacs--approval-prompt
-                            session-id tool-name reason call-id))
-                       (dsh-emacs--approval-prompt
-                        session-id tool-name reason call-id))
-                   ;; A remote cancel must reach the outer handler without
-                   ;; becoming the user's default rejection.
-                   (quit
-                    (if (equal event-id
-                               dsh-emacs--waterfall-cancelled-event-id)
-                        (signal 'quit nil)
-                      (message "Approval %s quit — rejecting" event-id)
-                      nil)))))
-            (if (equal event-id dsh-emacs--waterfall-cancelled-event-id)
-                (message "Approval was answered elsewhere")
-              (dsh-emacs--events-result-async
-               dsh-emacs-events--client-id
-               event-id
-               (dsh-protocol-approval-outcome allow)
-               (lambda (ok value)
-                 (if ok
-                     (message "%s %s for %s"
-                              (if allow "Approved" "Rejected")
-                              (or tool-name "tool") session-id)
-                   (message "Approval response not accepted (%s)"
-                            value))))
-              (setq sent t)))
-        ;; Remote cancellation exits the prompt without answering again.
-        (quit
-         (unless (equal event-id dsh-emacs--waterfall-cancelled-event-id)
-           (message "Approval %s cancelled" event-id)))
-        (error
-         (message "dsh approval error: %S" err)
-         ;; Reading failed (for example, a nested minibuffer made the
-         ;; prompt signal): reject so the host is not left blocked.  A
-         ;; remote cancel already answered it.
-         (unless (or sent
-                     (equal event-id dsh-emacs--waterfall-cancelled-event-id))
-           (condition-case fallback
-               (dsh-emacs--events-result-async
-                dsh-emacs-events--client-id event-id
-                (dsh-protocol-approval-outcome nil)
-                (lambda (ok value)
-                  (unless ok
-                    (message "Approval response not accepted (%s)" value))))
-             (error (message "dsh approval rejection error: %S" fallback)))))))))
-
-(defun dsh-emacs--avoid-minibuffer-prompt (&rest _)
-  "Point-entered handler keeping point off the read-only prompt tail.
-Same behavior as the obsolete `minibuffer-avoid-prompt' (deprecated
-since 25.1): entering the prompt region moves point past it."
-  (when (and (minibufferp) (< (point) (minibuffer-prompt-end)))
-    (goto-char (minibuffer-prompt-end))))
-
-(defun dsh-emacs--approval-prompt (session-id tool-name reason call-id)
-  "Read the user's decision for one approval in the minibuffer.
-The prompt is multi-line, untruncated and colored: the asker's full
-justification REASON in `dsh-emacs-approval-justification-face' (light
-orange), then a blank line and the actual tool call (the bash command
-line, see `dsh-emacs--approval-command-line' — runs in the chat buffer,
-so CALL-ID must be that session's) in `dsh-emacs-approval-command-face'
-(gray).  The owning session, tool and call-id are logged to *Messages*.
-Without any detail the prompt falls back to \"Allow TOOL?\".  The prompt
-faces survive because `minibuffer-prompt-properties' is bound WITHOUT
-its `face' slot around the read — the minibuffer prompt insertion would
-otherwise replace every prompt face with `minibuffer-prompt'.  Returns t
-to allow once, nil to reject; C-g signals `quit' and the caller answers
-the same rejection (an unanswered frame would block the host forever)."
-  (let* ((where (concat
-                 (if (and session-id (not (string-empty-p session-id)))
-                     (format "[%s] " (dsh-emacs--question-session-label
-                                      session-id))
-                   "")
-                 (if (and call-id (not (string-empty-p call-id)))
-                     (format "call %s " call-id)
-                   "")))
-         (just-line (and reason (not (string-empty-p reason))
-                         (propertize reason
-                                     'face
-                                     'dsh-emacs-approval-justification-face)))
-         (cmd-line (let ((line (dsh-emacs--approval-command-line call-id)))
-                     (and line (propertize line
-                                           'face
-                                           'dsh-emacs-approval-command-face))))
-         (lines (delq nil (list just-line cmd-line)))
-         (prompt (if lines
-                     (mapconcat #'identity lines "\n\n")
-                   (format "Allow %s?" (or tool-name "tool")))))
-    (when (and where (not (string-empty-p where)))
-      (message "dsh approval, %s: %s%s"
-               (or tool-name "tool") where
-               (if (and reason (not (string-empty-p reason)))
-                   (format " — %s" reason)
-                 "")))
-    (let ((minibuffer-prompt-properties
-           ;; Keep the prompt non-editable and point-safe, but drop the
-           ;; `face' slot: `read-from-minibuffer' applies these properties
-           ;; over the prompt, and `add-text-properties' replaces an
-           ;; existing `face' — with it bound the justification/command
-           ;; colors above would be wiped by `minibuffer-prompt'.
-           (list 'read-only t
-                 'point-entered #'dsh-emacs--avoid-minibuffer-prompt)))
-      (y-or-n-p prompt))))
-
-(defun dsh-emacs--approval-requested (chat event-id session-id tool-name
-                                             reason call-id)
-  "Queue an `approval/request' waterfall EVENT-ID of SESSION-ID and answer it.
-Mirrors `dsh-emacs--question-requested': the minibuffer is one global
-resource, so frames are queued (FIFO) and drained one at a time by
-`dsh-emacs--interaction-drain', never nested inside another prompt.  A
-waterfall whose EVENT-ID is already pending ($events replay of the same
-request) is dropped instead of asked twice.  The decision — allow once
-or reject — is sent as a single `$events/result' outcome (value =
-ApprovalOutcome string) carrying the current generation's client-id and
-the EVENT-ID; C-g answers the rejection too (default deny).  The quit is
-caught here so it cannot leak out of the process filter as \"error in
-process filter: Quit\"."
-  (unless (or (equal dsh-emacs--interaction-active (cons 'approval event-id))
-              (cl-some (lambda (entry)
-                         (equal event-id (nth 1 entry)))
-                       dsh-emacs--approval-queue))
-    (setq dsh-emacs--approval-queue
-          (nconc dsh-emacs--approval-queue
-                 (list (list chat event-id session-id
-                             tool-name reason call-id))))
-    ;; Desktop notice, turn-finish style: the approval prompt may wait in
-    ;; the queue while the user is in another buffer or app; the body
-    ;; carries the tool call (else justification, else tool name) so the
-    ;; decision can be made away from the minibuffer.  Acceptance-gated:
-    ;; a replayed duplicate never re-notifies.  The command-line lookup
-    ;; needs the chat buffer's transcript state, so it runs there.
-    (when (buffer-live-p chat)
-      (let* ((command (with-current-buffer chat
-                        (dsh-emacs--approval-command-line call-id)))
-             (detail (or command
-                         (and (stringp reason)
-                              (not (string-empty-p reason)) reason)
-                         (and (stringp tool-name)
-                              (not (string-empty-p tool-name)) tool-name)))
-             (body (format "Approval%s"
-                           (if detail (format ": %s" detail) ""))))
-        (dsh-emacs-notify--post session-id body chat))))
-  (dsh-emacs--interaction-drain 'approval))
-
-(defun dsh-emacs--approval-cancelled (event-id)
-  "Retire the queued `approval/request' waterfall EVENT-ID.
-A host `cancel' frame for EVENT-ID means the waterfall was withdrawn and
-no longer needs answering; drop any still-queued copy so a replay never
-re-asks a finished approval.  When the matching waterfall owns the active
-minibuffer, close it and let its drain retire without sending an outcome."
-  (setq dsh-emacs--approval-queue
-        (cl-remove-if (lambda (entry)
-                        (equal event-id (nth 1 entry)))
-                      dsh-emacs--approval-queue))
-  (dsh-emacs--waterfall-cancel-active 'approval event-id))
+                            (message "dsh service unreachable: %s"
+                                     (dsh-emacs-rpc-error-text value))))))
 
 (provide 'dsh-emacs)
 

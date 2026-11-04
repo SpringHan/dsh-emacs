@@ -1,10 +1,10 @@
-# 155 — HTTP route proxy
+# 183 — HTTP route proxy
 
 ## Background
 
-[dsh-plugins-bridge](154-plugin-bridge-client.md) also exposes plugins that
+[dsh-plugins-bridge](182-plugin-bridge-client.md) also exposes plugins that
 register custom HTTP routes on `dsh-host-webserver` instead of shipping a
-generated Typert API. Record 154 deliberately left that surface out, so
+generated Typert API. Record 182 deliberately left that surface out, so
 `M-x dsh-emacs-plugins` could not operate routes such as
 `dsh-session-manager/trash` or `dsh-whale/*`. The bridge's `/v1/routes`
 reports the groups, their paths and whether each is selected; `/v1/http`
@@ -83,8 +83,8 @@ group selection, request shape, JSON/text/binary/error rendering, truncation,
 same-origin Cookie forwarding and command wiring.
 
 Docs: [Plugin bridge](../docs/plugins.md), the module/transport notes in
-[architecture](../docs/architecture.md), and the `0.8.0` CHANGELOG entry.
-The route-scope limitation in [154](154-plugin-bridge-client.md) is
+[architecture](../docs/architecture.md), and the `0.9.0` CHANGELOG entry.
+The route-scope limitation in [182](182-plugin-bridge-client.md) is
 superseded; the rest of that record still applies.
 
 ## Known limitations

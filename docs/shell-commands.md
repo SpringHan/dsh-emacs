@@ -45,10 +45,12 @@ printf 'done\n'
   and of the dsh server. `C-c C-c` requires no server connection for `!`
   input; it never reaches `session/prompt` or `commands.execute`.
 - **Rendering**: a transcript row appears instantly — the bash terminal icon
-  (the same dsh-web SVG as tool rows) followed by the command and a classic
-  `-\|/` spinner.  On completion the header shows the exit status
-  (`✓ exit 0` green, `✗ exit N` / `✗ signal N` red) and the merged
-  stdout+stderr becomes a collapsible body below, expanded by default
+  in `full` (one dot in `simple` or where Emacs cannot draw SVG) followed by
+  the command, with the pending tint in `full` (the dot in `simple`) carrying
+  the running state.  On completion the header shows
+  the exit status (`✓ exit 0` / `✗ exit N` / `✗ signal N`), green/red in
+  `full` and muted in `simple`, where the dot carries the state color.  The
+  merged stdout+stderr becomes a collapsible body below, expanded by default
   (`RET` on the row folds it).  The line is recorded in the input history
   (`M-p` recalls it) and the input is cleared immediately, like slash
   commands.

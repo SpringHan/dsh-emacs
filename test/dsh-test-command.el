@@ -265,6 +265,72 @@
             dsh-emacs--command-fetch-inflight old-inflight
             dsh-emacs--command-fetch-stamps old-stamps))))
 
+;; A synchronous read supersedes a prefetch already in flight: the late
+;; prefetch response is older than the sync catalog and must not overwrite it.
+(ert-deftest dsh-emacs-test-command-command-catalog-sync-supersedes-prefetch ()
+  :tags '(dsh-unit)
+  (let ((sid "sess-cmd-sync-stale")
+        (old-catalogs dsh-emacs--command-catalogs)
+        (old-inflight dsh-emacs--command-fetch-inflight)
+        (old-stamps dsh-emacs--command-fetch-stamps)
+        (callback nil))
+    (unwind-protect
+        (progn
+          ;; Prefetch starts; its response is captured, not run.
+          (cl-letf (((symbol-function 'dsh-emacs--rpc-async)
+                     (lambda (_method _params cb) (setq callback cb))))
+            (dsh-emacs-command-catalog-fetch sid))
+          ;; The synchronous read returns a newer catalog and caches it.
+          (cl-letf (((symbol-function 'dsh-emacs--rpc-request)
+                     (lambda (_method _params)
+                       (cons t [((name . "new") (description . "N"))]))))
+            (should (dsh-emacs-command-catalog-sync sid)))
+          ;; The older prefetch response arrives late.
+          (funcall callback t [((name . "old") (description . "O"))])
+          (let ((items (dsh-emacs-command-catalog sid)))
+            (ert-info ((format "%s" "command-catalog-sync-supersedes-prefetch"))
+              (should (consp items))
+              (should (string= "new"
+                               (dsh-protocol-command-name (car items)))))))
+      (setq dsh-emacs--command-catalogs old-catalogs
+            dsh-emacs--command-fetch-inflight old-inflight
+            dsh-emacs--command-fetch-stamps old-stamps))))
+
+;; Waiting on a synchronous RPC services timers: a prefetch can start and
+;; cache a newer catalog before the older synchronous response returns.  The
+;; sync result must not overwrite that newer catalog.
+(ert-deftest dsh-emacs-test-command-command-catalog-sync-loses-to-newer-prefetch ()
+  :tags '(dsh-unit)
+  (let ((sid "sess-cmd-sync-race")
+        (old-catalogs dsh-emacs--command-catalogs)
+        (old-inflight dsh-emacs--command-fetch-inflight)
+        (old-stamps dsh-emacs--command-fetch-stamps))
+    (unwind-protect
+        (cl-letf (((symbol-function 'dsh-emacs--rpc-request)
+                   (lambda (_method _params)
+                     ;; A prefetch starts and completes while the synchronous
+                     ;; read waits on the network.
+                     (dsh-emacs-command-catalog-fetch sid)
+                     (cons t [((name . "older-command")
+                               (description . "O"))])))
+                  ((symbol-function 'dsh-emacs--rpc-async)
+                   (lambda (_method _params callback)
+                     (funcall callback
+                              t [((name . "newer-command")
+                                  (description . "N"))]))))
+          (let ((returned (dsh-emacs-command-catalog-sync sid))
+                (items (dsh-emacs-command-catalog sid)))
+            (ert-info ((format "%s" "command-catalog-sync-keeps-newer-prefetch"))
+              (should (consp items))
+              (should (string= "newer-command"
+                               (dsh-protocol-command-name (car items))))
+              (should (consp returned))
+              (should (string= "newer-command"
+                               (dsh-protocol-command-name (car returned)))))))
+      (setq dsh-emacs--command-catalogs old-catalogs
+            dsh-emacs--command-fetch-inflight old-inflight
+            dsh-emacs--command-fetch-stamps old-stamps))))
+
 ;; --- Test 98: command/run + command/done rendering ---
 (ert-deftest dsh-emacs-test-command-command-render-run-and-done ()
   :tags '(dsh-unit)
@@ -384,15 +450,13 @@
                                 (number-sequence body-start (1- (cdr block))))))))))
         (kill-buffer buf)))))
 
-;; --- Test 98a: command row styling --- result prefix + spinner lifecycle ---
-(ert-deftest dsh-emacs-test-command-command-result-prefix-and-spinner-stopped ()
+;; --- Test 98a: command row styling --- result prefix + done settlement ---
+(ert-deftest dsh-emacs-test-command-command-result-prefix ()
   :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-prefix*"))
-        (old-spinners dsh-emacs--command-spinners))
+  (let ((buf (generate-new-buffer " *dsh-cmd-prefix*")))
     (unwind-protect
         (with-current-buffer buf
           (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
           (dsh-emacs-render-event
            '((type . "command/run") (seq . 20)
              (data . ((commandId . "pfx1") (name . "compact") (args . "")))))
@@ -405,80 +469,24 @@
                  (block-id "cmd-pfx1")
                  (blk (dsh-emacs-ui-find-block ns block-id))
                  (state (and blk (get-text-property (car blk) 'dsh-emacs-ui-state))))
-            (ert-info ((format "%s" "command-result-prefix-and-spinner-stopped"))
+            (ert-info ((format "%s" "command-result-prefix"))
               (should (and (string-match-p "compact" txt)
                            (string-match-p "done" txt)
                            ;; The result is folded into the body
                            (not (string-match-p "Compacted 174 history items" txt))
                            state
                            (equal (map-elt state :body) "Compacted 174 history items")
-                           (map-elt state :collapsed)
-                           ;; done stopped the spinner (hash cleared + no leftover timer)
-                           (null (gethash "pfx1" dsh-emacs--command-spinners)))))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
-
-(ert-deftest dsh-emacs-test-command-command-spinner-starts ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-spin*"))
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 30)
-             (data . ((commandId . "spin1") (name . "goal")))))
-          ;; run started the animation: the timer is running
-          (ert-info ((format "%s" "command-spinner-starts"))
-            (should (and (gethash "spin1" dsh-emacs--command-spinners)
-                         (timerp (nth 1 (gethash "spin1" dsh-emacs--command-spinners))))))
-          ;; Push 2 frames manually: the index advances and the label changes frame (timers
-          ;; do not fire automatically in batch)
-          (dsh-emacs--command-spinner-tick (current-buffer) "spin1")
-          (dsh-emacs--command-spinner-tick (current-buffer) "spin1")
-          (ert-info ((format "%s" "command-spinner-advances"))
-            (should (= 2 (nth 2 (gethash "spin1" dsh-emacs--command-spinners)))))
-          ;; done stops the clock: hash cleared
-          (dsh-emacs-render-event
-           '((type . "command/done") (seq . 31)
-             (data . ((commandId . "spin1") (kind . "success")
-                      (text . "ok")))))
-          (ert-info ((format "%s" "command-spinner-done-stops"))
-            (should (null (gethash "spin1" dsh-emacs--command-spinners)))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
-
-(ert-deftest dsh-emacs-test-command-command-spinner-clear-all ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-clear*"))
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 40)
-             (data . ((commandId . "clear1") (name . "goal") (args . "")))))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 41)
-             (data . ((commandId . "clear2") (name . "goal") (args . "")))))
-          (dsh-emacs--command-spinner-clear-all)
-          (ert-info ((format "%s" "command-spinner-clear-all"))
-            (should (= 0 (hash-table-count dsh-emacs--command-spinners)))))
-      (setq dsh-emacs--command-spinners old-spinners)
+                           (map-elt state :collapsed))))))
       (kill-buffer buf))))
 
 ;; --- Test 98c: a running command row matches a tool row --- header line pending
 ;; coloring ---
 (ert-deftest dsh-emacs-test-command-command-running-tints-header ()
   :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-tint*"))
-        (old-spinners dsh-emacs--command-spinners))
+  (let ((buf (generate-new-buffer " *dsh-cmd-tint*")))
     (unwind-protect
         (with-current-buffer buf
           (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
           (dsh-emacs-render-event
            '((type . "command/run") (seq . 60)
              (data . ((commandId . "tint1") (name . "goal")))))
@@ -492,36 +500,54 @@
                                        (ensure-list (get-text-property pos 'face))))
                                (number-sequence (car blk) (1- (cdr blk)))))))
             (ert-info ((format "%s" "command-running-tints-header"))
-              (should tinted)))
-          ;; The spinner tick rebuilds the whole line on every frame; the coloring must not
-          ;; be lost
-          (dsh-emacs--command-spinner-tick (current-buffer) "tint1")
+              (should tinted))))
+      (kill-buffer buf))))
+
+(ert-deftest dsh-emacs-test-command-simple-render-style-keeps-row-neutral ()
+  :tags '(dsh-unit)
+  (let ((buf (generate-new-buffer " *dsh-cmd-neutral*"))
+        (dsh-emacs-render-style 'simple))
+    (unwind-protect
+        (with-current-buffer buf
+          (dsh-emacs-mode)
+          (dsh-emacs-render-event
+           '((type . "command/run") (seq . 61)
+             (data . ((commandId . "plain1") (name . "goal")))))
+          (dsh-emacs-render-event
+           '((type . "command/done") (seq . 62)
+             (data . ((commandId . "plain1") (kind . "success")
+                      (text . "ok")))))
           (let* ((ns (dsh-emacs-render--make-namespace))
-                 (block-id "cmd-tint1")
-                 (blk (dsh-emacs-ui-find-block ns block-id)))
-            (ert-info ((format "%s" "command-running-tint-survives-tick"))
-              (should (and blk
-                           (seq-every-p
-                            (lambda (pos)
-                              (memq 'dsh-emacs-tool-pending-face
-                                    (ensure-list (get-text-property pos 'face))))
-                            (number-sequence (car blk) (1- (cdr blk)))))))))
-      (setq dsh-emacs--command-spinners old-spinners)
+                 (blk (dsh-emacs-ui-find-block ns "cmd-plain1")))
+            (ert-info ((format "%s" "command-simple-render-style-keeps-row-neutral"))
+              (should blk)
+              (let* ((start (car blk))
+                     (text (buffer-substring-no-properties start (cdr blk)))
+                     (title (ensure-list (get-text-property (+ start 2) 'face)))
+                     (status (+ start (string-match "✓ done" text)))
+                     (status-faces (ensure-list (get-text-property status 'face))))
+                (should (string-match-p "● Goal" text))
+                (should (memq 'dsh-emacs-tool-success-face
+                              (ensure-list (get-text-property start 'face))))
+                (should (memq 'dsh-emacs-event-row-face title))
+                (should-not (memq 'dsh-emacs-tool-title-face title))
+                (should-not (memq 'dsh-emacs-tool-success-face title))
+                (should (memq 'dsh-emacs-timestamp-face status-faces))
+                (should-not (memq 'dsh-emacs-tool-success-face
+                                  status-faces))))))
       (kill-buffer buf))))
 
 ;; --- Test 98d: an optimistic command row also carries header line pending
 ;; coloring ---
 (ert-deftest dsh-emacs-test-command-command-optimistic-tints-header ()
   :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-opt-tint*"))
-        (old-spinners dsh-emacs--command-spinners))
+  (let ((buf (generate-new-buffer " *dsh-cmd-opt-tint*")))
     (unwind-protect
         (with-current-buffer buf
           (dsh-emacs-mode)
           (let ((dsh-emacs-show-commands t)
                 (dsh-emacs--command-blocks (make-hash-table :test 'equal))
-                (dsh-emacs--pending-command nil)
-                (dsh-emacs--command-spinners (make-hash-table :test 'equal)))
+                (dsh-emacs--pending-command nil))
             (dsh-emacs-render-command-optimistic "/compact")
             (let* ((entry (gethash "pending-compact" dsh-emacs--command-blocks))
                    (blk (and entry
@@ -533,160 +559,47 @@
                                 (memq 'dsh-emacs-tool-pending-face
                                       (ensure-list (get-text-property pos 'face))))
                               (number-sequence (car blk) (1- (cdr blk))))))))))
-      (setq dsh-emacs--command-spinners old-spinners)
       (kill-buffer buf))))
 
-;; --- Test 98e: the leading icon of a command row is the bash terminal (same as
-;; tool rows) ---
-(ert-deftest dsh-emacs-test-command-command-leading-icon-is-bash ()
+;; --- Test 98e: the leading glyph of a command row is the bash fallback dot
+;; (or its SVG on a graphical display) ---
+(ert-deftest dsh-emacs-test-command-command-leading-glyph-is-dot ()
   :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-bash-icon*"))
-        (old-spinners dsh-emacs--command-spinners))
+  (let ((buf (generate-new-buffer " *dsh-cmd-bash-icon*")))
     (unwind-protect
         (with-current-buffer buf
           (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
           (dsh-emacs-render-event
            '((type . "command/run") (seq . 70)
              (data . ((commandId . "bash1") (name . "goal")))))
           (let ((txt (buffer-string)))
-            (ert-info ((format "%s" "command-leading-icon-is-bash"))
-              (should (string-match-p "💻" txt))))
-          ;; The bash icon is still kept after done
-          (dsh-emacs--command-spinner-tick (current-buffer) "bash1")
+            (ert-info ((format "%s" "command-leading-dot-is-bash-fallback"))
+              (should (string-match-p "\n● goal" txt))))
+          ;; The leading dot is still kept after done
           (dsh-emacs-render-event
            '((type . "command/done") (seq . 71)
              (data . ((commandId . "bash1") (kind . "success")
                       (text . "ok")))))
           (let ((txt (buffer-string)))
-            (ert-info ((format "%s" "command-done-keeps-bash-icon"))
-              (should (string-match-p "💻" txt)))))
-      (setq dsh-emacs--command-spinners old-spinners)
+            (ert-info ((format "%s" "command-done-keeps-leading-dot"))
+              (should (string-match-p "\n● goal" txt)))))
       (kill-buffer buf))))
 
-;; In batch (non-graphical) the icon table gives a bash emoji fallback; the SVG
-;; template exists for GUI rendering
-(ert-deftest dsh-emacs-test-command-command-bash-icon-emoji-fallback ()
+;; A non-graphical display falls back to one tool-accent dot even when Emacs
+;; has SVG image support; the SVG template exists for GUI rendering.
+(ert-deftest dsh-emacs-test-command-command-bash-icon-dot-fallback ()
   :tags '(dsh-unit)
-  (ert-info ((format "%s" "command-bash-icon-emoji-fallback"))
-    (should (equal (cdr (assoc "bash" dsh-emacs--variant-icons)) "💻"))))
+  (ert-info ((format "%s" "command-bash-icon-dot-fallback"))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) nil))
+              ((symbol-function 'image-type-available-p) (lambda (&rest _) t)))
+      (let ((icon (dsh-emacs-render--tool-icon "bash")))
+        (should (equal "●" (substring-no-properties icon)))
+        (should-not (get-text-property 0 'display icon))))))
 
 (ert-deftest dsh-emacs-test-command-command-bash-icon-svg-template ()
   :tags '(dsh-unit)
   (ert-info ((format "%s" "command-bash-icon-svg-template"))
     (should (assoc "bash" dsh-emacs--tool-icon-svgs))))
-
-;; --- Test 98f: after a stream reconnect (disconnect+connect) revive a command
-;; spinner that is still running ---
-(ert-deftest dsh-emacs-test-command-command-spinner-revive-clear-all ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-revive*"))
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 50)
-             (data . ((commandId . "rv1") (name . "goal")))))
-          ;; Simulate disconnect (reconnect/switch session) clearing all animations
-          (dsh-emacs--command-spinner-clear-all)
-          (ert-info ((format "%s" "command-spinner-revive-clear-all"))
-            (should (= 0 (hash-table-count dsh-emacs--command-spinners))))
-          ;; connect revives it: the row is still there in the same chat buffer and the
-          ;; status is still pending
-          (dsh-emacs--command-spinner-revive)
-          (ert-info ((format "%s" "command-spinner-revive-restarts"))
-            (should (and (gethash "rv1" dsh-emacs--command-spinners)
-                         (timerp (nth 1 (gethash "rv1" dsh-emacs--command-spinners))))))
-          ;; After revival it advances frames as usual
-          (dsh-emacs--command-spinner-tick (current-buffer) "rv1")
-          (dsh-emacs--command-spinner-tick (current-buffer) "rv1")
-          (ert-info ((format "%s" "command-spinner-revive-advances"))
-            (should (= 2 (nth 2 (gethash "rv1" dsh-emacs--command-spinners))))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
-
-;; done already replaced the row with the success color (status != tool-pending):
-;; revival must not restart it
-(ert-deftest dsh-emacs-test-command-command-spinner-revive-skips-settled ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-revive-done*"))
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 52)
-             (data . ((commandId . "rv2") (name . "goal")))))
-          (dsh-emacs-render-event
-           '((type . "command/done") (seq . 53)
-             (data . ((commandId . "rv2") (kind . "success")
-                      (text . "ok")))))
-          (dsh-emacs--command-spinner-clear-all)
-          (dsh-emacs--command-spinner-revive)
-          (ert-info ((format "%s" "command-spinner-revive-skips-settled"))
-            (should (null (gethash "rv2" dsh-emacs--command-spinners)))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
-
-;; The row has already been deleted (the entry remains): revival must not restart
-;; the animation
-(ert-deftest dsh-emacs-test-command-command-spinner-revive-skips-missing-block ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-revive-gone*"))
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs-render-event
-           '((type . "command/run") (seq . 54)
-             (data . ((commandId . "rv3") (name . "goal")))))
-          (when-let* ((entry (gethash "rv3" dsh-emacs--command-blocks))
-                      (ns (nth 0 entry))
-                      (block-id (nth 1 entry))
-                      (blk (dsh-emacs-ui-find-block ns block-id)))
-            (let ((inhibit-read-only t))
-              (delete-region (car blk) (cdr blk))))
-          (dsh-emacs--command-spinner-clear-all)
-          (dsh-emacs--command-spinner-revive)
-          (ert-info ((format "%s" "command-spinner-revive-skips-missing-block"))
-            (should (null (gethash "rv3" dsh-emacs--command-spinners)))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
-
-;; 98f2: events-connect (which reconnects also go through) really calls revive
-(ert-deftest dsh-emacs-test-command-command-spinner-revive-wired-in-connect ()
-  :tags '(dsh-unit)
-  (let ((buf (generate-new-buffer " *dsh-cmd-connect-revive*"))
-        (revives 0)
-        (old-spinners dsh-emacs--command-spinners))
-    (unwind-protect
-        (with-current-buffer buf
-          (dsh-emacs-mode)
-          (setq dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (cl-letf (((symbol-function 'open-network-stream)
-                     (lambda (&rest _) (prog1 :fake-proc)))
-                    ((symbol-function 'set-process-query-on-exit-flag)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'set-process-coding-system)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'process-put)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'set-process-filter)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'set-process-sentinel)
-                     (lambda (&rest _) nil))
-                    ((symbol-function 'dsh-emacs--command-spinner-revive)
-                     (lambda () (setq revives (1+ revives)))))
-            (dsh-emacs-events-connect buf)
-            (dsh-emacs-events--health-stop))
-          (ert-info ((format "%s" "command-spinner-revive-wired-in-connect"))
-            (should (> revives 0))))
-      (setq dsh-emacs--command-spinners old-spinners)
-      (kill-buffer buf))))
 
 ;; --- Test 98a: optimistic command row rendering ---
 (ert-deftest dsh-emacs-test-command-command-optimistic-creates-temp-entry ()
@@ -697,8 +610,7 @@
           (dsh-emacs-mode)
           (let ((dsh-emacs-show-commands t)
                 (dsh-emacs--command-blocks (make-hash-table :test 'equal))
-                (dsh-emacs--pending-command nil)
-                (dsh-emacs--command-spinners (make-hash-table :test 'equal)))
+                (dsh-emacs--pending-command nil))
             (dsh-emacs-render-command-optimistic "/compact")
             ;; temp entry stored in command-blocks
             (let ((entry (gethash "pending-compact"
@@ -715,78 +627,63 @@
   (with-temp-buffer
     (dsh-emacs-mode)
     (setq-local dsh-emacs-show-commands t)
-    (unwind-protect
-        (let ((ns (dsh-emacs-render--make-namespace)))
-          (dsh-emacs-render-command-optimistic "/compact")
-          (should (gethash "pending-compact" dsh-emacs--command-blocks))
-          (should (gethash "pending-compact" dsh-emacs--command-spinners))
-          (should (dsh-emacs-ui-find-block ns "cmd-pending-compact"))
-          (should (= 10 (dsh-emacs-render-event
-                         '((type . "command/run") (seq . 10)
-                           (data . ((commandId . "real-123")
-                                    (name . "/compact") (args . "")))))))
-          (should-not (gethash "pending-compact" dsh-emacs--command-blocks))
-          (should-not (gethash "pending-compact" dsh-emacs--command-spinners))
-          (should-not (dsh-emacs-ui-find-block ns "cmd-pending-compact"))
-          (should-not dsh-emacs--pending-command)
-          (should (gethash "real-123" dsh-emacs--command-blocks))
-          (should (gethash "real-123" dsh-emacs--command-spinners))
-          ;; Settlement keeps the run's label, even if done carries another.
-          (should (= 11 (dsh-emacs-render-event
-                         '((type . "command/done") (seq . 11)
-                           (data . ((commandId . "real-123")
-                                    (name . "unrelated") (kind . "error")
-                                    (text . "Command rejected")))))))
-          (should-not (gethash "real-123" dsh-emacs--command-spinners))
-          (let* ((block (dsh-emacs-ui-find-block ns "cmd-real-123"))
-                 (state (get-text-property (car block) 'dsh-emacs-ui-state)))
-            (should (string-match-p "compact" (map-elt state :label-left)))
-            (should-not (string-match-p "unrelated" (buffer-string)))
-            (should (eq 'tool-error (map-elt state :status)))
-            (should (equal "Command rejected" (map-elt state :body)))
-            (should (map-elt state :collapsed)))
-          (should (= 11 dsh-emacs--anchor-seq)))
-      (dsh-emacs--command-spinner-clear-all))))
+    (let ((ns (dsh-emacs-render--make-namespace)))
+      (dsh-emacs-render-command-optimistic "/compact")
+      (should (gethash "pending-compact" dsh-emacs--command-blocks))
+      (should (dsh-emacs-ui-find-block ns "cmd-pending-compact"))
+      (should (= 10 (dsh-emacs-render-event
+                     '((type . "command/run") (seq . 10)
+                       (data . ((commandId . "real-123")
+                                (name . "/compact") (args . "")))))))
+      (should-not (gethash "pending-compact" dsh-emacs--command-blocks))
+      (should-not (dsh-emacs-ui-find-block ns "cmd-pending-compact"))
+      (should-not dsh-emacs--pending-command)
+      (should (gethash "real-123" dsh-emacs--command-blocks))
+      ;; Settlement keeps the run's label, even if done carries another.
+      (should (= 11 (dsh-emacs-render-event
+                     '((type . "command/done") (seq . 11)
+                       (data . ((commandId . "real-123")
+                                (name . "unrelated") (kind . "error")
+                                (text . "Command rejected")))))))
+      (let* ((block (dsh-emacs-ui-find-block ns "cmd-real-123"))
+             (state (get-text-property (car block) 'dsh-emacs-ui-state)))
+        (should (string-match-p "compact" (map-elt state :label-left)))
+        (should-not (string-match-p "unrelated" (buffer-string)))
+        (should (eq 'tool-error (map-elt state :status)))
+        (should (equal "Command rejected" (map-elt state :body)))
+        (should (map-elt state :collapsed)))
+      (should (= 11 dsh-emacs--anchor-seq)))))
 
 (ert-deftest dsh-emacs-test-command-ignored-events-preserve-pending-row ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
     (setq-local dsh-emacs-show-commands t)
-    (unwind-protect
-        (progn
-          (dsh-emacs-render-command-optimistic "/compact")
-          (let ((before (buffer-string))
-                (pending dsh-emacs--pending-command)
-                (spinner (gethash "pending-compact"
-                                  dsh-emacs--command-spinners)))
-            (should pending)
-            (should spinner)
-            (let ((dsh-emacs-show-commands nil))
-              (should (= 11 (dsh-emacs-render-event
-                             '((type . "command/run") (seq . 11)
-                               (data . ((commandId . "hidden")
-                                        (name . "goal")))))))
-              (should (= 12 (dsh-emacs-render-event
-                             '((type . "command/done") (seq . 12)
-                               (data . ((commandId . "pending-compact")
-                                        (kind . "error") (text . "Hidden"))))))))
-            ;; Missing ids and unmatched results are consumed without a row.
-            (should (= 13 (dsh-emacs-render-event
-                           '((type . "command/run") (seq . 13)
-                             (data . ((name . "goal")))))))
-            (should (= 14 (dsh-emacs-render-event
-                           '((type . "command/done") (seq . 14)
-                             (data . ((commandId . "missing")
-                                      (kind . "error") (text . "Orphan")))))))
-            (should (equal before (buffer-string)))
-            (should (eq pending dsh-emacs--pending-command))
-            (should (eq spinner (gethash "pending-compact"
-                                        dsh-emacs--command-spinners)))
-            (should (= 1 (hash-table-count dsh-emacs--command-blocks)))
-            (should (= 1 (hash-table-count dsh-emacs--command-spinners)))
-            (should (= 14 dsh-emacs--anchor-seq))))
-      (dsh-emacs--command-spinner-clear-all))))
+    (dsh-emacs-render-command-optimistic "/compact")
+    (let ((before (buffer-string))
+          (pending dsh-emacs--pending-command))
+      (should pending)
+      (let ((dsh-emacs-show-commands nil))
+        (should (= 11 (dsh-emacs-render-event
+                       '((type . "command/run") (seq . 11)
+                         (data . ((commandId . "hidden")
+                                  (name . "goal")))))))
+        (should (= 12 (dsh-emacs-render-event
+                       '((type . "command/done") (seq . 12)
+                         (data . ((commandId . "pending-compact")
+                                  (kind . "error") (text . "Hidden"))))))))
+      ;; Missing ids and unmatched results are consumed without a row.
+      (should (= 13 (dsh-emacs-render-event
+                     '((type . "command/run") (seq . 13)
+                       (data . ((name . "goal")))))))
+      (should (= 14 (dsh-emacs-render-event
+                     '((type . "command/done") (seq . 14)
+                       (data . ((commandId . "missing")
+                                (kind . "error") (text . "Orphan")))))))
+      (should (equal before (buffer-string)))
+      (should (eq pending dsh-emacs--pending-command))
+      (should (= 1 (hash-table-count dsh-emacs--command-blocks)))
+      (should (= 14 dsh-emacs--anchor-seq)))))
 
 (ert-deftest dsh-emacs-test-command-command-menu-hint-prompts-args ()
   :tags '(dsh-unit)

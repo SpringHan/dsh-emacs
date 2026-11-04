@@ -11,7 +11,7 @@ packages.
 
 https://github.com/user-attachments/assets/9ee9fc66-1997-49b7-a921-5753690edafa
 
-dsh-emacs **0.7.0** is compatible with **dsh 0.2.1-rc.2**, the
+dsh-emacs **0.8.0** is compatible with **dsh 0.2.1-rc.2**, the
 [latest upstream release](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.1-rc.2)
 as of **2026-10-18** (npm `next`; npm `latest` still points to 0.2.0-rc.2).
 The client includes compatibility fixes for the **dsh 0.2.1 protocol**:
@@ -51,14 +51,20 @@ before connecting. A `use-package` example is in
 
 ## Using it
 
-`M-x dsh-emacs` lists sessions by workspace. Press `RET` to open a session,
-`c` to create one, and `TAB` to fold a workspace or expand available subagents.
+`M-x dsh-emacs` opens the session list with **Recents** first: the 15 most
+recently updated visible sessions with workspace labels, followed by their
+usual workspace groups.
+Set `dsh-emacs-session-recents-limit` to change the count (zero hides Recents).
+Set `dsh-emacs-session-recents-show-workspace` to nil to hide workspace labels.
+Press `RET` to open a session, `c` to create one, and `TAB` to fold a group
+or expand available subagents.
 From a local project, the command locates its existing workspace; from a chat,
 it locates that session. New sessions open an editable draft while connecting.
 Opening an existing session in a fresh chat buffer completes only the latest
-round, fetching extra pages for a long round without moving your draft cursor.
-`C-c C-o` cancels an in-progress history load; once finished, it loads 3 earlier
-rounds by default (`dsh-emacs-history-rounds`). Switching back to a live chat
+human round (a turn with a user-authored message), fetching extra pages for a
+long round without moving your draft cursor. `C-c C-o` cancels an in-progress
+history load; once finished, it loads 3 earlier user+assistant rounds by
+default (`dsh-emacs-history-rounds`). Switching back to a live chat
 preserves it.
 
 The PTC mode preset ID is now `ptc`. If your configuration sets
@@ -75,14 +81,14 @@ theme's `shadow` face (grey by default); running session dots are orange.
 | `C-c C-c` | Send; while busy, queue input or interrupt if input and attachments are empty |
 | `C-u C-c C-c` | Steer the running turn (default configuration) |
 | `C-c C-b` | Interrupt the running turn |
-| `C-c C-q` / `C-c C-j` | Manage pending messages / background jobs |
+| `C-c C-q` / `C-c C-j` | [Manage pending messages / background jobs](docs/customization.md#queue-and-job-menus) |
 | `C-c C-m` / `C-c C-e` | Select a model / change reasoning effort |
 | `C-c C-a` | Stage a file; repeat to add more |
 | `C-c C-v` / `C-c C-d` | Paste a clipboard image / discard staged attachments |
-| `C-c C-o` | Load 3 earlier rounds; prefix chooses the count; press again to cancel |
+| `C-c C-o` | Load 3 earlier user+assistant rounds; prefix chooses the count; press again to cancel |
 | `C-c >` | Return to the draft and follow new output |
 | `C-c C-w` / `C-c C-y` | Copy content / fork through the assistant reply at point |
-| `C-c C-l` | Return to the session list |
+| `C-c C-l` | Locate this session in the list ([jump preference](docs/customization.md#renaming-and-grouping)) |
 | `C-c C-s` / `C-c M-s` | Switch sessions in this workspace / across all workspaces |
 | `C-c C-r` | Refresh the chat |
 | `M-p` / `M-n` | Recall previous / next input |
@@ -108,6 +114,9 @@ See [Web folding rules and remaining differences](docs/web-folding.md).
 Visible chat windows follow new output independently while their cursors and
 views stay near the draft, preserving each editing position. Windows reading
 older messages stay put; `C-c >` returns that window to the draft and following.
+Typing from the read-only transcript jumps to the composer; extend
+`dsh-emacs-composer-typing-commands` for a mode-specific editing command
+(see [Customization](docs/customization.md#typing-from-the-transcript)).
 
 The 0.7.0 release removes `dsh-emacs-group-consecutive-tools` and
 `dsh-emacs-assistant-divider`; both are deleted, so remove any remaining
@@ -168,8 +177,9 @@ queue.
 The default busy-send behavior is configurable with
 `dsh-emacs-busy-enter-behavior`.
 
-`M-x dsh-emacs-list-subagents` opens child conversations; `M-,` returns to the
-originating position. Continuable children accept follow-up input, while
+`M-,` returns to the originating position after opening files, sessions,
+plans, images or job output. `M-x dsh-emacs-list-subagents` opens child
+conversations. Continuable children accept follow-up input, while
 one-shot children are read-only. See [Subagents](docs/subagents.md).
 
 Agent questions use your normal minibuffer completion. Pick an option or type
@@ -188,6 +198,11 @@ Doom keeps its static whale logo and existing layout.
 Completed replies show Copy, Fork and tokens together on the left, in order.
 Elapsed time appears in the compact Completed disclosure above the answer; add `duration` to
 `dsh-emacs-reply-footer-items` to also show it in the footer.
+
+Transcript event rows follow `dsh-emacs-render-style`: `full` (the
+default) draws dsh-web's SVG icons where Emacs can, while `simple` leads every
+event row with one compact dot (state-colored where the row carries state) and
+mutes the rest of the row.
 
 See [Mode line](docs/modeline.md),
 [Reply footer](docs/customization.md#reply-footer), and

@@ -294,13 +294,14 @@
 (ert-deftest dsh-emacs-test-composer-composer-goal-row-leads-with-svg-icon ()
   :tags '(dsh-unit)
   (skip-unless (image-type-available-p 'svg))
-  (with-temp-buffer
-    (dsh-emacs-mode)
-    (dsh-emacs-composer-set-goal
-     (dsh-protocol-goal-projection--from-alist
-      '((goal . ((objective . "Icon lead") (phase . "active"))))))
-    (let ((beg (marker-position dsh-emacs--composer-top-marker)))
-      (should (eq 'image (car-safe (get-text-property beg 'display)))))))
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t)))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (dsh-emacs-composer-set-goal
+       (dsh-protocol-goal-projection--from-alist
+        '((goal . ((objective . "Icon lead") (phase . "active"))))))
+      (let ((beg (marker-position dsh-emacs--composer-top-marker)))
+        (should (eq 'image (car-safe (get-text-property beg 'display))))))))
 
 ;; --- Composer Goal Row: ellipsize long objectives to one line ---
 (ert-deftest dsh-emacs-test-composer-composer-goal-fit-objective-ellipsizes ()
@@ -1152,7 +1153,8 @@
                          'dsh-emacs-goal-edit)
                      (get-text-property edit-pos 'mouse-face)
                      ;; SVG uses a display image; fallback text retains the same keymap.
-                     (if (image-type-available-p 'svg)
+                     (if (and (display-graphic-p)
+                              (image-type-available-p 'svg))
                          (get-text-property edit-pos 'display)
                        t)))))))
 
@@ -1197,6 +1199,21 @@
             (should (eq (default-value 'dsh-emacs-composer-goal-actions) default-before))
             (should (not (null (dsh-test-goal-row-edit-cell))))))
       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest dsh-emacs-test-composer-goal-action-fallbacks-avoid-emoji ()
+  :tags '(dsh-unit)
+  (ert-info ((format "%s" "goal-action-fallbacks-avoid-emoji"))
+    (should (equal "||" (car (dsh-emacs-composer--goal-action-spec 'pause))))
+    (should (equal "▶" (car (dsh-emacs-composer--goal-action-spec 'resume))))
+    (should (equal "✎" (car (dsh-emacs-composer--goal-action-spec 'edit))))
+    (should (equal "✕" (car (dsh-emacs-composer--goal-action-spec 'clear)))))
+  (ert-info ((format "%s" "queue-delete-fallback-is-x"))
+    (cl-letf (((symbol-function 'image-type-available-p) (lambda (_type) nil)))
+      (let ((cell (dsh-emacs-composer--next-cell
+                   (dsh-emacs-test--queue-item "q1" "queued" "Alpha")
+                   'delete)))
+        (should cell)
+        (should (string-prefix-p "✕" (substring-no-properties cell)))))))
 
 ;; --- Goal actions: toggling outside chat creates no local override ---
 (ert-deftest dsh-emacs-test-composer-goal-actions-toggle-outside-chat-errors-cleanly ()
@@ -1325,14 +1342,15 @@
 ;; Both SVGs must fit their backing text even in a frame with tiny cells.
 (ert-deftest dsh-emacs-test-composer-goal-svg-fits-reserved-columns ()
   :tags '(dsh-unit)
-  (cl-letf (((symbol-function 'image-type-available-p) (lambda (_type) t))
+  (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+            ((symbol-function 'image-type-available-p) (lambda (_type) t))
             ((symbol-function 'get-buffer-window-list) (lambda (&rest _args) nil))
             ((symbol-function 'frame-char-width) (lambda (&optional _frame) 5))
             ((symbol-function 'create-image)
              (lambda (_data _type _data-p &rest props) (cons 'image props))))
     (let* ((icon (dsh-emacs-composer--goal-icon))
            (action (dsh-emacs-composer--action-cell
-                    "⏸" dsh-emacs-composer--pause-svg
+                    "||" dsh-emacs-composer--pause-svg
                     'dsh-emacs-composer-goal-action-face
                     "Pause goal · C-c C-g p" #'dsh-emacs-goal-pause)))
       (ert-info ((format "%s" "goal-svg-fits-reserved-columns"))

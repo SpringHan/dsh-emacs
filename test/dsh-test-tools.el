@@ -156,21 +156,21 @@ Lets a test drive a malformed content value through the result path."
       (should (equal state
                      (dsh-emacs-render--tool-state "ordinary"))))))
 
-(ert-deftest dsh-emacs-test-tools-tool-running-keeps-variant-icon ()
+(ert-deftest dsh-emacs-test-tools-tool-running-keeps-leading-glyph ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
     (dsh-emacs-modeline-setup)
     (setq-local dsh-emacs-tool-expand-by-default t)
-    ;; 1) tool call (running): keeps the bash variant icon + gear loading
+    ;; 1) tool call (running): keeps the leading dot + gear loading
     (dsh-emacs-render-tool-call
      (dsh-emacs-test--tool-call-event 1 "c1" "bash" "{\"description\":\"list files\",\"command\":\"ls -la\"}"))
     (let* ((ns (dsh-emacs-render--make-namespace))
            (block (dsh-emacs-test--tool-block-text ns "tool-c1")))
-      (ert-info ((format "%s" "tool-running-keeps-variant-icon"))
+      (ert-info ((format "%s" "tool-running-keeps-leading-glyph"))
         (should (and block
-                     (string-match-p (regexp-quote "💻 ") block)
-                     ;; Keeps the variant icon while running; the animated spinner moved to the
+                     (string-match-p (regexp-quote "● ") block)
+                     ;; Keeps the leading glyph while running; the animated spinner moved to the
                      ;; mode-line progress bar
                      (string-match-p "Bash" block)))))
     ;; 2) successful result: bash expands into a terminal card ($ prompt line +
@@ -181,7 +181,7 @@ Lets a test drive a malformed content value through the result path."
            (block (dsh-emacs-test--tool-block-text ns "tool-c1")))
       (ert-info ((format "%s" "tool-bash-success-terminal-card"))
         (should (and block
-                     (string-match-p (regexp-quote "💻 ") block)
+                     (string-match-p (regexp-quote "● ") block)
                      (string-match-p (regexp-quote "$ ls -la") block)
                      (string-match-p "drwxr-xr-x" block)
                      (not (string-match-p (regexp-quote "✓ exit 0") block))
@@ -206,6 +206,98 @@ Lets a test drive a malformed content value through the result path."
         (should (and block
                      (string-match-p (regexp-quote "● ") block)
                      (string-match-p "segmentation fault" block)))))))
+
+(ert-deftest dsh-emacs-test-tools-simple-render-style-uses-dots ()
+  :tags '(dsh-unit)
+  (ert-info ((format "%s" "render-style-defaults-to-full"))
+    (should (eq 'full dsh-emacs-render-style)))
+  (let ((dsh-emacs-render-style 'full))
+    (ert-info ((format "%s" "full-style-falls-back-to-dot-without-svg"))
+      (should (equal "●" (substring-no-properties
+                           (dsh-emacs-render--tool-icon "bash"))))
+      (should (equal "✶" (substring-no-properties
+                           (dsh-emacs-render--think-icon))))))
+  (ert-info ((format "%s" "simple-suppresses-svg-on-graphics"))
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda (&rest _) t))
+              ((symbol-function 'image-type-available-p) (lambda (&rest _) t))
+              ((symbol-function 'create-image) (lambda (&rest _) '(:test-svg))))
+      (let ((dsh-emacs-render-style 'full))
+        (should (get-text-property 0 'display
+                                   (dsh-emacs-render--tool-icon "bash"))))
+      (let ((dsh-emacs-render-style 'simple))
+        (should-not (get-text-property 0 'display
+                                       (dsh-emacs-render--tool-icon "bash"))))))
+  (let ((dsh-emacs-render-style 'simple))
+    (let ((icon (dsh-emacs-render--tool-icon "bash")))
+      (ert-info ((format "%s" "simple-tool-icon-is-one-dot"))
+        (should (equal "●" (substring-no-properties icon)))
+        (should (eq 'dsh-emacs-tool-icon-face
+                    (get-text-property 0 'face icon)))
+        (should-not (get-text-property 0 'display icon))))
+    (ert-info ((format "%s" "simple-tool-leading-colors-states"))
+      (dolist (entry '((pending . dsh-emacs-tool-icon-face)
+                       (success . dsh-emacs-tool-success-face)
+                       (error . dsh-emacs-tool-error-face)
+                       (stopped . dsh-emacs-tool-stopped-face)))
+        (let ((leading (dsh-emacs-render--tool-leading "ignored" (car entry))))
+          (should (equal "● " (substring-no-properties leading)))
+          (should (eq (cdr entry)
+                      (get-text-property 0 'face leading))))))
+    (ert-info ((format "%s" "simple-row-icons-are-dots"))
+      (let ((think (dsh-emacs-render--think-icon))
+            (todo (dsh-emacs-render--todo-icon))
+            (turn (dsh-emacs-render--turn-trigger-icon))
+            (goal (dsh-emacs-render--goal-trigger-icon)))
+        (dolist (entry `((,think . dsh-emacs-thinking-face)
+                         (,todo . dsh-emacs-tool-icon-face)
+                         (,turn . dsh-emacs-meta-face)
+                         (,goal . dsh-emacs-composer-goal-face)))
+          (should (equal "●" (substring-no-properties (car entry))))
+          (should (eq (cdr entry)
+                      (get-text-property 0 'face (car entry)))))))
+    (ert-info ((format "%s" "simple-row-chrome-is-neutral-and-muted"))
+      (should (facep 'dsh-emacs-event-row-face))
+      (should (equal '(bold dsh-emacs-event-row-face)
+                     (dsh-emacs-render--row-label-face 'dsh-emacs-thinking-face)))
+      (should (eq 'dsh-emacs-event-row-face
+                  (dsh-emacs-render--row-chrome-face
+                   'dsh-emacs-tool-success-face)))
+      (let ((dsh-emacs-render-style 'full))
+        (should (eq 'dsh-emacs-thinking-face
+                    (dsh-emacs-render--row-label-face 'dsh-emacs-thinking-face)))
+        (should (eq 'dsh-emacs-tool-success-face
+                    (dsh-emacs-render--row-chrome-face
+                     'dsh-emacs-tool-success-face)))))
+    (with-temp-buffer
+      (dsh-emacs-mode)
+      (dsh-emacs-modeline-setup)
+      (setq-local dsh-emacs-show-tool-calls t)
+      (dsh-emacs-render-tool-call
+       (dsh-emacs-test--tool-call-event
+        1 "s1" "bash" "{\"command\":\"true\"}"))
+      (let* ((ns (dsh-emacs-render--make-namespace))
+             (found (dsh-emacs-ui-find-block ns "tool-s1"))
+             (title-faces (and found (dsh-test--faces-at (+ (car found) 2))))
+             (block (and found
+                         (dsh-emacs-test--tool-block-text ns "tool-s1"))))
+        (ert-info ((format "%s" "simple-pending-tool-row-leads-with-dot"))
+          (should (and block (string-prefix-p "● Bash" block)))
+          (should (memq 'dsh-emacs-event-row-face title-faces))
+          (should-not (memq 'dsh-emacs-tool-title-face title-faces))
+          (should-not (memq 'dsh-emacs-tool-pending-face title-faces))))
+      (dsh-emacs-render-tool-result
+       (dsh-emacs-test--tool-result-event 2 "s1" nil 0 "done"))
+      (let* ((ns (dsh-emacs-render--make-namespace))
+             (found (dsh-emacs-ui-find-block ns "tool-s1"))
+             (faces (and found (dsh-test--faces-at (car found))))
+             (title-faces (and found (dsh-test--faces-at (+ (car found) 2))))
+             (block (and found
+                         (dsh-emacs-test--tool-block-text ns "tool-s1"))))
+        (ert-info ((format "%s" "simple-settled-tool-row-stays-a-success-dot"))
+          (should (and block (string-prefix-p "● Bash" block)))
+          (should (memq 'dsh-emacs-tool-success-face faces))
+          (should (memq 'dsh-emacs-event-row-face title-faces))
+          (should-not (memq 'dsh-emacs-tool-success-face title-faces)))))))
 
 ;; --- Test 29c: a file read expands into a line-numbered read card ---
 (ert-deftest dsh-emacs-test-tools-tool-read-card-numbers-the-window ()
@@ -944,7 +1036,7 @@ Lets a test drive a malformed content value through the result path."
       (ert-info ((format "%s" "tool-io-empty-args-hide-IN"))
         (should (not (string-match-p "^  IN" block))))
       (ert-info ((format "%s" "tool-generic-header-hides-empty-input"))
-        (should (string-match-p "✨ Tool Call · dev_injected_list$" header))
+        (should (string-match-p "● Tool Call · dev_injected_list$" header))
         (should (not (string-match-p "{}" header)))
         (should (string-match-p "^  OUT （无注入记录）$" block))))))
 
@@ -962,7 +1054,7 @@ Lets a test drive a malformed content value through the result path."
     (let ((block (dsh-emacs-test--tool-block-text
                   (dsh-emacs-render--make-namespace) "tool-g4")))
       (ert-info ((format "%s" "tool-known-variant-result-preview-summary"))
-        (should (string-match-p "🔍 Glob · alpha.md …" block))))))
+        (should (string-match-p "● Glob · alpha.md …" block))))))
 
 ;; --- Test 31d: a failed generic call keeps its status line above the block ---
 (ert-deftest dsh-emacs-test-tools-tool-io-failure-keeps-status-line ()
@@ -993,11 +1085,11 @@ Lets a test drive a malformed content value through the result path."
            (block (dsh-emacs-test--tool-block-text ns "tool-g1")))
       (ert-info ((format "%s" "tool-grep-title-distinct-from-search"))
         (should (and block
-                     (string-match-p "🔍 Grep" block)      ; magnifier icon + real tool name
+                     (string-match-p "● Grep" block)       ; leading dot + real tool name
                      (not (string-match-p "Search" block)) ; must no longer render as Search
                      (not (string-match-p "· Search" block))))))))
 
-(ert-deftest dsh-emacs-test-tools-tool-web-search-title-keeps-globe-icon ()
+(ert-deftest dsh-emacs-test-tools-tool-web-search-title-stays-distinct ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
@@ -1006,10 +1098,10 @@ Lets a test drive a malformed content value through the result path."
      (dsh-emacs-test--tool-call-event 1 "w1" "web_search" "{\"query\":\"cats\"}"))
     (let* ((ns (dsh-emacs-render--make-namespace))
            (block (dsh-emacs-test--tool-block-text ns "tool-w1")))
-      (ert-info ((format "%s" "tool-web-search-title-keeps-globe-icon"))
+      (ert-info ((format "%s" "tool-web-search-title-stays-distinct"))
         (should (and block
-                     (string-match-p "🌐 Web Search" block)
-                     (not (string-match-p "🌐 Search · cats" block))))))))
+                     (string-match-p "● Web Search" block)
+                     (not (string-match-p "● Search · cats" block))))))))
 
 ;; web_search's SVG icon is overridden to a globe (harness WebRow: globe for web
 ;; search, magnifier family for grep/glob), and it differs from the search
@@ -1038,7 +1130,7 @@ Lets a test drive a malformed content value through the result path."
            (block (dsh-emacs-test--tool-block-text ns "tool-u1"))
            (header (dsh-emacs-render--first-line block)))
       (ert-info ((format "%s" "tool-generic-header-is-tool-call-name"))
-        (should (string-match-p "✨ Tool Call · my_tool$" header))
+        (should (string-match-p "● Tool Call · my_tool$" header))
         (should (not (string-match-p "{\"x\"" header))))
       (ert-info ((format "%s" "tool-generic-input-only-when-expanded"))
         (should (string-match-p "^  IN  { \"x\": \"1\" }$" block))))))
@@ -1056,7 +1148,7 @@ Lets a test drive a malformed content value through the result path."
     (let* ((ns (dsh-emacs-render--make-namespace))
            (block (dsh-emacs-test--tool-block-text ns "tool-u2")))
       (ert-info ((format "%s" "tool-title-defcustom-override"))
-        (should (string-match-p "✨ Curated" block))
+        (should (string-match-p "● Curated" block))
         (should (not (string-match-p "Tool Call" block)))))))
 
 ;; --- Test 33: adjacent tool lines stack compactly (no extra blank lines) ---
@@ -1113,12 +1205,12 @@ Lets a test drive a malformed content value through the result path."
     (let* ((st (dsh-emacs-render--tool-state "c1"))
            (ns (plist-get st :ns))
            (block-id (dsh-emacs-render--tool-call-block-id "c1")))
-      ;; Initial render: the line starts with the variant icon (no spinner gear), no
+      ;; Initial render: the line starts with the leading dot (no spinner gear), no
       ;; trailing …
       (when-let* ((b (dsh-emacs-ui-find-block ns block-id)))
         (let ((txt (buffer-substring-no-properties (car b) (cdr b))))
           (ert-info ((format "%s" "running-tool-no-spinner"))
-            (should (and (string-match-p (regexp-quote "💻 ") txt)
+            (should (and (string-match-p (regexp-quote "● ") txt)
                          (not (string-match-p "⚙" txt))
                          (not (string-match-p "…" txt)))))))
       ;; After the tool completes the line still renders into the same block
@@ -1128,7 +1220,7 @@ Lets a test drive a malformed content value through the result path."
       (when-let* ((b (dsh-emacs-ui-find-block ns block-id)))
         (let ((txt (buffer-substring-no-properties (car b) (cdr b))))
           (ert-info ((format "%s" "tool-row-not-lost-after-result"))
-            (should (and (string-match-p (regexp-quote "💻 ") txt)
+            (should (and (string-match-p (regexp-quote "● ") txt)
                          (string-match-p (regexp-quote "$ ls -la") txt)
                          (string-match-p "drwxrwxr-x" txt)))))))))
 
@@ -1203,7 +1295,7 @@ Lets a test drive a malformed content value through the result path."
                  (tool-line
                   (save-excursion
                     (goto-char (point-min))
-                    (when (search-forward "💻 " nil t)
+                    (when (search-forward "● " nil t)
                       (line-number-at-pos (line-beginning-position))))))
             (ert-info ((format "%s" "tool-after-user-keeps-one-blank"))
               (should (and user-line tool-line (= tool-line (+ user-line 2)))))))

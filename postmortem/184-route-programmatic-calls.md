@@ -1,8 +1,8 @@
-# 156 — Programmatic route calls and generated code
+# 184 — Programmatic route calls and generated code
 
 ## Background
 
-`M-x dsh-emacs-plugin-routes` (record [155](155-http-route-proxy.md)) always
+`M-x dsh-emacs-plugin-routes` (record [183](183-http-route-proxy.md)) always
 prompted for the route group, target path and method, then delivered the raw
 response into a read-only buffer asynchronously. That is right for exploring a
 route, but useless when a user writes their own command around one route:

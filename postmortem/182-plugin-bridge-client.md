@@ -1,6 +1,6 @@
-# 154 — Plugin bridge client
+# 182 — Plugin bridge client
 
-_Status: Superseded in part by 155 (HTTP route proxy)._
+_Status: Superseded in part by 183 (HTTP route proxy)._
 
 ## Background
 
@@ -72,7 +72,7 @@ cover the bridge structs, argument readers, request shape, result rendering,
 command wiring, and both HTTP primitives.
 
 Docs: [Plugin bridge](../docs/plugins.md), the module map and transport notes
-in [architecture](../docs/architecture.md), and the `0.8.0` CHANGELOG entry.
+in [architecture](../docs/architecture.md), and the `0.9.0` CHANGELOG entry.
 
 ## Known limitations
 

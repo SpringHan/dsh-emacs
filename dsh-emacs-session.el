@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -20,7 +20,8 @@
 ;;     ● stray-session                             1d
 ;;
 ;; Each row shows a status dot, a title and a relative time; sessions are
-;; grouped by workspace.  The title is the session's auto summary
+;; grouped by workspace, with recent sessions repeated in a leading Recents
+;; group.  The title is the session's auto summary
 ;; (`projections.values.title', same as dsh web: condensed from the first
 ;; user message); a blank session shows "New Session".  Details appear in
 ;; the minibuffer via the `i' key.
@@ -32,7 +33,7 @@
 ;;
 ;; Keys:
 ;;   RET     open session
-;;   TAB     collapse/expand workspace or subagents
+;;   TAB     collapse/expand group or subagents
 ;;   c       new session
 ;;   r       rename session
 ;;   D       delete session (if the API supports it)
@@ -81,20 +82,14 @@
 (declare-function dsh-emacs-delete-workspace "dsh-emacs" (workspace-id))
 (declare-function dsh-emacs-move-workspace "dsh-emacs" (workspace-id before-workspace-id))
 (declare-function dsh-emacs-events-host-connect "dsh-emacs-events" ())
-(declare-function dsh-emacs-events-host-disconnect "dsh-emacs-events" ())
+(declare-function dsh-emacs-events--host-maybe-disconnect "dsh-emacs-events" ())
 
 ;; Defvars for cross-file caches owned by dsh-emacs.el, so native
 ;; compilation does not treat the reads as free-variable errors.
-(defvar dsh-emacs--sessions nil
-  "Cached session struct list (owned by dsh-emacs.el).")
-(defvar dsh-emacs--workspaces nil
-  "Cached workspace struct list (owned by dsh-emacs.el).")
-(defvar dsh-emacs--archived-sessions nil
-  "Archived session ids (owned by dsh-emacs.el).")
-(defvar dsh-emacs--current-session nil
-  "Globally active session (the last opened one); owned by dsh-emacs.el.
-Interactively resolve command targets through `dsh-emacs--active-session-id'
-(see the authoritative defvar in dsh-emacs.el).")
+(defvar dsh-emacs--sessions)
+(defvar dsh-emacs--workspaces)
+(defvar dsh-emacs--archived-sessions)
+(defvar dsh-emacs--current-session)
 ;; Declare-only forward forms for buffer-local filter state defined further
 ;; down (the header/render uses near the top precede their `defvar-local').
 (defvar dsh-emacs-session--filter-ws-id)
@@ -107,7 +102,7 @@ Interactively resolve command targets through `dsh-emacs--active-session-id'
 ;;; Buffer and mode
 ;;; ---------------------------------------------------------------------------
 
-(defvar dsh-emacs-sessions-buffer "*dsh-sessions*"
+(defvar dsh-emacs--sessions-buffer "*dsh-sessions*"
   "Buffer name for the session list.")
 
 (defvar-local dsh-emacs-session--auto-jump-session nil
@@ -132,7 +127,8 @@ command in the list cancels pending project and session targets.")
 
 (defvar-local dsh-emacs-session--row-cache nil
   "Visual rows emitted by the last successful render of this list buffer.
-Each id maps to (DISPLAY-INPUTS . ROW); no session or command metadata is
+Each row id maps to (DISPLAY-INPUTS . ROW); Recents titles use scoped ids.
+No session or command metadata is
 retained.  Every render replaces the table, dropping rows no longer visible.")
 
 (defvar dsh-emacs-session--previous-row-cache nil
@@ -173,10 +169,35 @@ active workspace filter)."
                  (number :tag "Seconds"))
   :group 'dsh-emacs)
 
+(defcustom dsh-emacs-session-recents-limit 15
+  "Maximum sessions in the first Recents group; zero hides the group.
+Sessions are ordered by their latest update, newest first, and remain
+listed in their workspace as well.  Recents is hidden while a workspace
+filter is active and otherwise follows the list's usual visibility rules."
+  :type 'natnum
+  :group 'dsh-emacs)
+
+(defcustom dsh-emacs-session-recents-show-workspace t
+  "Whether Recents rows prefix their titles with the workspace name.
+Untitled workspaces use their directory basename; unassigned sessions
+show Ungrouped.  Takes effect on the next session-list redraw."
+  :type 'boolean
+  :group 'dsh-emacs)
+
+(defcustom dsh-emacs-session-jump-target 'recents
+  "Preferred occurrence of the active session when opening the list.
+With `recents', jump to Recents when present, otherwise its workspace.
+With `workspace', always jump to its workspace (or Ungrouped) row.
+Explicit project navigation and plain refreshes are unaffected."
+  :type '(choice (const :tag "Recents, then workspace" recents)
+                 (const :tag "Workspace" workspace))
+  :group 'dsh-emacs)
+
 (defcustom dsh-emacs-workspaces-collapsed-by-default nil
   "Whether workspace groups start collapsed in the session list.
-This applies to real workspaces and the Ungrouped bucket.  `TAB' or `RET'
-on a group header overrides the default for the current session-list
+This applies to real workspaces and the Ungrouped bucket; Recents starts
+expanded.  `TAB' or `RET' on a group header overrides the default for the
+current session-list
 buffer; `dsh-emacs-collapse-workspaces' and
 `dsh-emacs-expand-workspaces' change all groups in that buffer."
   :type 'boolean
@@ -200,7 +221,10 @@ buffer; `dsh-emacs-collapse-workspaces' and
   (add-hook 'kill-buffer-hook #'dsh-emacs-session--auto-refresh-stop nil t)
   (dsh-emacs-session--auto-refresh-start)
   (dsh-emacs-events-host-connect)
-  (add-hook 'kill-buffer-hook #'dsh-emacs-events-host-disconnect nil t)
+  ;; The core stream is client-wide: closing the list keeps it for any open
+  ;; chat; closing the last owner tears it down (appended so the list buffer
+  ;; itself is not counted as a live owner).
+  (add-hook 'kill-buffer-hook #'dsh-emacs-events--host-maybe-disconnect t t)
   (dsh-emacs-session--render))
 
 ;;; ---------------------------------------------------------------------------
@@ -256,10 +280,10 @@ Only use the first new row when none of the old candidates survive."
 (defun dsh-emacs-session--window-points ()
   "Capture the view of every window displaying the current buffer.
 Returns a list of (WINDOW ID START-ID . START-OFFSET), where ID is the id of
-the row under that window's point (`dsh-emacs-row-id': a session id, or a
-group id for a header or the empty New Session row); START-ID is the id of
-the row at the top of the window and START-OFFSET how far into that row the
-window starts.
+the row under that window's point (`dsh-emacs-row-id': a session id, a
+Recents-scoped id, or a group id for a header or empty New Session row).
+START-ID is the id of the row at the top of the window and START-OFFSET
+how far into that row the window starts.
 
 A render can reorder or remove rows.  Remember each window by content rather
 than absolute position, even though the text diff preserves markers in rows
@@ -346,9 +370,10 @@ instead move point to the middle of the window."
 
 (defun dsh-emacs-session--update-rows (source)
   "Install SOURCE's rows in the current buffer, preserving surviving markers.
-Move existing rows by identity before updating their text.  Text diffs are
-limited to one line: a whole-buffer diff is prohibitively slow when workspace
-baselines regroup hundreds of multibyte rows."
+Move existing rows by identity before updating their text, then publish
+SOURCE's row properties and visual cache.  Text diffs are limited to one line.
+A whole-buffer diff is prohibitively slow when workspace baselines regroup
+hundreds of multibyte rows."
   (let ((target (current-buffer))
         (rows (make-hash-table :test #'equal))
         (case-fold-search nil)
@@ -363,7 +388,7 @@ baselines regroup hundreds of multibyte rows."
               (while (not (eobp))
                 (when-let* ((id (get-text-property (point) 'dsh-emacs-row-id)))
                   (puthash (cons id (get-text-property
-                                    (point) 'dsh-emacs-workspace-group-id))
+                                     (point) 'dsh-emacs-workspace-group-id))
                            nil rows))
                 (forward-line 1))))
           (save-excursion
@@ -429,10 +454,53 @@ baselines regroup hundreds of multibyte rows."
           (delete-region dest (point-max)))
       (maphash (lambda (_key marker)
                  (when marker (set-marker marker nil)))
-               rows))))
+               rows))
+    (let ((end (with-current-buffer source (point-max))))
+      ;; The text diff retains old properties on matching characters.
+      ;; Reapply row metadata, especially in reused padding, so a
+      ;; collapsed child's address cannot survive on its parent row.
+      (let ((pos 1)
+            (offset (1- (point-min))))
+        (while (< pos end)
+          (let ((next (next-property-change pos source end)))
+            (set-text-properties (+ offset pos) (+ offset next)
+                                 (text-properties-at pos source))
+            (setq pos next))))
+      (setq dsh-emacs-session--row-cache
+            (buffer-local-value 'dsh-emacs-session--row-cache source)))))
+
+(defun dsh-emacs-session--build-rows (target groups empty)
+  "Build list rows in the current temporary buffer using TARGET's UI state.
+GROUPS already reflects jump preparation.  EMPTY requests the no-sessions
+hint.  Reuse TARGET's visual rows while building a fresh local row cache."
+  (let ((dsh-emacs-session--previous-row-cache
+         (buffer-local-value 'dsh-emacs-session--row-cache target)))
+    (setq dsh-emacs-session--row-cache (make-hash-table :test #'equal))
+    (dolist (variable '(dsh-emacs-session--workspace-fold-default
+                        dsh-emacs-session--workspace-fold-overrides
+                        dsh-emacs-session--expanded-subagents
+                        dsh-emacs-session--auto-jump-session
+                        dsh-emacs-session--filter-ws-title))
+      (set (make-local-variable variable)
+           (buffer-local-value variable target)))
+    (insert (propertize "Sessions" 'face 'dsh-emacs-header-face))
+    (when dsh-emacs-session--filter-ws-title
+      (insert (propertize
+               (format " | Filter: %s" dsh-emacs-session--filter-ws-title)
+               'face 'dsh-emacs-session-model-face)))
+    (insert "\n")
+    (insert (propertize (make-string 50 ?─) 'face 'dsh-emacs-separator-face))
+    (insert "\n\n")
+    (if empty
+        (progn
+          (insert (propertize "No sessions. " 'face 'dsh-emacs-muted-face))
+          (insert (propertize "Press 'c' to create one."
+                              'face 'dsh-emacs-hint-face)))
+      (dolist (group groups)
+        (dsh-emacs-session--render-group group)))))
 
 (defun dsh-emacs-session--render ()
-  "Render the session list, grouped by workspace."
+  "Render Recents followed by the session list's workspace groups."
   (let* ((sessions dsh-emacs--sessions)
          (workspaces dsh-emacs--workspaces)
          (jump-workspace
@@ -467,6 +535,7 @@ baselines regroup hundreds of multibyte rows."
          (jump-id (unless jump-workspace
                     dsh-emacs-session--auto-jump-session))
          (jump-p (or jump-workspace jump-id))
+         (jump-row-id nil)
          (ancestors (and jump-id
                          (dsh-emacs-session--ancestors jump-id))))
     (dolist (parent ancestors)
@@ -493,62 +562,35 @@ baselines regroup hundreds of multibyte rows."
         ;; stays pending for the repaint that brings the session in.
         (let ((owner (cl-find-if
                       (lambda (group)
-                        (cl-find-if (lambda (session)
-                                      (equal (or (car (last ancestors)) jump-id)
-                                             (dsh-protocol-session-session-id
-                                              session)))
-                                    (plist-get group :sessions)))
+                        (and (or (eq dsh-emacs-session-jump-target 'recents)
+                                 (not (eq (plist-get group :group-id) :recents)))
+                             (cl-find-if
+                              (lambda (session)
+                                (equal (or (car (last ancestors)) jump-id)
+                                       (dsh-protocol-session-session-id session)))
+                              (plist-get group :sessions))))
                       groups)))
           (when owner
-            (let ((group-id (or (plist-get owner :workspace-id) :ungrouped)))
+            (setq jump-row-id
+                  (if (eq (plist-get owner :group-id) :recents)
+                      (list :recents jump-id)
+                    jump-id))
+            (let ((group-id (or (plist-get owner :group-id)
+                                (plist-get owner :workspace-id) :ungrouped)))
               (when (dsh-emacs-session--workspace-collapsed-p group-id)
                 (setf (alist-get group-id
-                                 dsh-emacs-session--workspace-fold-overrides)
+                                 dsh-emacs-session--workspace-fold-overrides
+                                 nil nil #'equal)
                       nil))))))
       ;; Preserve xref departure markers in surviving child rows.  Erasing
       ;; the list would collapse them to point-min before a follow completes.
-      (let ((target (current-buffer))
-            (dsh-emacs-session--previous-row-cache dsh-emacs-session--row-cache))
+      (let ((target (current-buffer)))
         (with-temp-buffer
-          (setq dsh-emacs-session--row-cache (make-hash-table :test #'equal))
-          (dolist (variable '(dsh-emacs-session--workspace-fold-default
-                              dsh-emacs-session--workspace-fold-overrides
-                              dsh-emacs-session--expanded-subagents
-                              dsh-emacs-session--auto-jump-session
-                              dsh-emacs-session--filter-ws-title))
-            (set (make-local-variable variable)
-                 (buffer-local-value variable target)))
-          (insert (propertize "Sessions" 'face 'dsh-emacs-header-face))
-          (when dsh-emacs-session--filter-ws-title
-            (insert (propertize
-                     (format " | Filter: %s" dsh-emacs-session--filter-ws-title)
-                     'face 'dsh-emacs-session-model-face)))
-          (insert "\n")
-          (insert (propertize (make-string 50 ?─) 'face 'dsh-emacs-separator-face))
-          (insert "\n\n")
-          (if (and (null sessions) (null workspaces))
-              (progn
-                (insert (propertize "No sessions. " 'face 'dsh-emacs-muted-face))
-                (insert (propertize "Press 'c' to create one."
-                                    'face 'dsh-emacs-hint-face)))
-            (dolist (group groups)
-              (dsh-emacs-session--render-group group)))
-          (let ((source (current-buffer))
-                (cache dsh-emacs-session--row-cache)
-                (end (point-max)))
+          (dsh-emacs-session--build-rows
+           target groups (and (null sessions) (null workspaces)))
+          (let ((source (current-buffer)))
             (with-current-buffer target
-              (dsh-emacs-session--update-rows source)
-              ;; The text diff retains old properties on matching characters.
-              ;; Reapply row metadata, especially in reused padding, so a
-              ;; collapsed child's address cannot survive on its parent row.
-              (let ((pos 1)
-                    (offset (1- (point-min))))
-                (while (< pos end)
-                  (let ((next (next-property-change pos source end)))
-                    (set-text-properties (+ offset pos) (+ offset next)
-                                         (text-properties-at pos source))
-                    (setq pos next))))
-              (setq dsh-emacs-session--row-cache cache))))))
+              (dsh-emacs-session--update-rows source))))))
     ;; Where point goes now that the list is rebuilt.  The buffer point is
     ;; the list's focus (commands read it); other windows each keep their own
     ;; captured row and are restored separately.
@@ -556,9 +598,9 @@ baselines regroup hundreds of multibyte rows."
                     (jump-workspace
                      (dsh-emacs-session--row-pos
                       'dsh-emacs-workspace-group-id jump-workspace))
-                    (jump-id
+                    (jump-row-id
                      (dsh-emacs-session--row-pos
-                      'dsh-emacs-session-id jump-id))))
+                      'dsh-emacs-row-id jump-row-id))))
            ;; Without a pending jump the buffer's captured row decides point:
            ;; the row itself when it survived the redraw, a surviving neighbor
            ;; when it is gone (collapsed, archived), and the first session row
@@ -612,33 +654,34 @@ which stays visible even while blank."
              (and blank (not (equal session-id current)))))))
 
 (defun dsh-emacs-session--group-sessions (sessions workspaces)
-  "Group SESSIONS by WORKSPACES.
+  "Group SESSIONS by WORKSPACES, with a leading Recents shortcut group.
 Returns a list of plists: (:label LABEL :workspace-id WS-ID :sessions MEMBERS),
-in workspace order (WS-ID is nil for the ungrouped bucket).
+in workspace order (WS-ID is nil for synthetic groups).  Recents also carries
+:group-id `:recents' and :workspaces, a session-id to workspace map.
 When `dsh-emacs-session--filter-ws-id' is set, only that workspace's
-members are returned (the ungrouped bucket is suppressed); archived
-sessions are always excluded."
-  ;; Build session-id → workspace-id map from each workspace's sessionIds.
-  (let ((ws-by-id (make-hash-table :test 'equal))
-        (ws-by-session (make-hash-table :test 'equal))
+group is returned; Recents and the ungrouped bucket are suppressed.
+Archived sessions are always excluded."
+  ;; Map session ids to their owning workspaces for grouping and row commands.
+  (let ((ws-by-session (make-hash-table :test 'equal))
         (filter dsh-emacs-session--filter-ws-id)
         (current dsh-emacs--current-session)
         (groups nil)
-        (ungrouped nil))
+        (ungrouped nil)
+        (recents nil))
     (dolist (ws workspaces)
-      (let ((ws-id (dsh-protocol-workspace-workspace-id ws)))
-        (puthash ws-id ws ws-by-id)
-        (dolist (sid (dsh-protocol-workspace-session-ids ws))
-          (puthash sid ws-id ws-by-session))))
+      (dolist (sid (dsh-protocol-workspace-session-ids ws))
+        (puthash sid ws ws-by-session)))
     ;; Assign each visible (non-archived) session to its workspace or the
     ;; ungrouped bucket.
     (dolist (session sessions)
       (let* ((session-id (or (dsh-protocol-session-session-id session) ""))
-             (ws-id (gethash session-id ws-by-session)))
+             (ws (gethash session-id ws-by-session))
+             (ws-id (and ws (dsh-protocol-workspace-workspace-id ws))))
         ;; Skip archived sessions, subagent child sessions and blank
         ;; (never-messaged) rows — blank rows match dsh web's browser tree:
         ;; only the currently-open session stays visible among them.
         (when (dsh-emacs-session--visible-p session current)
+          (push session recents)
           (if (and ws-id (or (null filter) (equal ws-id filter)))
               (let ((entry (assoc ws-id groups)))
                 (if entry
@@ -666,7 +709,16 @@ sessions are always excluded."
         (push (list :label "Ungrouped" :workspace-id nil
                     :sessions (dsh-emacs-session--sort-by-recency ungrouped))
               result))
-      (nreverse result))))
+      (setq result (nreverse result))
+      (when (and (null filter) recents (> dsh-emacs-session-recents-limit 0))
+        (push (list :label "Recents" :group-id :recents
+                    :workspaces ws-by-session
+                    :sessions (cl-subseq
+                               (dsh-emacs-session--sort-by-recency recents)
+                               0 (min dsh-emacs-session-recents-limit
+                                      (length recents))))
+              result))
+      result)))
 
 (defun dsh-emacs-session--sort-by-recency (sessions)
   "Sort SESSIONS by updatedAt descending (newest first)."
@@ -687,7 +739,7 @@ sessions are always excluded."
   "Render a GROUP plist header and its session rows."
   (let* ((label (plist-get group :label))
          (ws-id (plist-get group :workspace-id))
-         (group-id (or ws-id :ungrouped))
+         (group-id (or (plist-get group :group-id) ws-id :ungrouped))
          (members (plist-get group :sessions))
          (count (length members))
          (collapsed (dsh-emacs-session--workspace-collapsed-p group-id)))
@@ -714,9 +766,37 @@ sessions are always excluded."
     (unless collapsed
       (if members
           (dolist (session members)
-            (dsh-emacs-session--render-session session 2
-                                               (and ws-id ws-id)
-                                               (and ws-id label)))
+            (let* ((start (point))
+                   (recent-p (eq group-id :recents))
+                   (workspace (and recent-p
+                                   (gethash
+                                    (dsh-protocol-session-session-id session)
+                                    (plist-get group :workspaces)))))
+              (dsh-emacs-session--render-session
+               session 2
+               (if recent-p
+                   (and workspace (dsh-protocol-workspace-workspace-id workspace))
+                 ws-id)
+               (if recent-p
+                   (and workspace
+                        (or (dsh-protocol-workspace-title workspace)
+                            (dsh-emacs-session--workspace-basename
+                             (dsh-protocol-workspace-path workspace))))
+                 (and ws-id label))
+               nil (and recent-p dsh-emacs-session-recents-show-workspace))
+              ;; Recents is a second occurrence of the same subtree.  Scope
+              ;; row identities, including child notices, so reconciliation,
+              ;; xref markers and window focus cannot switch occurrences.
+              (when recent-p
+                (let ((end (point)))
+                  (save-excursion
+                    (goto-char start)
+                    (while (< (point) end)
+                      (let ((row-start (point))
+                            (id (get-text-property (point) 'dsh-emacs-row-id)))
+                        (forward-line 1)
+                        (put-text-property row-start (point) 'dsh-emacs-row-id
+                                           (list :recents id)))))))))
         ;; Empty workspace: show a New Session row (like dsh web's blank
         ;; row) so `c' can create a session inside this workspace.
         (let ((start (point)))
@@ -742,7 +822,8 @@ sessions are always excluded."
 
 (defvar-local dsh-emacs-session--workspace-fold-overrides nil
   "Alist of group ids and their buffer-local collapsed states.
-Real workspaces use their server ids; Ungrouped uses `:ungrouped'.")
+Real workspaces use their server ids; synthetic groups use `:ungrouped'
+and `:recents'.")
 
 (defun dsh-emacs-session--workspace-collapsed-p (group-id)
   "Return non-nil when GROUP-ID should render collapsed."
@@ -750,11 +831,12 @@ Real workspaces use their server ids; Ungrouped uses `:ungrouped'.")
                              dsh-emacs-session--workspace-fold-overrides)))
       (cdr override)
     (if (eq dsh-emacs-session--workspace-fold-default :inherit)
-        dsh-emacs-workspaces-collapsed-by-default
+        (and (not (eq group-id :recents))
+             dsh-emacs-workspaces-collapsed-by-default)
       dsh-emacs-session--workspace-fold-default)))
 
 (defun dsh-emacs-session-toggle ()
-  "Toggle the workspace header or known direct children at point.
+  "Toggle the group header or known direct children at point.
 Sessions without a nonempty child catalog are left unchanged."
   (interactive)
   (if-let* ((id (dsh-emacs-session-id-at-point)))
@@ -769,7 +851,7 @@ Sessions without a nonempty child catalog are left unchanged."
     (dsh-emacs-session-toggle-workspace)))
 
 (defun dsh-emacs-session-toggle-workspace ()
-  "Fold or unfold the workspace or Ungrouped header at point."
+  "Fold or unfold the workspace, Ungrouped or Recents header at point."
   (interactive)
   (let ((group-id (get-text-property
                    (point) 'dsh-emacs-workspace-group-id)))
@@ -786,14 +868,14 @@ Sessions without a nonempty child catalog are left unchanged."
     (dsh-emacs-session--render)))
 
 (defun dsh-emacs-collapse-workspaces ()
-  "Collapse every workspace group in the current session-list buffer."
+  "Collapse every group, including Recents, in the current session list."
   (interactive)
   (setq dsh-emacs-session--workspace-fold-default t
         dsh-emacs-session--workspace-fold-overrides nil)
   (dsh-emacs-session--render))
 
 (defun dsh-emacs-expand-workspaces ()
-  "Expand every workspace group in the current session-list buffer."
+  "Expand every group, including Recents, in the current session list."
   (interactive)
   (setq dsh-emacs-session--workspace-fold-default nil
         dsh-emacs-session--workspace-fold-overrides nil)
@@ -877,16 +959,19 @@ rows, otherwise the generated summary title, else a cwd-derived name."
      (t (dsh-emacs-session--generate-name session)))))
 
 (defun dsh-emacs-session--render-session (session &optional indent workspace-id
-                                                  workspace-title child)
+                                                  workspace-title child
+                                                  show-workspace)
   "Render a single SESSION row, optionally indented by INDENT spaces.
 When WORKSPACE-ID is given (rendering inside a workspace group), the row
 carries `dsh-emacs-workspace-id' / `dsh-emacs-workspace-title' text
 properties as well, so commands like `c' (new session) started on ANY row
 of that workspace create the session inside it — matching dsh web, where
 the workspace context applies to the whole group.
-CHILD is (DIRECT-PARENT . CATALOG-ENTRY); SESSION may be nil for a cold child."
+CHILD is (DIRECT-PARENT . CATALOG-ENTRY); SESSION may be nil for a cold child.
+SHOW-WORKSPACE prefixes the title with its workspace in a Recents row."
   (let* ((session-id (if child (dsh-protocol-subagent-entry-id (cdr child))
                        (or (dsh-protocol-session-session-id session) "")))
+         (cache-id (if show-workspace (list :recents session-id) session-id))
          (activity (and child (dsh-emacs-subagent--activity session-id)))
          (running (if child (equal activity "running")
                     (dsh-protocol-session-running session)))
@@ -900,8 +985,14 @@ CHILD is (DIRECT-PARENT . CATALOG-ENTRY); SESSION may be nil for a cold child."
 
          ;; Format fields: the display title is the auto-generated summary
          ;; (`values.title') like dsh web; blank sessions show "New Session".
-         (title-str (if child (dsh-emacs-subagent--label (cdr child))
-                      (dsh-emacs-session--display-title session)))
+         (title-str
+          (concat
+           (when show-workspace
+             (propertize (format "[%s] " (or workspace-title "Ungrouped"))
+                         'face 'dsh-emacs-muted-face))
+           (propertize (if child (dsh-emacs-subagent--label (cdr child))
+                         (dsh-emacs-session--display-title session))
+                       'face 'dsh-emacs-session-title-face)))
          (detail (if child
                      (format "%s · %s"
                              (dsh-protocol-subagent-address-mode
@@ -918,8 +1009,11 @@ CHILD is (DIRECT-PARENT . CATALOG-ENTRY); SESSION may be nil for a cold child."
          (inputs (list (or indent 0) disclosure status
                        (copy-sequence title-str)
                        (and detail (copy-sequence detail))))
-         (cached (and dsh-emacs-session--previous-row-cache
-                      (gethash session-id dsh-emacs-session--previous-row-cache)))
+         (cached (or (and dsh-emacs-session--row-cache
+                          (gethash cache-id dsh-emacs-session--row-cache))
+                     (and dsh-emacs-session--previous-row-cache
+                          (gethash cache-id
+                                   dsh-emacs-session--previous-row-cache))))
          ;; indent + disclosure + dot/separator + title + gap.  :align-to
          ;; keeps the time column stable with proportional and CJK fonts.
          (row (if (and cached (equal-including-properties inputs (car cached)))
@@ -927,13 +1021,12 @@ CHILD is (DIRECT-PARENT . CATALOG-ENTRY); SESSION may be nil for a cold child."
                 (concat
                  (make-string (or indent 0) ?\s) disclosure
                  (dsh-emacs-session--status-dot status) " "
-                 (propertize (dsh-emacs-session--pad-right title-str 46)
-                             'face 'dsh-emacs-session-title-face)
+                 (dsh-emacs-session--pad-right title-str 46)
                  (propertize " " 'display
                              `(space :align-to ,(+ (or indent 0) 3 49)))
                  (propertize (or detail "") 'face 'dsh-emacs-muted-face)))))
     (when dsh-emacs-session--row-cache
-      (puthash session-id (cons inputs row) dsh-emacs-session--row-cache))
+      (puthash cache-id (cons inputs row) dsh-emacs-session--row-cache))
 
     ;; Insert row with text properties for selection and (optionally) the
     ;; containing workspace

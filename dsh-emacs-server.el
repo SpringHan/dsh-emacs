@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -40,6 +40,9 @@
 (require 'url)
 (require 'url-parse)
 (require 'dsh-emacs-protocol)
+
+(declare-function dsh-emacs-ui-navigate "dsh-emacs-ui"
+                  (departure function &rest arguments))
 
 (defgroup dsh-emacs-server nil
   "dsh server bootstrap: probe, auto-start, and on-demand install."
@@ -130,7 +133,7 @@ on every single invocation.")
 (defconst dsh-emacs--server-alive-ttl 2.0
   "Seconds a cached liveness result stays valid.")
 
-(defconst dsh-emacs-server-default-base-url "http://127.0.0.1:3080"
+(defconst dsh-emacs--server-default-base-url "http://127.0.0.1:3080"
   "Fallback server address when `dsh-emacs-base-url' is not yet loaded.
 `dsh-emacs-base-url' is defined in dsh-emacs.el (the package entry), which
 always loads this module first at package load; the fallback only matters
@@ -158,7 +161,7 @@ server.  Reset whenever a fresh server is spawned.")
 actually builds a request URL."
   (if (boundp 'dsh-emacs-base-url)
       dsh-emacs-base-url
-    dsh-emacs-server-default-base-url))
+    dsh-emacs--server-default-base-url))
 
 (defun dsh-emacs--server-base-url ()
   "The server URL to probe and start: `dsh-emacs-base-url' or the default.
@@ -734,6 +737,23 @@ methods).  Returns (ok-p . value) or nil."
                 (dsh-emacs--http-error-hint err))
        (cons nil nil)))))
 
+(defun dsh-emacs-rpc-error-text (value)
+  "Readable text for a failed RPC's VALUE.
+VALUE is the error object the server returned (an alist with `code',
+`message' and `details'), a plain string, or nil when no response
+arrived.  The server's message wins, with its code in parentheses; nil
+reads no response; a code-only response reads the code; anything else
+falls back to `%S'."
+  (let* ((error (dsh-protocol-rpc-error--from-alist value))
+         (text (dsh-protocol-rpc-error-message error))
+         (code (dsh-protocol-rpc-error-code error)))
+    (cond ((and text code) (format "%s (%s)" text code))
+          (text text)
+          ((stringp value) value)
+          ((null value) "no response")
+          (code (format "%s" code))
+          (t (format "%S" value)))))
+
 (defun dsh-emacs--http-error-hint (err)
   "Human-readable hint for an HTTP error ERR, or \"\".
 ERR like `(error http 404)' comes from `url-retrieve' status.  404/405
@@ -1156,7 +1176,8 @@ file handling; dsh owns configuration loading and validation."
                                   nil previous t)))))
     (unless (file-regular-p file)
       (user-error "Not a regular configuration file: %s" file))
-    (find-file file)
+    (require 'dsh-emacs-ui)
+    (dsh-emacs-ui-navigate (point-marker) #'find-file file)
     (setf (alist-get server dsh-emacs--config-files nil nil #'equal) file)))
 
 ;;;###autoload
@@ -1193,6 +1214,17 @@ of missing tooling.  Only loopback hosts (127.0.0.1, localhost, ::1) are
     (member (downcase host)
             '("127.0.0.1" "localhost" "::1" "0.0.0.0"))))
 
+(defun dsh-emacs--server-unreachable-error ()
+  "Signal a `user-error' for an unreachable dsh server.
+Local and remote `dsh-emacs-base-url' values get tailored instructions:
+a local address can be started here, a remote one only points at the
+address or network path.  Startup is never attempted."
+  (if (dsh-emacs--server-local-host-p)
+      (user-error "dsh server not reachable at %s.  Start it with M-x dsh-emacs-server-start (or `dsh web --no-open'), or set `dsh-emacs-server-auto-start' to t"
+                  (dsh-emacs--server-base-url))
+    (user-error "dsh server at %s is not reachable.  Check `dsh-emacs-base-url' and the network path to the remote server (the CLI would only start a local server, so it is not used here)"
+                (dsh-emacs--server-base-url))))
+
 (defun dsh-emacs-server-ensure ()
   "Ensure the dsh server is reachable before a server-touching command.
 With `dsh-emacs-server-auto-start' non-nil and no server answering at a
@@ -1216,13 +1248,10 @@ the unauthenticated request pop `url''s Basic username/password box."
   (when (not noninteractive)
     (if (dsh-emacs--server-alive-p)
         (dsh-emacs--server-auth-ensure-interactive)
-      (if (dsh-emacs--server-local-host-p)
-          (if dsh-emacs-server-auto-start
-              (dsh-emacs-server-start t)
-            (user-error "dsh server not reachable at %s.  Start it with M-x dsh-emacs-server-start (or `dsh web --no-open'), or set `dsh-emacs-server-auto-start' to t"
-                        (dsh-emacs--server-base-url)))
-        (user-error "dsh server at %s is not reachable.  Check `dsh-emacs-base-url' and the network path to the remote server (the CLI would only start a local server, so it is not used here)"
-                    (dsh-emacs--server-base-url))))))
+      (if (and (dsh-emacs--server-local-host-p)
+               dsh-emacs-server-auto-start)
+          (dsh-emacs-server-start t)
+        (dsh-emacs--server-unreachable-error)))))
 
 (declare-function url-retrieve "url"
                   (url callback &optional cbargs silent inhibit-cookies))

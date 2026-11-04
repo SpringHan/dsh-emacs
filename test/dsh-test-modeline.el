@@ -4,40 +4,12 @@
 
 (require 'dsh-test-support)
 
+(defvar doom-modeline-major-mode-icon)
+
 (defvar motion-line-current-time-function)
 (defvar motion-line-visible-p-function)
 (defvar motion-line--timer)
 (defvar motion-line--buffers)
-
-;; A displayed buffer can contain an offscreen running command.
-(ert-deftest dsh-emacs-test-modeline-spinner-offscreen-advances-without-redraw ()
-  :tags '(dsh-unit)
-  (with-temp-buffer
-    (let ((dsh-emacs--command-spinners (make-hash-table :test 'equal))
-          (dsh-emacs--command-blocks (make-hash-table :test 'equal))
-          (window (selected-window))
-          (visible nil)
-          (redraws 0))
-      (puthash "spin" (list (current-buffer) nil 0) dsh-emacs--command-spinners)
-      (puthash "spin" '("ns" "cmd-spin" "goal" "") dsh-emacs--command-blocks)
-      (cl-letf (((symbol-function 'get-buffer-window) (lambda (&rest _) window))
-                ((symbol-function 'get-buffer-window-list)
-                 (lambda (&rest _) (list window)))
-                ((symbol-function 'dsh-emacs-ui-find-block)
-                 (lambda (&rest _) '(1 . 10)))
-                ((symbol-function 'pos-visible-in-window-p)
-                 (lambda (&rest _) visible))
-                ((symbol-function 'dsh-emacs-ui-update-fragment)
-                 (lambda (&rest _) (setq redraws (1+ redraws)))))
-        (dsh-emacs--command-spinner-tick (current-buffer) "spin")
-        (ert-info ((format "%s" "spinner-offscreen-advances-without-redraw"))
-          (should (= redraws 0))
-          (should (= (nth 2 (gethash "spin" dsh-emacs--command-spinners)) 1)))
-        (setq visible t)
-        (dsh-emacs--command-spinner-tick (current-buffer) "spin")
-        (ert-info ((format "%s" "spinner-visible-resumes-redraw"))
-          (should (= redraws 1))
-          (should (= (nth 2 (gethash "spin" dsh-emacs--command-spinners)) 2)))))))
 
 ;; --- Test 5c: mode-line event accumulation and rendering ---
 (ert-deftest dsh-emacs-test-modeline-modeline-note-event-accumulates-assistant-message-usage ()
@@ -213,18 +185,38 @@
         (should (null (dsh-emacs-modeline--permission-nerd-icon "auto" 'default)))
         (should (null (dsh-emacs-modeline--permission-nerd-icon "custom" 'default)))))))
 
-(ert-deftest dsh-emacs-test-modeline-doom-file-icon-skipped-for-fileless-dsh-buffer ()
+(ert-deftest dsh-emacs-test-modeline-doom-chat-icon-uses-public-option ()
   :tags '(dsh-unit)
   (with-temp-buffer
     (dsh-emacs-mode)
-    (let ((called nil))
-      (ert-info ((format "%s" "doom-file-icon-skipped-for-fileless-dsh-buffer"))
-        (should (null
-                 (dsh-emacs-modeline--doom-buffer-file-icon
-                  (lambda (&rest _args)
-                    (setq called t)
-                    (signal 'wrong-type-argument '(stringp nil))))))
-        (should (not called))))))
+    (let ((doom-modeline-major-mode-icon t)
+          called)
+      (should-not
+       (dsh-emacs-modeline--doom-buffer-file-icon
+        (lambda ()
+          (setq called t)
+          (should-not doom-modeline-major-mode-icon)
+          nil)))
+      (should called)
+      (should doom-modeline-major-mode-icon))))
+
+(ert-deftest dsh-emacs-test-modeline-session-mode-uses-dsh-icon ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (setq major-mode 'dsh-emacs-session-mode)
+    (let (called)
+      (let ((icon (dsh-emacs-modeline--doom-icon-for-buffer
+                   (lambda () (setq called t) "generic"))))
+        (should (equal (substring-no-properties icon) "DSH"))
+        (should (listp (get-text-property 0 'face icon))))
+      (should-not called)
+      (should (eq 'updated
+                  (dsh-emacs-modeline--doom-buffer-file-icon
+                   (lambda () 'updated))))))
+  (with-temp-buffer
+    (should (eq 'generic
+                (dsh-emacs-modeline--doom-icon-for-buffer
+                 (lambda () 'generic))))))
 
 (ert-deftest dsh-emacs-test-modeline-doom-file-icon-delegates-for-other-buffers ()
   :tags '(dsh-unit)
@@ -1070,29 +1062,6 @@
                 (should (get-text-property 0 'face seg)))))
         (setq dsh-emacs--modeline-branch-cache old-cache)))))
 
-;; Performance regressions: callbacks must retain their owning buffer.
-(ert-deftest dsh-emacs-test-modeline-spinner-callback-stops-missing-row-from-other-buffer ()
-  :tags '(dsh-unit)
-  (let ((owner (generate-new-buffer " *dsh-spinner-owner*")) timer)
-    (unwind-protect
-        (progn
-          (with-current-buffer owner
-            (dsh-emacs-render--reset-tool-tracking)
-            (dsh-emacs--command-spinner-start "perf" owner)
-            (setq timer (nth 1 (gethash "perf" dsh-emacs--command-spinners))))
-          (with-temp-buffer
-            (apply (timer--function timer) (timer--args timer)))
-          (ert-info ((format "%s" "spinner-callback-stops-missing-row-from-other-buffer"))
-            (should (not (memq timer timer-list))))
-          (with-current-buffer owner
-            (dsh-emacs--command-spinner-start "perf" owner)
-            (setq timer (nth 1 (gethash "perf" dsh-emacs--command-spinners)))
-            (dsh-emacs-render--reset-tool-tracking))
-          (ert-info ((format "%s" "spinner-reset-cancels-old-timer"))
-            (should (not (memq timer timer-list)))))
-      (when timer (cancel-timer timer))
-      (when (buffer-live-p owner) (kill-buffer owner)))))
-
 ;; Pending text paints the shared animation's cached frame without an extra pass.
 ;; Motion Line exposes its clock and visibility as variables (postmortem/002 in
 ;; that repository), so the engine needs no `cl-letf' on built-in subrs -- a
@@ -1661,6 +1630,79 @@
         (dsh-emacs-mode))
       (ert-info ((format "%s" "dsh-mode-exempts-awesome-tray"))
         (should (= calls 1))))))
+
+;; A running direct child keeps the whale and its clock alive after the
+;; parent turn ends, without marking the session busy.
+(ert-deftest dsh-emacs-test-modeline-running-child-keeps-whale-alive ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (let ((dsh-emacs--ml-busy nil)
+          (dsh-emacs--modeline-subagent-active nil)
+          (dsh-emacs--modeline-run-start nil)
+          (dsh-emacs--modeline-compaction nil))
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 100.0)))
+        (dsh-emacs-modeline-set-subagent-activity t)
+        (ert-info ((format "%s" "running-child-lights-the-whale"))
+          (should dsh-emacs--modeline-subagent-active)
+          (should (= dsh-emacs--modeline-run-start 100.0))
+          (should-not dsh-emacs--ml-busy)
+          (should (string-match-p "Deep diving"
+                                  (dsh-emacs--ml-busy-indicator))))
+        ;; The parent turn ending must not stop a child's activity.
+        (dsh-emacs--ml-busy-set nil)
+        (ert-info ((format "%s" "parent-turn-end-keeps-child-animation"))
+          (should (= dsh-emacs--modeline-run-start 100.0))
+          (should (string-match-p "Deep diving"
+                                  (dsh-emacs--ml-busy-indicator))))
+        (dsh-emacs-modeline-set-subagent-activity nil)
+        (ert-info ((format "%s" "last-child-settles-stops-the-whale"))
+          (should-not dsh-emacs--modeline-subagent-active)
+          (should-not dsh-emacs--modeline-run-start)
+          (should (equal (dsh-emacs--ml-busy-indicator) "")))))))
+
+(ert-deftest dsh-emacs-test-modeline-disconnect-clears-child-activity ()
+  :tags '(dsh-unit)
+  (with-temp-buffer
+    (dsh-emacs-mode)
+    (dsh-emacs-modeline-set-subagent-activity t)
+    (should dsh-emacs--modeline-run-start)
+    (dsh-emacs-events-disconnect)
+    (should-not dsh-emacs--modeline-subagent-active)
+    (should-not dsh-emacs--modeline-run-start)
+    (should (equal (dsh-emacs--ml-busy-indicator) ""))
+    (when (featurep 'motion-line)
+      (should-not (motion-line-playing-p 'dsh-running)))))
+
+(ert-deftest dsh-emacs-test-modeline-refresh-owns-caches-and-icons ()
+  :tags '(dsh-unit)
+  (let ((chat (generate-new-buffer " *modeline-refresh-chat*"))
+        (sessions (generate-new-buffer " *modeline-refresh-list*"))
+        (other (generate-new-buffer " *modeline-refresh-other*"))
+        (dsh-emacs-modeline--logo-labels '(old))
+        (dsh-emacs-modeline--whale-tail-labels '(old))
+        (dsh-emacs-modeline--whale-tail-frames '(old))
+        (dsh-emacs-modeline--whale-tail-gif-data "old")
+        icons)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat
+            (setq major-mode 'dsh-emacs-mode))
+          (with-current-buffer sessions
+            (setq major-mode 'dsh-emacs-session-mode))
+          (cl-letf (((symbol-function 'doom-modeline-update-buffer-file-icon)
+                     (lambda () (push (current-buffer) icons))))
+            (dsh-emacs-modeline-refresh))
+          (should (memq chat icons))
+          (should (memq sessions icons))
+          (should-not (memq other icons))
+          (should-not dsh-emacs-modeline--logo-labels)
+          (should-not dsh-emacs-modeline--whale-tail-labels)
+          (should-not dsh-emacs-modeline--whale-tail-frames)
+          (should-not dsh-emacs-modeline--whale-tail-gif-data))
+      (kill-buffer chat)
+      (kill-buffer sessions)
+      (kill-buffer other))))
 
 (provide 'dsh-test-modeline)
 ;;; dsh-test-modeline.el ends here

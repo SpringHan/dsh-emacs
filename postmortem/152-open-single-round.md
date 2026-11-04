@@ -1,5 +1,9 @@
 # 152 - Complete only the latest round on opening
 
+_Round definition and the opening auto-load are refined by
+[160](160-history-human-rounds.md): a round is a turn with a user-authored
+message._
+
 ## Background
 
 Commit `3812271` and [148](148-open-complete-rounds.md) reused the manual

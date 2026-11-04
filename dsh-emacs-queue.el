@@ -3,7 +3,7 @@
 ;; Copyright (C) 2025 vritser
 
 ;; Author: vritser
-;; Version: 0.7.0
+;; Version: 0.8.0
 ;; License: GPL-3.0-or-later
 ;; Package-Requires: ((emacs "28.1"))
 
@@ -24,10 +24,9 @@
 ;; Emacs-native interaction (no panels, no overlays):
 ;;   - the echo area flashes transient feedback on enqueue / steer /
 ;;     consumption, derived from the frame diff;
-;;   - `dsh-emacs-list-queue' (C-c C-q) opens the queue as a minibuffer
-;;     candidate list and applies single keys to the CURRENTLY highlighted
-;;     entry (vertico up/down picks the item — no numbering): e = edit,
-;;     s = steer, d = delete, RET = send now, x = delete the whole queue;
+;;   - `dsh-emacs-list-queue' (C-c C-q) opens one completion list:
+;;     RET or C-c s sends now, C-c e edits, C-c d deletes, C-c x
+;;     deletes all;
 ;;   - Composer displays the next visible pending item on its own read-only
 ;;     row above the input; this module owns selection and transient gating.
 
@@ -39,19 +38,15 @@
 (require 'cl-lib)
 (require 'dsh-emacs-protocol)
 (require 'dsh-emacs-server)
+(require 'dsh-emacs-ui)
 
 ;; Lazy boundary with same-package modules (see AGENTS.md): dsh-emacs.el
 ;; assembles this module, which calls back into its symbols through
 ;; declare-function at runtime, avoiding a top-level require cycle.
 (declare-function dsh-emacs--active-session-id "dsh-emacs" ())
 (declare-function dsh-emacs--busy-p "dsh-emacs" ())
-(declare-function dsh-emacs--submit-prompt "dsh-emacs" (message &optional attachments mode))
+(declare-function dsh-emacs--submit-plain "dsh-emacs" (message &rest args))
 (declare-function dsh-emacs-composer-render "dsh-emacs-composer" ())
-
-;; Borrowed vertico runtime variables (see `dsh-emacs-queue--menu-item'):
-;; declare-only so the byte-compiler stays quiet — always read under `boundp'.
-(defvar vertico--index)
-(defvar vertico--candidates)
 
 ;;; ---------------------------------------------------------------------------
 ;;; State mirror (buffer-local, replaced wholesale by mux frames)
@@ -315,8 +310,8 @@ current one and no minibuffer session is active."
   "Replace CHAT's pending-input mirror with ITEMS arriving on PROCESS.
 ITEMS is the `dsh-protocol-queue-item' list derived from the session's
 `inbox' projection (`dsh-protocol-queue-items-from-inbox') — the events
-dispatcher resolves CHAT by session id and drops frames for any other
-session.  The first frame of a connection is the connect-time snapshot
+dispatcher resolves CHAT by session id and retains the latest cell on the
+core connection for closed chats.  The first frame of a connection is a snapshot
 and seeds the mirror silently; later frames diff against the mirror to
 emit the enqueue / steer / consumption feedback.
 
@@ -446,7 +441,8 @@ the instant the RPC succeeds, without waiting for the frame round-trip."
            (if ok
                (when on-success (funcall on-success value))
              (when on-error (funcall on-error value))
-             (message "Queue update failed: %S" value))))))))
+             (message "Queue update failed: %s"
+                      (dsh-emacs-rpc-error-text value)))))))))
 
 (defun dsh-emacs-queue--delete (item)
   "Delete ITEM via `session/updateQueue' (kind remove)."
@@ -516,10 +512,15 @@ edited preview at once; the confirming frame overwrites the mirror."
   "Send ITEM right away.
 While a turn is running this steers it into the running turn (jump the
 queue).  While idle there is no wake-only RPC: the item is deleted and
-re-submitted as an ordinary prompt, which wakes the driver — the parked
-queue drains in order and the re-submitted copy re-joins at the tail
-with its text preserved.  Reject non-text items while idle, before removing
-anything: the text-only resubmit cannot preserve their attachments."
+submitted as a literal prompt, which wakes the driver — the parked queue
+drains in order and the submitted copy re-joins at the tail with its text
+preserved.  The text never re-enters the composer's input parsing, so a
+queued \"!\" or \"/name\" line stays an ordinary message (no local shell,
+no `commands.execute') and the unrelated draft in the input area is left
+untouched.  Reject non-text items while idle, before removing anything: the
+text-only submit cannot preserve their attachments.  Subagent queues are
+read-only, so a child conversation rejects here before any removal too."
+  (dsh-emacs-subagent-require 'mutate)
   (cond
    ((eq (dsh-protocol-queue-item-placement item) 'steering)
     (message "Already steering"))
@@ -542,19 +543,20 @@ anything: the text-only resubmit cannot preserve their attachments."
            (with-current-buffer buf
              (if ok
                  (progn
-                   ;; Optimistic removal + input-line flash, then resubmit
-                   ;; (a failure is never resent).
+                   ;; Optimistic removal + input-line flash, then submit
+                   ;; the item's text as a literal message (never resent).
                    (setq dsh-emacs--queue-items
                          (cl-remove-if
                           (lambda (it)
                             (equal id (dsh-protocol-queue-item-id it)))
                           dsh-emacs--queue-items))
                    (dsh-emacs-queue--refresh-ui)
-                   (dsh-emacs--submit-prompt text))
+                   (dsh-emacs--submit-plain text :input-consumed t))
                (progn
                  (setq dsh-emacs--queue-deleted
                        (delete id dsh-emacs--queue-deleted))
-                 (message "Queue update failed: %S" value)))))))))))
+                 (message "Queue update failed: %s"
+                          (dsh-emacs-rpc-error-text value))))))))))))
 
 (defun dsh-emacs-queue--label (item)
   "Return the queue-menu label for ITEM, e.g. \"[Q] fix the bug\"."
@@ -563,192 +565,31 @@ anything: the text-only resubmit cannot preserve their attachments."
               ?S ?Q)
           (dsh-emacs-queue-preview (dsh-protocol-queue-item-text item))))
 
-(defun dsh-emacs-queue--table (items)
-  "Return ((LABEL . ITEM) ...) for ITEMS with unique LABELs:
-items whose preview text collides get a \"[N]\" suffix, so each label
-maps back to exactly one item however the minibuffer picked it."
-  (let ((seen (make-hash-table :test 'equal)))
-    (mapcar (lambda (item)
-              (let* ((base (dsh-emacs-queue--label item))
-                     (n (1+ (gethash base seen 0))))
-                (puthash base n seen)
-                (cons (if (= n 1) base
-                        (format "%s [%d]" base n))
-                      item)))
-            items)))
+(defun dsh-emacs-queue--delete-all (items)
+  "Delete every queue ITEM after confirmation."
+  (when (y-or-n-p (format "Delete all %d pending item%s? "
+                          (length items)
+                          (if (= (length items) 1) "" "s")))
+    (dolist (item items)
+      (dsh-emacs-queue--delete item))))
 
-(defvar dsh-emacs--queue-pick-table nil
-  "((LABEL . ITEM) ...): the queue entries of the open queue menu.
-A DYNAMIC binding set by `dsh-emacs-list-queue' around the
-`completing-read'; the single-key menu commands resolve the entry they
-act on through this table — the same pattern as
-`dsh-emacs--question-pick-labels'.")
-
-(defun dsh-emacs-queue--menu-item ()
-  "The ITEM the next menu key acts on: the vertico-highlighted
-candidate when vertico renders the list; else the minibuffer's typed
-input as an exact/prefix match on the labels; else the first entry
-(the next to run).
-The highlighted candidate is read straight off `vertico--index' /
-`vertico--candidates' rather than through an accessor like
-`vertico--current', which no longer exists in current vertico
-(renamed to `vertico--candidate', whose return additionally prepends
-`vertico--base' after the user typed input).  `equal' ignores text
-properties, so the face vertico puts on the candidate does not break
-the table lookup."
-  (let* ((vertico-active (and (bound-and-true-p vertico-mode)
-                              (boundp 'vertico--candidates)
-                              (boundp 'vertico--index)
-                              (>= vertico--index 0)))
-         (hl (and vertico-active
-                  (ignore-errors
-                    (nth vertico--index vertico--candidates))))
-         (typed (condition-case nil (minibuffer-contents) (error nil)))
-         (entry (or (and hl
-                         (assoc hl dsh-emacs--queue-pick-table))
-                    (and typed
-                         (assoc typed dsh-emacs--queue-pick-table))
-                    (and typed
-                         (let ((hit (car (all-completions
-                                          typed
-                                          (mapcar #'car
-                                                  dsh-emacs--queue-pick-table)))))
-                           (and hit
-                                (assoc hit dsh-emacs--queue-pick-table))))
-                    (car dsh-emacs--queue-pick-table))))
-    (cdr entry)))
-
-(defun dsh-emacs-queue--menu-chat ()
-  "The chat buffer the queue menu was opened from."
-  (window-buffer (minibuffer-selected-window)))
-
-(defun dsh-emacs-queue--menu-run (fn)
-  "Close the queue minibuffer and run FN on the picked item, in the
-chat buffer the menu was opened from (RPC/input state stay the
-session's own).  FN is deferred through `run-at-time 0': inside a
-minibuffer command, nothing after `exit-minibuffer' is ever executed
-— the exit THROWS out of the recursive minibuffer edit, abandoning
-the rest of the command — so the action must be scheduled BEFORE the
-exit and fired once the minibuffer is gone (same pattern as the `e'
-and `x' keys)."
-  (let* ((chat (dsh-emacs-queue--menu-chat))
-         (item (dsh-emacs-queue--menu-item)))
-    ;; The timer must be scheduled before the exit: `exit-minibuffer' throws
-    ;; out of the command, so code after it never runs.
-    (run-at-time 0 nil
-                 (lambda ()
-                   (when (and (buffer-live-p chat) item)
-                     (with-current-buffer chat
-                       (funcall fn item)))))
-    (exit-minibuffer)))
-
-(defun dsh-emacs-queue--menu-edit ()
-  "Edit the picked entry's text (`e')."
-  (interactive)
-  (let* ((chat (dsh-emacs-queue--menu-chat))
-         (item (dsh-emacs-queue--menu-item)))
-    ;; The timer is registered before the exit, so after the exit the
-    ;; minibuffer is closed and read-string no longer nests inside the
-    ;; recursive minibuffer (its prompt is not swallowed).
-    (run-at-time 0 nil
-                 (lambda ()
-                   (when (and (buffer-live-p chat) item)
-                     (with-current-buffer chat
-                       (let ((text (read-string
-                                    "Edit queued message: "
-                                    (dsh-protocol-queue-item-text item))))
-                         (unless (string-empty-p (string-trim text))
-                           (dsh-emacs-queue--edit item text)))))))
-    (exit-minibuffer)))
-
-(defun dsh-emacs-queue--menu-steer ()
-  "Steer the picked entry into the running turn (`s')."
-  (interactive)
-  (dsh-emacs-queue--menu-run
-   (lambda (item)
-     (cond
-      ((eq (dsh-protocol-queue-item-placement item) 'steering)
-       (message "Already steering"))
-      ((not (dsh-emacs--busy-p))
-       (message "No turn is running — RET sends it now"))
-      (t (dsh-emacs-queue--steer item))))))
-
-(defun dsh-emacs-queue--menu-delete ()
-  "Delete the picked entry (`d')."
-  (interactive)
-  (dsh-emacs-queue--menu-run #'dsh-emacs-queue--delete))
-
-(defun dsh-emacs-queue--menu-send ()
-  "Send the picked entry now (`RET')."
-  (interactive)
-  (dsh-emacs-queue--menu-run #'dsh-emacs-queue--send-now))
-
-(defun dsh-emacs-queue--menu-delete-all ()
-  "Delete the whole queue after confirmation (`x')."
-  (interactive)
-  (let* ((chat (dsh-emacs-queue--menu-chat))
-         (items (delq nil (mapcar #'cdr dsh-emacs--queue-pick-table))))
-    ;; The timer is registered before the exit (the throw discards the
-    ;; rest of the command).
-    (run-at-time 0 nil
-                 (lambda ()
-                   (when (buffer-live-p chat)
-                     (with-current-buffer chat
-                       (when (y-or-n-p
-                              (format "Delete all %d queued item%s? "
-                                      (length items)
-                                      (if (= (length items) 1) "" "s")))
-                         (dolist (it items)
-                           (dsh-emacs-queue--delete it)))))))
-    (exit-minibuffer)))
-
-(defun dsh-emacs-queue--chooser-keymap ()
-  "Minibuffer keymap for the queue menu: `e'/`s'/`d'/`RET' act on the
-picked entry, `x' deletes the whole queue.  Built exactly like the
-question chooser's (`dsh-emacs--question-chooser-keymap'): a copy of
-the minibuffer's current local map (vertico's when active, so its
-navigation keys survive) plus our single keys.  Mounted last in the
-minibuffer-setup-hook chain (`minibuffer-with-setup-hook' prepends its
-hook, so vertico's `use-local-map vertico-map' has already run), which
-is what makes the keys win."
-  (let ((map (copy-keymap (or (current-local-map)
-                              (make-sparse-keymap)))))
-    (define-key map (kbd "e") #'dsh-emacs-queue--menu-edit)
-    (define-key map (kbd "s") #'dsh-emacs-queue--menu-steer)
-    (define-key map (kbd "d") #'dsh-emacs-queue--menu-delete)
-    (define-key map (kbd "x") #'dsh-emacs-queue--menu-delete-all)
-    (define-key map (kbd "RET") #'dsh-emacs-queue--menu-send)
-    map))
-
-(defun dsh-emacs-queue--chooser-setup-hook ()
-  "Queue-menu minibuffer setup: stable candidate order (no completion
-re-sort), first entry preselected, single-key map mounted.  Unlike the
-question reader, which pins its order with collection sort metadata, this
-menu pins the frontend's own sort variable — its candidates are queue
-labels with no position to carry.  Because `minibuffer-with-setup-hook'
-prepends, this hook runs AFTER vertico's and its `use-local-map' wins.
-Returns nil explicitly — `minibuffer-with-setup-hook' funcalls the
-setup value."
-  (when (boundp 'vertico-sort-function)
-    (setq-local vertico-sort-function nil))
-  (when (boundp 'vertico-sort-override-function)
-    (setq-local vertico-sort-override-function nil))
-  (when (boundp 'vertico-preselect)
-    (setq-local vertico-preselect 'first))
-  (use-local-map (dsh-emacs-queue--chooser-keymap))
-  nil)
+(defun dsh-emacs-queue--edit-item (item)
+  "Read new text for ITEM and apply it when it is not blank.
+Refuse a non-text item: the edit RPC replaces its content with one text
+block, which would drop its attachments."
+  (unless (dsh-protocol-queue-item-text-only item)
+    (user-error "Cannot edit queued attachments"))
+  (let ((text (read-string "Edit queued message: "
+                           (dsh-protocol-queue-item-text item))))
+    (unless (string-empty-p (string-trim text))
+      (dsh-emacs-queue--edit item text))))
 
 (cl-defun dsh-emacs-list-queue ()
-  "Manage this session's pending queue (minibuffer menu).
-Opens the queue as a candidate list (`[Q]' queued, `[S]' steering;
-vertico/icomplete up/down moves) and acts on the picked entry with the
-SINGLE keys bound inside the minibuffer — no numbering, no separate
-selection step: `e' edit the current entry's text, `s' steer it into
-the running turn, `d' delete it, `x' delete the whole queue (after
-confirmation), `RET' send it now (steer while a turn runs; while idle
-it wakes the queue drain).  One `C-g' cancels.  Keys and RPCs run back
-in the chat buffer the menu was opened from.  Host-injected `context'
-items are never shown or acted on."
+  "Manage this session's pending queue in one completion list.
+RET or C-c s sends the selected entry now, steering a running turn or
+waking the idle queue drain.  C-c e edits it, C-c d deletes it, and
+C-c x deletes the whole queue after confirmation.  Ordinary letters
+filter the list; C-g cancels.  Host-injected `context' items are hidden."
   (interactive)
   (when (bound-and-true-p dsh-emacs--buffer-subagent)
     (with-help-window "*DSH Subagent Queue*"
@@ -757,24 +598,29 @@ items are never shown or acted on."
         (princ (concat (dsh-protocol-queue-item-text item) "\n"))))
     (cl-return-from dsh-emacs-list-queue))
   (dsh-emacs-queue--session-id)
-  ;; A single C-g exits everything (menu, edit, delete-all confirmation),
-  ;; leaving no half-open minibuffer.
   (condition-case nil
-      (let* ((items (cl-remove-if
-                     (lambda (item)
-                       (eq (dsh-protocol-queue-item-placement item) 'context))
-                     dsh-emacs--queue-items)))
+      (let ((items (cl-remove-if
+                    (lambda (item)
+                      (eq (dsh-protocol-queue-item-placement item) 'context))
+                    dsh-emacs--queue-items)))
         (when (null items)
           (user-error "Queue is empty"))
-        (let* ((table (dsh-emacs-queue--table items))
-               (dsh-emacs--queue-pick-table table))
-          (minibuffer-with-setup-hook
-              (lambda () (dsh-emacs-queue--chooser-setup-hook))
-            (completing-read
-             (format "Queue Q%d S%d — e edit, s steer, d delete, x all, RET send: "
-                     (car (dsh-emacs-queue-counts))
-                     (cdr (dsh-emacs-queue-counts)))
-             (mapcar #'car table) nil nil nil nil nil))))
+        (pcase-let ((`(,action ,item)
+                     (dsh-emacs-ui-menu-read
+                      (format "Queue Q%d S%d (RET or C-c s send; C-c e/d/x): "
+                              (car (dsh-emacs-queue-counts))
+                              (cdr (dsh-emacs-queue-counts)))
+                      (dsh-emacs-ui-menu-entries items
+                                                 #'dsh-emacs-queue--label)
+                      'send
+                      '(("C-c s" send) ("C-c e" edit)
+                        ("C-c d" delete) ("C-c x" delete-all t)))))
+          (pcase action
+            ('send (dsh-emacs-queue--send-now item))
+            ('edit (dsh-emacs-queue--edit-item item))
+            ('delete (dsh-emacs-queue--delete item))
+            ('delete-all (dsh-emacs-queue--delete-all items))
+            (_ (user-error "Unknown queue menu action: %s" action)))))
     (quit (message "Queue manager cancelled"))))
 
 (provide 'dsh-emacs-queue)
