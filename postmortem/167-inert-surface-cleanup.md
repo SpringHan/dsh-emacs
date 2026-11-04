@@ -34,7 +34,8 @@ to the history module, and put `dsh-emacs-stream-markdown-limit` and
 session module's forward `defvar`s become bare declarations instead of
 duplicated value-carrying definitions.  Delete the thirteen unused Markdown
 faces, and privatize the internal `dsh-emacs-sessions-buffer` and
-`dsh-emacs-server-default-base-url` symbols.
+`dsh-emacs-server-default-base-url` symbols to `dsh-emacs--sessions-buffer`
+and `dsh-emacs--server-default-base-url`.
 
 ## Why
 
